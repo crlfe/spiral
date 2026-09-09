@@ -13,9 +13,12 @@ NPU can be used as an accelerator, starting with offloading large matrix ops.
 The eventual code will build in a fork of the llama.cpp tree, but for now this
 repository will be for proving capabilities and benchmarking.
 
-### Next Steps
+### Done
 
 * tests/poc/memory.py: Check the available host->NPU memory bandwidth.
+
+### Next Steps
+
 * tests/poc/invoke.py: Check the latency of running multiple operations.
 * tests/poc/flow.py: Check the max banwidth through a matrix multiply.
 * tests/poc/calc.py: Check the throughput of a matrix multiply kernel.
