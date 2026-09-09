@@ -2,9 +2,9 @@
 
 The AMD XDNA2 NPU is an intriguing addition to some recent AMD processors:
 it promises a lot of compute for local inference with much lower power
-consumption than a GPU. Unfortunately software support for the AMD NPUs
-remains poor, and what is available has limited model support and seems slow.
-So we're going to fix it.
+consumption than a GPU. Unfortunately, software support for the AMD NPUs
+remains poor. What is available has limited model support and seems slower
+than it should be. So we're going to fix it.
 
 ## Roadmap
 
@@ -45,6 +45,7 @@ roughly equivalent to the Radeon 890M iGPU, but runs much cooler:
 | llama-b10839 ROCm  | Qwen 3.6 35B-A3B UD-Q8_K_XL | 36.4 GB    | 18 tps |
 | llama-b10839 ROCm  | Gemma 4 26B-A4B IT QAT Q4_0 | 13.4 GB    | 25 tps |
 | llama-b10839 ROCm  | Qwen 3.8 27B UD-Q4_K_XL     | 16.4 GB    | 4 tps  |
+|
 
 Interestingly, Qwen 3.6 35B-A3B runs as fast in Q8 as the smaller Q4 versions,
 suggesting that the bottleneck is not the system memory bandwidth. The dense
