@@ -1,5 +1,5 @@
-import aie.iron as iron
 import numpy as np
+from aie import iron
 from aie.iron import (
     CompileTime,
     ExternalFunction,
@@ -13,19 +13,30 @@ from aie.iron import (
 )
 from aie.iron.controlflow import range_
 from aie.iron.dataflow import ObjectFifoHandle
-from aie.iron.kernels import reduce_add
 from aie.iron.device import NPU2
-from aie.utils.benchmark import run_iters, print_benchmark
+from aie.utils.benchmark import run_iters
 
+# TODO: Figure out a less confusing terminology for whole-buffer/block/tile.
+#
+# For the moment: The input is divided into `num_channels` blocks of length
+# `input_block_len`, each of which is run through a distinct pipeline of one
+# Shim MM2S DMA, one Compute Tile, and one Shim S2MM DMA. The `input_block_len`
+# int32 items processed by each Compute Tile are further divided into groups
+# of length `input_tile_len`. When all of the input has been processed, the
+# Compute Tile sends the final sum as the first value in a block of length
+# `output_block_len`.
 
 @iron.jit
 def program(
     input: In,
     output: Out,
     *,
+    func_zero: CompileTime[ExternalFunction],
+    func_sum: CompileTime[ExternalFunction],
     input_len: CompileTime[int],
-    input_tile_len: CompileTime[int],
     num_channels: CompileTime[int],
+    input_tile_len: CompileTime[int],
+    output_block_len: CompileTime[int],
 ):
     assert input_len % num_channels == 0
     input_block_len = input_len // num_channels
@@ -36,28 +47,30 @@ def program(
     input_type = np.ndarray[(input_len,), np.dtype[np.int32]]
     input_block_type = np.ndarray[(input_block_len,), np.dtype[np.int32]]
     input_tile_type = np.ndarray[(input_tile_len,), np.dtype[np.int32]]
+    output_tile_type = np.ndarray[(1,), np.dtype[np.int64]]
+
     input_fifos = [
         ObjectFifo(input_block_type, consumer_obj_type=input_tile_type)
         for _ in range(num_channels)
     ]
 
-    output_type = np.ndarray[(num_channels,), np.dtype[np.int32]]
-    output_block_type = np.ndarray[(1,), np.dtype[np.int32]]
+    output_type = np.ndarray[(num_channels, output_block_len), np.dtype[np.int64]]
 
-    output_fifos = [ObjectFifo(output_block_type) for _ in range(num_channels)]
+    output_fifos = [ObjectFifo(output_tile_type) for _ in range(num_channels)]
 
     def run_core(
         input_cons: ObjectFifoHandle,
         output_prod: ObjectFifoHandle,
-        kernel: ExternalFunction,
-        input_tile_len: CompileTime[int],
+        func_zero: ExternalFunction,
+        func_sum: ExternalFunction,
         input_tiles_per_block: CompileTime[int],
     ):
         output_buf = output_prod.acquire(1)
-        for _ in range_(input_tiles_per_block):
+        func_zero(output_buf)
+
+        for i in range_(input_tiles_per_block):
             input_buf = input_cons.acquire(1)
-            # TODO: Replace reduce_add with an inline kernel that accumulates.
-            kernel(input_buf, output_buf, input_tile_len)
+            func_sum(input_buf, output_buf)
             input_cons.release(1)
         output_prod.release(1)
 
@@ -67,8 +80,8 @@ def program(
             [
                 input_fifos[i].cons(),
                 output_fifos[i].prod(),
-                reduce_add(input_tile_len),
-                input_tile_len,
+                func_zero,
+                func_sum,
                 input_tiles_per_block,
             ],
         )
@@ -85,7 +98,7 @@ def program(
             input_prod.fill(input, offset=input_block_len * i, sizes=[input_block_len])
 
         for i, output_cons in enumerate(output_conses):
-            output_cons.drain(output, offset=i, sizes=[1], wait=True)
+            output_cons.drain(output, offset=output_block_len * i, sizes=[1], wait=True)
 
     rt = Runtime(
         run_sequence,
@@ -101,22 +114,90 @@ def program(
     return prog.resolve_program()
 
 
-def main():
-    print("Loading...")
-    input_len = 1024 * 1024 * 1024
-    input = iron.randint(0, 64, (input_len,), dtype=np.int32, device="npu")
+def _run_and_verify(input, output, *args, **kwargs):
+    result = program(input, output, *args, **kwargs)
 
-    for num_channels in [1, 2, 4, 8, 16]:
-        output = iron.zeros(num_channels, dtype=np.int32, device="npu")
+    expected = np.sum(input, dtype=np.int64)
+    actual = np.sum(output)
+    if expected != actual:
+        err_abs = abs(expected - actual)
+        err_pct = 100 * err_abs / min(expected, actual)
+        print(
+            "  output validation failed:",
+            f"got {actual}, ",
+            f"expected {expected},",
+            f"diff {err_abs} ({err_pct}%)",
+        )
+
+    return result
+
+
+def main():
+    # It may take quite a while before the first program is compiled and run,
+    # so pring a message just to tell the user we are doing something.
+    print("Loading...")
+
+    input_tile_len = 1024
+    input_tile_type = np.ndarray[(input_tile_len,), np.dtype[np.int32]]
+
+    output_block_len = 8
+    output_tile_type = np.ndarray[(1,), np.dtype[np.int64]]
+
+    max_channels = 16
+    per_channel_input_len = 64 * 1024 * 1024
+    max_input_len = max_channels * per_channel_input_len
+    max_input = iron.randint(0, 255, (max_input_len,), dtype=np.int32)
+    output = iron.zeros((max_channels, output_block_len), dtype=np.int64)
+
+    def make_zero():
+        return ExternalFunction(
+            "zero",
+            arg_types=[output_tile_type],
+            source_string="""
+#include <aie_api/aie.hpp>
+
+extern "C" void zero(int64_t * restrict output) {
+    *output = 0;
+}
+""",
+        )
+
+    def make_sum():
+        return ExternalFunction(
+            "sum",
+            arg_types=[input_tile_type, output_tile_type],
+            compile_flags=[f"-DINPUT_TILE_LEN={input_tile_len}"],
+            source_string="""
+#include <aie_api/aie.hpp>
+
+extern "C" void sum(const int32_t * restrict input, int64_t * restrict output) {
+    aie::vector<int32_t, 16> accum(0);
+
+    for (int32_t i = 0; i < INPUT_TILE_LEN; i += 16) {
+        accum = accum + aie::load_v<16>(input + i);
+    }
+
+    *output += aie::reduce_add(accum);
+}
+""",
+        )
+
+    for num_channels in 1, 2, 3, 4, 6, 8, 10, 12, 14, 16:
+        input_len = num_channels * per_channel_input_len
+        input = max_input.subview(0, (input_len,))
+
         bench = run_iters(
-            program,
+            _run_and_verify,
             input,
-            output,
+            output.subview(0, (num_channels, output_block_len)),
+            func_zero=make_zero(),
+            func_sum=make_sum(),
             input_len=input_len,
-            input_tile_len=4096,
             num_channels=num_channels,
+            input_tile_len=input_tile_len,
+            output_block_len=output_block_len,
             warmup=1,
-            iters=20,
+            iters=5,
         )
 
         bytes_per_gb = 1024 * 1024 * 1024
