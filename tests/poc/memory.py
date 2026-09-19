@@ -1,3 +1,7 @@
+#
+# Proof-of-concept bulk memory transfer benchmark.
+#
+
 import numpy as np
 from aie import iron
 from aie.iron import (
@@ -17,6 +21,9 @@ from aie.iron.device import NPU2
 from aie.utils.benchmark import run_iters
 
 # TODO: Figure out a less confusing terminology for whole-buffer/block/tile.
+# Xilinx/AMD use L3 (Host), L2 (Memory Tile), and L1 (Compute Tile), which
+# carries the unfortunate suggestion that they are cache levels but is at least
+# simple to stick in variable names (see flow.py).
 #
 # For the moment: The input is divided into `num_channels` blocks of length
 # `input_block_len`, each of which is run through a distinct pipeline of one
@@ -25,6 +32,7 @@ from aie.utils.benchmark import run_iters
 # of length `input_tile_len`. When all of the input has been processed, the
 # Compute Tile sends the final sum as the first value in a block of length
 # `output_block_len`.
+
 
 @iron.jit
 def program(
@@ -134,7 +142,7 @@ def _run_and_verify(input, output, *args, **kwargs):
 
 def main():
     # It may take quite a while before the first program is compiled and run,
-    # so pring a message just to tell the user we are doing something.
+    # so print a message just to tell the user we are doing something.
     print("Loading...")
 
     input_tile_len = 1024

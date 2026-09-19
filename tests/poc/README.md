@@ -9,10 +9,10 @@ that MLIR-AIE installed to your PATH after following the MLIR-AIE instructions
 to enter their `ironenv` virtual environment. In my case, the default location
 was `${VIRTUAL_ENV}/../my_install/mlir/bin`.
 
-## Memory Bandwidth
+## Bulk Memory Bandwidth
 
-`memory.py` reports speed from host memory to the NPU in GB/s, using a varying
-number of DMA channels.
+`memory.py` reports the bulk transfer speed from host memory to the NPU in GB/s,
+testing a varying number of DMA channels.
 
 ```
 # Ryzen AI 9 HX 475 Laptop
@@ -27,4 +27,16 @@ Tested 10 channels: avg 56.2 GB/s   (min 56.0 to max 56.3)
 Tested 12 channels: avg 56.7 GB/s   (min 56.4 to max 56.9)
 Tested 14 channels: avg 56.7 GB/s   (min 56.4 to max 57.0)
 Tested 16 channels: avg 56.9 GB/s   (min 56.8 to max 57.1)
+```
+
+## Matrix Memory Bandwidth
+
+`flow.py` reports the transfer speed through the NPU following a path similar
+to a matrix multiply, but without performing the actual calculations. This
+result is unoptimized and the actual output data has not been verified.
+
+```
+# Ryzen AI 9 HX 475 Laptop
+
+Transfer: avg 56.1 GB/s   (min 56.0 to max 56.2)
 ```
