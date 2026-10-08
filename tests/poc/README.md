@@ -17,16 +17,16 @@ testing a varying number of DMA channels.
 ```
 # Ryzen AI 9 HX 475 Laptop
 
-Tested  1 channels: avg 13.8 GB/s   (min 13.5 to max 14.1)
-Tested  2 channels: avg 25.9 GB/s   (min 25.1 to max 26.4)
-Tested  3 channels: avg 36.9 GB/s   (min 36.3 to max 37.5)
-Tested  4 channels: avg 43.9 GB/s   (min 43.3 to max 44.8)
-Tested  6 channels: avg 49.5 GB/s   (min 48.4 to max 50.0)
-Tested  8 channels: avg 54.8 GB/s   (min 54.5 to max 55.2)
-Tested 10 channels: avg 56.2 GB/s   (min 56.0 to max 56.3)
-Tested 12 channels: avg 56.7 GB/s   (min 56.4 to max 56.9)
-Tested 14 channels: avg 56.7 GB/s   (min 56.4 to max 57.0)
-Tested 16 channels: avg 56.9 GB/s   (min 56.8 to max 57.1)
+Tested  1 channels: avg 14.3 GB/s   (min 14.2 to max 14.4)
+Tested  2 channels: avg 26.7 GB/s   (min 26.1 to max 27.0)
+Tested  3 channels: avg 35.2 GB/s   (min 34.7 to max 35.7)
+Tested  4 channels: avg 40.5 GB/s   (min 37.5 to max 44.3)
+Tested  6 channels: avg 48.9 GB/s   (min 45.5 to max 50.1)
+Tested  8 channels: avg 54.4 GB/s   (min 50.7 to max 55.6)
+Tested 10 channels: avg 54.6 GB/s   (min 51.8 to max 56.8)
+Tested 12 channels: avg 55.2 GB/s   (min 51.2 to max 57.2)
+Tested 14 channels: avg 57.6 GB/s   (min 57.4 to max 57.7)
+Tested 16 channels: avg 53.0 GB/s   (min 45.8 to max 57.4)
 ```
 
 ## Matrix Memory Bandwidth
