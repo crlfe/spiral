@@ -20,7 +20,7 @@ repository will be for proving capabilities and benchmarking.
 ### Next Steps
 
 * tests/poc/invoke.py: Check the latency of running multiple operations.
-* tests/poc/flow.py: Check the max banwidth through a matrix multiply.
+* tests/poc/flow.py: Check the max bandwidth through a matrix multiply.
 * tests/poc/calc.py: Check the throughput of a matrix multiply kernel.
 
 ### Future Plans
@@ -36,23 +36,24 @@ is crippled to prevent booting Linux (hacked that) or adjusting clock speeds.
 
 The [FastFlowLM project](https://github.com/ROCm/FastFlowLM) is currently the
 best choice for running inference on the NPU. Testing on my laptop it is
-roughly equivalent to the Radeon 890M iGPU, but runs much cooler:
+substantially slower than the Radeon 890M iGPU, but runs much cooler:
 
-| Engine             | Model                       | Size       | Decode |
-| :---               | :---                        | :---:      | :---:  |
-| FastFlowLM-1.0.4   | Qwen 3.6 35B-A3B Q4_K Aug26 | 21.3 GB    | 18 tps |
-| llama-b10839 ROCm  | Qwen 3.6 35B-A3B UD-Q4_K_XL | 21.3 GB    | 20 tps |
-| llama-b10839 ROCm  | Qwen 3.6 35B-A3B UD-Q8_K_XL | 36.4 GB    | 18 tps |
-| llama-b10839 ROCm  | Gemma 4 26B-A4B IT QAT Q4_0 | 13.4 GB    | 25 tps |
-| llama-b10839 ROCm  | Qwen 3.8 27B UD-Q4_K_XL     | 16.4 GB    | 4 tps  |
+| Engine             | Model                          | Size       | Decode |
+| :---               | :---                           | :---:      | :---:  |
+| FastFlowLM-1.0.7   | Qwen 3.6 35B-A3B Q4+MTP Aug26  | 20.6 GB    | 17 tps |
+| FastFlowLM-1.0.7   | Qwen 3.8 27B Q4+MTP Sep29      | 16.8 GB    |  2 tps |
+| llama-b10839 ROCm  | Qwen 3.6 35B-A3B UD-Q4_K_XL    | 21.3 GB    | 20 tps |
+| llama-b10839 ROCm  | Qwen 3.6 35B-A3B UD-Q8_K_XL    | 36.4 GB    | 18 tps |
+| llama-b10839 ROCm  | Qwen 3.8 27B UD-Q4_K_XL        | 16.4 GB    |  4 tps |
+| llama-b10839 ROCm  | Gemma 4 26B-A4B IT QAT Q4_0    | 13.4 GB    | 25 tps |
 |
 
-Interestingly, Qwen 3.6 35B-A3B runs as fast in Q8 as the smaller Q4 versions,
-suggesting that the bottleneck is not the system memory bandwidth. The dense
-Qwen 3.8 27B model used roughly `16.4 GB/tok * 4 tok/s = 65.6 GB/s`. If the
-same memory bandwidth were saturated by Qwen 35B-A3B Q4, we would double the
-basic decode rate to 36 tps. Adding speculative decoding like MTP or DFlash
-could easily get us over 50 tps.
+Interestingly, on the iGPU Qwen 3.6 35B-A3B runs as fast in Q8 as the smaller
+Q4 versions, suggesting that the bottleneck is not the system memory bandwidth.
+The dense Qwen 3.8 27B model used roughly `16.4 GB/tok * 4 tok/s = 65.6 GB/s`.
+If the same memory bandwidth were saturated by Qwen 35B-A3B Q4, we would double
+the basic decode rate to 36 tps. Adding speculative decoding like MTP or DFlash
+could then easily get us over 50 tps when writing code.
 
 # License and Warranty Disclaimer
 
