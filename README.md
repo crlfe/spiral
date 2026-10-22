@@ -16,11 +16,11 @@ repository will be for proving capabilities and benchmarking.
 ### Done
 
 * tests/poc/memory.py: Check the available host->NPU memory bandwidth.
+* tests/poc/flow.py: Check the max bandwidth through a plausible data flow.
+* tests/poc/invoke.py: Check the latency of running multiple operations.
 
 ### Next Steps
 
-* tests/poc/invoke.py: Check the latency of running multiple operations.
-* tests/poc/flow.py: Check the max bandwidth through a matrix multiply.
 * tests/poc/calc.py: Check the throughput of a matrix multiply kernel.
 
 ### Future Plans
