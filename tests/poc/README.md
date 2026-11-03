@@ -41,6 +41,22 @@ result is unoptimized and the actual output data has not been verified.
 Transfer: avg 56.5 GB/s   (min 56.3 to max 56.6)
 ```
 
+## Matrix Multiply
+
+`calc.py` measures a 2048x2048 matrix multiply in types easily handled by
+the NPU: float32 inputs and outputs with bfloat16 weights. It checks the
+output against numpy, and reports throughput based on elapsed times.
+
+```
+# Ryzen AI 9 HX 475 Laptop
+
+reps: 64
+npu: 10022.6 us (min 9612.4, max 10321.8), e2e 10807.5 us
+bandwidth: avg 53.98 GB/s, best 56.29 GB/s
+compute: 214.26 GFLOP/s
+verified against numpy
+```
+
 ## Call Overheads
 
 `invoke.py` reports the time required to call the NPU using different patterns,
