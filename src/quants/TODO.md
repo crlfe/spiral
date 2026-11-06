@@ -1,7 +1,7 @@
 # `src/quants` implementation TODO
 
 Production code lives in `spiral::quants`. Host repack and NPU unpack are
-header-only. Keep the original reference implementation unchanged.
+header-only.
 
 ## Current state
 
@@ -9,22 +9,22 @@ The initial Q4_0 pass is complete and verified on XDNA2:
 
 | item | state |
 | :-- | :-- |
-| Q4_0 layout, host repack, scalar unpack | implemented |
+| Q4_0 layout, host repack, optimized hi/lo unpack | implemented |
 | Q4_0 `tests/unpack.py` | passes, exact bf16 match |
 | Q4_0 `tests/mmul.py` | passes, exact mmul match |
 | Q6_K layout and Python reference | implemented |
 | Q6_K C++ repack/unpack | deliberate no-ops; tests fail on accuracy |
-| NPU-less execution | skips cleanly |
+| NPU-less execution | errors clearly; NPU is required |
 | Host header compilation | C++17, no AIE in `repack.h` |
+| Test shims | `tests/unpack.cc`, `tests/mmul.cc`, `tests/repack.cc` |
 
-Baseline Q4_0 64x64 result: **804,045 cycles for 8 tiles**, or
-**100,506 cycles per 512-weight tile**. The earlier vectorized Q4_0 path
-was roughly **227 cycles per 512-weight tile**, so scalar unpack is currently
-dominating by a large margin. Vectorization is the largest single optimization
-opportunity.
+Current Q4_0 64x64 result: **1,963 cycles for 8 tiles**, or **245 cycles per
+512-weight tile**. A single 64x8 tile measures **241 cycles**. The initial
+scalar path was about **100,506 cycles/tile**, so the hi/lo vectorized path
+removed the dominant bottleneck.
 
-Baseline Q4_0 fused result: unpack **803,790 cycles**, mmul **1,712 cycles**.
-The mmul is already cheap relative to unpack.
+Current Q4_0 fused result: unpack **1,928 cycles**, mmul **1,712 cycles**.
+The mmul is now a significant fraction of the fused loop.
 
 ## Constraints that still apply
 
@@ -41,7 +41,8 @@ The mmul is already cheap relative to unpack.
 - Host repack byte counts, capacities, strides, and offsets stay `int64_t`.
   NPU-side loop counters and record/chunk indices use `int32_t`; per-launch
   shapes are small enough that this is safe.
-- Do not modify the original reference implementation.
+- Production headers contain no tracing. The test shims call `event0()` and
+  `event1()` directly.
 
 ## Naming and canonical layouts
 
@@ -92,12 +93,12 @@ Separate repack record depth from per-compute-tile unpack depth:
 Helpers in `spiral::quants::<name>`:
 
 ```cpp
-const uint8_t* common_scales(const uint8_t* record);
 const uint8_t* chunk(const uint8_t* record, int chunk_index);
 ```
 
-`common_scales()` points at the start of the record's shared metadata;
-`chunk()` points past that metadata to a specific chunk.
+Shared metadata is always at the start of the record. `chunk()` points past
+that metadata to a specific chunk; callers pass the record pointer directly
+when they need the shared metadata.
 
 ### Repack API
 
@@ -136,13 +137,14 @@ return `0`.
 ### Unpack API
 
 ```cpp
-void unpack_weights_chunk(const uint8_t* common_scales,
+void unpack_weights_chunk(const uint8_t* record,
                           const uint8_t* packed_chunk,
                           bfloat16* weights_tile);
 ```
 
-The unpack function writes the canonical bf16 weights tile directly. Formats
-with `kChunksPerRecord == 1` may also provide:
+`record` points at the start of the shared metadata. The unpack function writes
+the canonical bf16 weights tile directly. Formats with
+`kChunksPerRecord == 1` may also provide:
 
 ```cpp
 void unpack_weights_tile(const uint8_t* record, bfloat16* weights_tile);
@@ -286,7 +288,6 @@ Type counts across the current target model set:
 ```text
 src/quants/
   common/
-    scale.h                 fp16x8 load and hi/lo bf16 scale helpers
     k_quant.h               shared 6-bit K scale/min unpack
     iq4nl.h                 shared IQ4_NL codebook
   q8_0/
@@ -331,9 +332,8 @@ share one implementation.
 
 ## Shared implementation work
 
-- Port or recreate the useful parts of the earlier scale helper into
-  `common/scale.h`:
-  - fp16x8 load and hi/lo bf16 scale splitting.
+- `common/scale.h` provides fp16x8 loading and hi/lo bf16 scale splitting.
+  Reuse it for K-quant and codebook formats that need scale conversion.
 - Use `aie::scoped_mode rounding{aie::rounding_mode::conv_even};` around bf16
   conversions. The default tile rounding mode truncates; `scoped_mode` restores
   the previous mode on scope exit.
@@ -349,26 +349,34 @@ share one implementation.
 
 ## Optimization roadmap
 
-### Q4_0 vectorized unpack
+### Q4_0 scale-mode variants
 
-This is the highest-value next optimization.
+The optimized hi/lo path is now the default. Add variant testing without
+changing the packed layout:
 
-- Load the 16-byte packed payload as `aie::vector<int4, 32>` and convert with
-  `aie::to_float<bfloat16>`.
-- Load the eight fp16 scales once per 32-row block, not once per payload.
-- Split scales into bf16 hi/lo components and use a multiply-plus-mac path, as
-  in the earlier vectorized reference.
-- Store directly into 8x8 mmul tiles with `aie::store_v`.
-- Compare against the current 100,484 cycles/tile baseline and against the
-  earlier vectorized Q4_0 reference (~227 cycles/tile).
+- Add a `ScaleMode` compile-time parameter:
+  - `exact`: current hi/lo bf16 scale split, bit-identical to float dequant.
+  - `fast`: single bf16 scale, lower precision and fewer cycles.
+- Keep the current non-template `unpack_weights_chunk()` as the default wrapper
+  around `unpack_weights_chunk_impl<ScaleMode::exact>()`.
+- Add named variants to the Python format module, with each variant carrying
+  its expected verification policy.
+- Add `--variant` to `tests/unpack.py` and `tests/mmul.py`. Do not expose raw
+  template arguments or blindly inject user-provided values.
+- Generate or select explicit NPU shim wrappers for each named variant.
+- Report the variant name with cycle results.
+- Measure the fast path against the current 245 cycles/tile 64x64 result and
+  241 cycles/tile single-tile result.
+- Only add layout-changing variants (payload representation, tile shape,
+  column pairing) after a layout-policy design exists.
 
 ### Fused unpack and mmul
 
 - Fuse at chunk level first: unpack one 64x8 chunk, then immediately run
   `mmul_weights_tile<kUnpackTileRows / kMmulWeightsRows>`.
 - Avoid materializing multiple chunks at once.
-- Keep separate `TRACE_ENTER/LEAVE` scopes for unpack and mmul so stage timing
-  remains visible.
+- Keep separate `event0()` / `event1()` scopes in `tests/mmul.cc` for unpack
+  and mmul so stage timing remains visible.
 - Measure whether the current full-chunk materialization costs anything before
   changing the public API.
 
@@ -408,9 +416,9 @@ Only after the vectorized chunk path is measured:
 - Add a real-model test path that extracts a small slice of a representative
   tensor, repacks it, and compares against the Python reference. This catches
   assumptions that synthetic data may miss.
-- Keep the no-NPU skip path and invalid-shape rejection tests.
+- Keep the no-NPU error path and invalid-shape rejection tests.
 - Benchmark at least:
-  - Q4_0 64x64 and 128x128;
+  - Q4_0 64x64 and 128x128, exact and fast scale modes;
   - Q8_0 64x64 and 128x128;
   - Q6_K 256x64;
   - Q4_K/Q5_K 256x64 and 512x64, split output if DMA limits require it.
@@ -424,12 +432,12 @@ Only after the vectorized chunk path is measured:
 - [ ] Q8_0 unpack and mmul pass on a device.
 - [ ] Q4_K and Q5_K host repacks and dequantization match the host reference.
 - [ ] Q4_K and Q5_K NPU unpack and mmul pass on a device.
-- [ ] Q4_0 vectorized unpack removes the scalar baseline bottleneck.
-- [ ] Q4_0 mmul stage remains correct after unpack optimization.
+- [x] Q4_0 vectorized hi/lo unpack removes the scalar baseline bottleneck.
+- [x] Q4_0 mmul stage remains correct after unpack optimization.
+- [ ] Q4_0 exact and fast scale modes are exposed through named variants with
+      per-variant verification.
 - [ ] Invalid shapes are rejected for every format.
 - [ ] No format-specific runner or duplicate mmul implementation is introduced.
-- [ ] The original reference implementation remains unchanged unless a future
-      task explicitly requests it.
 
 ## Deliberately deferred
 

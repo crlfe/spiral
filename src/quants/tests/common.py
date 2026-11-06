@@ -4,12 +4,14 @@ import ast
 import ctypes
 import functools
 import glob
+import importlib
 import json
 import os
 import re
 import subprocess
 import tempfile
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -18,13 +20,29 @@ from ml_dtypes import bfloat16
 TESTS_ROOT = Path(__file__).resolve().parent
 QUANTS_ROOT = TESTS_ROOT.parent
 SRC_ROOT = QUANTS_ROOT.parent
+REPACK_SHIM = TESTS_ROOT / "repack.cc"
+UNPACK_SHIM = TESTS_ROOT / "unpack.cc"
+MMUL_SHIM = TESTS_ROOT / "mmul.cc"
 _TMP_DIR = tempfile.TemporaryDirectory(prefix="quants_tests_")
 TMP_ROOT = Path(_TMP_DIR.name)
 _TRACE_SIZE = 4096
 
 
-class SkipTest(Exception):
-    """Raised when the NPU is unavailable or a test cannot run on this host."""
+class NpuUnavailable(Exception):
+    """Raised when the NPU or its software stack is unavailable."""
+
+
+@dataclass(frozen=True)
+class PreparedCase:
+    fmt: object
+    format_name: str
+    weights_rows: int
+    weights_cols: int
+    constants: dict
+    raw: np.ndarray
+    packed: np.ndarray
+    expected_weights: np.ndarray
+    tiles: int
 
 
 _CONST_RE = re.compile(
@@ -126,6 +144,76 @@ def layout_constants(format_name):
     return values
 
 
+def load_format(format_name):
+    try:
+        return importlib.import_module(f"formats.{format_name}")
+    except ModuleNotFoundError as exc:
+        raise SystemExit(f"unknown format: {format_name}") from exc
+
+
+def add_common_args(parser):
+    parser.add_argument("--format", required=True)
+    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--rows", type=int)
+    parser.add_argument("--cols", type=int)
+
+
+def resolve_shape(fmt, format_name, rows, cols):
+    rows = rows if rows is not None else fmt.DEFAULT_ROWS
+    cols = cols if cols is not None else fmt.DEFAULT_COLS
+    constants = layout_constants(format_name)
+    if rows <= 0 or cols <= 0:
+        raise ValueError("rows and cols must be positive")
+    if rows % constants["kRecordRows"] != 0:
+        raise ValueError(
+            f"rows must be a multiple of {constants['kRecordRows']}"
+        )
+    if cols % constants["kTileCols"] != 0:
+        raise ValueError(
+            f"cols must be a multiple of {constants['kTileCols']}"
+        )
+    return rows, cols, constants
+
+
+def prepare_case(fmt, format_name, seed, weights_rows, weights_cols):
+    constants = layout_constants(format_name)
+    rng = np.random.default_rng(seed)
+    raw = fmt.make_raw(weights_rows, weights_cols, rng)
+    src_col_stride_bytes = (
+        weights_rows // constants["kBlockRows"]
+    ) * constants["kBlockBytes"]
+    packed = repack_host(
+        format_name,
+        raw,
+        weights_rows,
+        weights_cols,
+        src_col_stride_bytes,
+    )
+    expected_weights = fmt.reference_weights(
+        raw, weights_rows, weights_cols
+    )
+    tiles = expected_weights.size // (
+        constants["kUnpackTileRows"] * constants["kTileCols"]
+    )
+    return PreparedCase(
+        fmt=fmt,
+        format_name=format_name,
+        weights_rows=weights_rows,
+        weights_cols=weights_cols,
+        constants=constants,
+        raw=raw,
+        packed=packed,
+        expected_weights=expected_weights,
+        tiles=tiles,
+    )
+
+
+def print_case_header(case):
+    print(f"format: {case.format_name}")
+    print(f"weights: {case.weights_rows} rows x {case.weights_cols} cols")
+    print(f"packed bytes: {case.packed.size}")
+
+
 def _compiler():
     return os.environ.get("CXX", "g++")
 
@@ -160,40 +248,17 @@ def _build_shared(source, tag):
     return ctypes.CDLL(str(path))
 
 
-def _host_shim_source(format_name):
-    namespace = f"spiral::quants::{format_name}"
-    return f"""
-#include <stdint.h>
-
-#include "quants/{format_name}/repack.h"
-
-extern "C" {{
-int64_t quants_record_count(int64_t weights_rows, int64_t weights_cols) {{
-  return {namespace}::record_count(weights_rows, weights_cols);
-}}
-
-int64_t quants_packed_bytes(int64_t weights_rows, int64_t weights_cols) {{
-  return {namespace}::packed_bytes(weights_rows, weights_cols);
-}}
-
-int64_t quants_repack(const uint8_t* src,
-                      int64_t src_col_stride_bytes,
-                      uint8_t* dst,
-                      int64_t dst_capacity,
-                      int64_t weights_rows,
-                      int64_t weights_cols) {{
-  return {namespace}::repack_weights(
-      src, src_col_stride_bytes, dst, dst_capacity, weights_rows,
-      weights_cols);
-}}
-}}
-"""
+def _shim_source(body_path, definitions):
+    lines = [f"#define {name} {value}" for name, value in definitions.items()]
+    lines.append(body_path.read_text())
+    return "\n".join(lines)
 
 
 @functools.cache
 def host_shim(format_name):
     library = _build_shared(
-        _host_shim_source(format_name), f"quants_host_{format_name}"
+        _shim_source(REPACK_SHIM, {"QUANTS_FORMAT": format_name}),
+        f"quants_host_{format_name}",
     )
     library.quants_record_count.argtypes = [
         ctypes.c_int64,
@@ -212,18 +277,6 @@ def host_shim(format_name):
     ]
     library.quants_repack.restype = ctypes.c_int64
     return library
-
-
-def host_record_count(format_name, weights_rows, weights_cols):
-    return host_shim(format_name).quants_record_count(
-        weights_rows, weights_cols
-    )
-
-
-def host_packed_bytes(format_name, weights_rows, weights_cols):
-    return host_shim(format_name).quants_packed_bytes(
-        weights_rows, weights_cols
-    )
 
 
 def repack_host(format_name, raw, weights_rows, weights_cols, stride):
@@ -263,7 +316,7 @@ def repack_host(format_name, raw, weights_rows, weights_cols, stride):
 
 
 def npu_available():
-    if os.environ.get("QUANTS_SKIP_NPU"):
+    if os.environ.get("QUANTS_NO_NPU"):
         return False
     if os.environ.get("QUANTS_FORCE_NPU"):
         return True
@@ -292,105 +345,22 @@ def _write_shim(source, tag):
     return path
 
 
-def _npu_unpack_source(format_name, weights_rows, weights_cols):
-    namespace = f"spiral::quants::{format_name}"
-    return f"""
-#include <stdint.h>
-
-#include <aie_api/aie.hpp>
-
-#include "quants/{format_name}/layout.h"
-#include "quants/{format_name}/unpack.h"
-
-extern "C" void quants_unpack_all(const uint8_t* packed, bfloat16* out) {{
-  using namespace {namespace};
-  const int32_t cols_tiles = {weights_cols} / kTileCols;
-  const int32_t rows_records = {weights_rows} / kRecordRows;
-  const int32_t chunk_elems = kUnpackTileRows * kTileCols;
-
-  for (int32_t weights_cols_tile = 0; weights_cols_tile < cols_tiles;
-       ++weights_cols_tile) {{
-    for (int32_t weights_rows_record = 0;
-         weights_rows_record < rows_records; ++weights_rows_record) {{
-      const int32_t record_index =
-          weights_cols_tile * rows_records + weights_rows_record;
-      const uint8_t* record = packed + record_index * kPackedRecordBytes;
-
-      for (int chunk_index = 0; chunk_index < kChunksPerRecord;
-           ++chunk_index) {{
-        bfloat16* tile =
-            out + (record_index * kChunksPerRecord + chunk_index) *
-                      chunk_elems;
-        unpack_weights_chunk(common_scales(record),
-                             chunk(record, chunk_index), tile);
-      }}
-    }}
-  }}
-}}
-"""
-
-
-def _npu_mmul_source(format_name, weights_rows, weights_cols):
-    namespace = f"spiral::quants::{format_name}"
-    return f"""
-#include <stdint.h>
-
-#include <aie_api/aie.hpp>
-
-#include "quants/common/mmul.h"
-#include "quants/common/tile.h"
-#include "quants/{format_name}/layout.h"
-#include "quants/{format_name}/unpack.h"
-
-extern "C" void quants_unpack_mmul_all(const uint8_t* packed,
-                                       const bfloat16* inputs,
-                                       float* outputs) {{
-  using namespace {namespace};
-  const int32_t cols_tiles = {weights_cols} / kTileCols;
-  const int32_t rows_records = {weights_rows} / kRecordRows;
-  constexpr int kWeightsRowsTiles =
-      kUnpackTileRows / spiral::quants::kMmulWeightsRows;
-
-  for (int32_t weights_cols_tile = 0; weights_cols_tile < cols_tiles;
-       ++weights_cols_tile) {{
-    float* outputs_tile =
-        outputs + weights_cols_tile * spiral::quants::kMmulOutputsElems;
-    for (int i = 0; i < spiral::quants::kMmulOutputsElems; ++i) {{
-      outputs_tile[i] = 0.0f;
-    }}
-
-    for (int32_t weights_rows_record = 0;
-         weights_rows_record < rows_records; ++weights_rows_record) {{
-      const int32_t record_index =
-          weights_cols_tile * rows_records + weights_rows_record;
-      const uint8_t* record = packed + record_index * kPackedRecordBytes;
-
-      for (int chunk_index = 0; chunk_index < kChunksPerRecord;
-           ++chunk_index) {{
-        alignas(64) bfloat16 weights_tile[kUnpackTileRows * kTileCols];
-        unpack_weights_chunk(common_scales(record),
-                             chunk(record, chunk_index), weights_tile);
-
-        const int32_t weights_rows_start =
-            weights_rows_record * kRecordRows +
-            chunk_index * kUnpackTileRows;
-        const bfloat16* inputs_slice =
-            inputs +
-            (weights_rows_start / spiral::quants::kMmulWeightsRows) *
-                spiral::quants::kMmulInputsElems;
-        spiral::quants::mmul_weights_tile<kWeightsRowsTiles>(
-            inputs_slice, weights_tile, outputs_tile);
-      }}
-    }}
-  }}
-}}
-"""
+def _npu_shim(format_name, body_path, weights_rows, weights_cols, tag):
+    source = _shim_source(
+        body_path,
+        {
+            "QUANTS_FORMAT": format_name,
+            "QUANTS_WEIGHTS_ROWS": weights_rows,
+            "QUANTS_WEIGHTS_COLS": weights_cols,
+        },
+    )
+    return _write_shim(source, tag)
 
 
 def _header_files(format_name, include_mmul=False):
     paths = [
         QUANTS_ROOT / "common" / "tile.h",
-        QUANTS_ROOT / "common" / "trace.h",
+        QUANTS_ROOT / "common" / "scale.h",
         QUANTS_ROOT / format_name / "layout.h",
         QUANTS_ROOT / format_name / "unpack.h",
     ]
@@ -413,7 +383,7 @@ def _require_iron():
         )
         from aie.iron.device import NPU2
     except ImportError as exc:
-        raise SkipTest(f"AIE/IRON is not installed: {exc}") from exc
+        raise NpuUnavailable(f"AIE/IRON is not installed: {exc}") from exc
     return (
         iron,
         ExternalFunction,
@@ -441,11 +411,17 @@ def build_unpack_program(
         Worker,
         NPU2,
     ) = _require_iron()
-    shim = _write_shim(
-        _npu_unpack_source(format_name, weights_rows, weights_cols),
+    shim = _npu_shim(
+        format_name,
+        UNPACK_SHIM,
+        weights_rows,
+        weights_cols,
         f"quants_unpack_{format_name}_{weights_rows}x{weights_cols}",
     )
-    source_files = [str(shim)] + _header_files(format_name)
+    source_files = [
+        str(shim),
+        str(UNPACK_SHIM),
+    ] + _header_files(format_name)
     include_dirs = [str(SRC_ROOT)]
 
     def build(
@@ -463,7 +439,6 @@ def build_unpack_program(
             source_file=str(shim),
             arg_types=[packed_ty, out_ty],
             include_dirs=include_dirs,
-            compile_flags=["-DTRACE=1"],
         )
         packed_fifo = ObjectFifo(packed_ty, name="packed", depth=1)
         out_fifo = ObjectFifo(out_ty, name="weights", depth=1)
@@ -522,11 +497,17 @@ def build_mmul_program(
         Worker,
         NPU2,
     ) = _require_iron()
-    shim = _write_shim(
-        _npu_mmul_source(format_name, weights_rows, weights_cols),
+    shim = _npu_shim(
+        format_name,
+        MMUL_SHIM,
+        weights_rows,
+        weights_cols,
         f"quants_mmul_{format_name}_{weights_rows}x{weights_cols}",
     )
-    source_files = [str(shim)] + _header_files(format_name, include_mmul=True)
+    source_files = [
+        str(shim),
+        str(MMUL_SHIM),
+    ] + _header_files(format_name, include_mmul=True)
     include_dirs = [str(SRC_ROOT)]
 
     def build(
@@ -546,7 +527,6 @@ def build_mmul_program(
             source_file=str(shim),
             arg_types=[packed_ty, inputs_ty, outputs_ty],
             include_dirs=include_dirs,
-            compile_flags=["-DTRACE=1"],
         )
         packed_fifo = ObjectFifo(packed_ty, name="packed", depth=1)
         inputs_fifo = ObjectFifo(inputs_ty, name="inputs", depth=1)
@@ -654,6 +634,14 @@ def flatten_intervals(intervals_by_tile):
     )
 
 
+def top_level_intervals(intervals_by_tile):
+    return [
+        interval
+        for interval in flatten_intervals(intervals_by_tile)
+        if interval["depth"] == 0
+    ]
+
+
 def total_cycles(intervals):
     if not intervals:
         raise RuntimeError("no trace intervals found")
@@ -666,7 +654,9 @@ def run_traced(program, args, tag):
     try:
         from aie.utils.trace import TraceConfig
     except ImportError as exc:
-        raise SkipTest(f"AIE trace utilities are not installed: {exc}") from exc
+        raise NpuUnavailable(
+            f"AIE trace utilities are not installed: {exc}"
+        ) from exc
 
     trace_file = TMP_ROOT / f"{tag}_trace.txt"
     trace_json = TMP_ROOT / f"{tag}_trace.json"

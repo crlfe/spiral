@@ -30,10 +30,6 @@ static_assert(kRecordRows == kChunksPerRecord * kUnpackTileRows,
 static_assert(kPackedChunkBytes == 416, "Q6_K packed chunk size changed");
 static_assert(kPackedRecordBytes == 1680, "Q6_K packed record size changed");
 
-inline const uint8_t* common_scales(const uint8_t* record) {
-  return record;
-}
-
 inline const uint8_t* chunk(const uint8_t* record, int chunk_index) {
   return record + kCommonScaleBytes + chunk_index * kPackedChunkBytes;
 }

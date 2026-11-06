@@ -1,7 +1,6 @@
 """Repack, NPU-unpack, and bf16 mmul test for `src/quants` formats."""
 
 import argparse
-import importlib
 import sys
 from pathlib import Path
 
@@ -16,37 +15,8 @@ from ml_dtypes import bfloat16
 
 def parse_args():
     parser = argparse.ArgumentParser(description="quants mmul test")
-    parser.add_argument("--format", required=True, choices=["q4_0", "q6_k"])
-    parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument("--weights-rows", type=int)
-    parser.add_argument("--weights-cols", type=int)
+    common.add_common_args(parser)
     return parser.parse_args()
-
-
-def resolve_shape(args, fmt):
-    rows = (
-        args.weights_rows
-        if args.weights_rows is not None
-        else fmt.DEFAULT_ROWS
-    )
-    cols = (
-        args.weights_cols
-        if args.weights_cols is not None
-        else fmt.DEFAULT_COLS
-    )
-    constants = common.layout_constants(args.format)
-    if rows <= 0 or cols <= 0:
-        raise ValueError("weights_rows and weights_cols must be positive")
-    if rows % constants["kRecordRows"] != 0:
-        raise ValueError(
-            f"weights_rows must be a multiple of "
-            f"{constants['kRecordRows']}"
-        )
-    if cols % constants["kTileCols"] != 0:
-        raise ValueError(
-            f"weights_cols must be a multiple of {constants['kTileCols']}"
-        )
-    return rows, cols, constants
 
 
 def make_inputs(weights_rows, seed, inputs_vecs, inputs_len_tile):
@@ -67,100 +37,85 @@ def make_inputs(weights_rows, seed, inputs_vecs, inputs_len_tile):
 
 def main():
     args = parse_args()
-    try:
-        fmt = importlib.import_module(f"formats.{args.format}")
-    except ModuleNotFoundError as exc:
-        raise SystemExit(f"unknown format: {args.format}") from exc
+    fmt = common.load_format(args.format)
 
     try:
-        weights_rows, weights_cols, constants = resolve_shape(args, fmt)
+        weights_rows, weights_cols, _ = common.resolve_shape(
+            fmt, args.format, args.rows, args.cols
+        )
     except ValueError as exc:
         raise SystemExit(f"invalid shape: {exc}") from exc
 
-    rng = np.random.default_rng(args.seed)
-    raw = fmt.make_raw(weights_rows, weights_cols, rng)
-    src_col_stride_bytes = (
-        weights_rows // constants["kBlockRows"]
-    ) * constants["kBlockBytes"]
-    packed = common.repack_host(
-        args.format,
-        raw,
-        weights_rows,
-        weights_cols,
-        src_col_stride_bytes,
+    case = common.prepare_case(
+        fmt, args.format, args.seed, weights_rows, weights_cols
     )
-    expected_weights = fmt.reference_weights(raw, weights_rows, weights_cols)
+    constants = case.constants
     inputs_vecs = constants["kMmulInputsVecs"]
     inputs_len_tile = constants["kMmulInputsLen"]
     outputs_len_tile = constants["kMmulOutputsLen"]
     packed_inputs, inputs_rows = make_inputs(
-        weights_rows, args.seed, inputs_vecs, inputs_len_tile
+        case.weights_rows, args.seed, inputs_vecs, inputs_len_tile
     )
-    cols_tiles = weights_cols // constants["kTileCols"]
+    cols_tiles = case.weights_cols // constants["kTileCols"]
     outputs_elems = cols_tiles * inputs_vecs * outputs_len_tile
-    tiles = expected_weights.size // (
-        constants["kUnpackTileRows"] * constants["kTileCols"]
-    )
 
-    print(f"format: {args.format}")
-    print(f"weights: {weights_rows} rows x {weights_cols} cols")
-    print(f"packed bytes: {packed.size}")
+    common.print_case_header(case)
 
     if not common.npu_available():
-        print("SKIP: no NPU device available")
-        return 0
+        print("ERROR: no NPU device available")
+        return 1
 
     try:
         from aie import iron
 
         program = common.build_mmul_program(
-            args.format,
-            packed.size,
+            case.format_name,
+            case.packed.size,
             packed_inputs.size,
             outputs_elems,
-            weights_rows,
-            weights_cols,
+            case.weights_rows,
+            case.weights_cols,
         )
-        packed_tensor = iron.tensor(packed, dtype=np.uint8)
+        packed_tensor = iron.tensor(case.packed, dtype=np.uint8)
         inputs_tensor = iron.tensor(packed_inputs, dtype=bfloat16)
         outputs = iron.zeros((outputs_elems,), dtype=np.float32)
         intervals = common.run_traced(
             program,
             [packed_tensor, inputs_tensor, outputs],
-            f"quants_mmul_{args.format}_{weights_rows}x{weights_cols}",
+            f"quants_mmul_{case.format_name}_"
+            f"{case.weights_rows}x{case.weights_cols}",
         )
-    except common.SkipTest as exc:
-        print(f"SKIP: {exc}")
-        return 0
+    except common.NpuUnavailable as exc:
+        print(f"ERROR: {exc}")
+        return 1
     except Exception as exc:
         if common.is_device_error(exc):
-            print(f"SKIP: {exc}")
-            return 0
+            print(f"ERROR: {exc}")
+            return 1
         raise
 
-    flat = [
-        interval
-        for interval in common.flatten_intervals(intervals)
-        if interval["depth"] == 0
-    ]
+    flat = common.top_level_intervals(intervals)
     cycles = common.total_cycles(flat)
     print(f"cycles: {cycles}")
-    print(f"cycles/tile: {cycles / tiles:.3f}")
-    if len(flat) == 2 * tiles:
+    print(f"cycles/tile: {cycles / case.tiles:.3f}")
+    print(f"weights/cycle: {case.expected_weights.size / cycles:.3f}")
+    if len(flat) == 2 * case.tiles:
         unpack_cycles = sum(interval["cycles"] for interval in flat[0::2])
         mmul_cycles = sum(interval["cycles"] for interval in flat[1::2])
         print(f"unpack cycles: {unpack_cycles}")
         print(f"mmul cycles: {mmul_cycles}")
     else:
         print(
-            f"WARNING: expected {2 * tiles} trace intervals, "
+            f"WARNING: expected {2 * case.tiles} trace intervals, "
             f"found {len(flat)}"
         )
 
     weights_matrix = (
-        expected_weights.reshape(cols_tiles, weights_rows, constants["kTileCols"])
+        case.expected_weights.reshape(
+            cols_tiles, case.weights_rows, constants["kTileCols"]
+        )
         .transpose(1, 0, 2)
-        .reshape(weights_rows, weights_cols)
+        .reshape(case.weights_rows, case.weights_cols)
         .astype(np.float32)
     )
     expected_outputs = inputs_rows @ weights_matrix
@@ -168,7 +123,7 @@ def main():
         cols_tiles, inputs_vecs, outputs_len_tile
     )
     actual_outputs = actual.transpose(1, 0, 2).reshape(
-        inputs_vecs, weights_cols
+        inputs_vecs, case.weights_cols
     )
     error = np.abs(actual_outputs - expected_outputs)
 

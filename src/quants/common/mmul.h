@@ -3,7 +3,6 @@
 #include <aie_api/aie.hpp>
 
 #include "quants/common/tile.h"
-#include "quants/common/trace.h"
 
 namespace spiral::quants {
 
@@ -20,7 +19,6 @@ template <int weights_rows_tiles>
 static inline void mmul_weights_tile(const bfloat16* inputs,
                                      const bfloat16* weights,
                                      float* outputs) {
-  TRACE_ENTER();
   MMUL accumulator(aie::load_v<kMmulOutputsElems>(outputs));
 #pragma unroll
   for (int weights_rows_tile = 0; weights_rows_tile < weights_rows_tiles;
@@ -32,7 +30,6 @@ static inline void mmul_weights_tile(const bfloat16* inputs,
             weights + weights_rows_tile * kMmulWeightsElems));
   }
   aie::store_v(outputs, accumulator.template to_vector<float>());
-  TRACE_LEAVE();
 }
 
 }  // namespace spiral::quants
