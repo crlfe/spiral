@@ -2,15 +2,15 @@
 
 ## Current state
 
-`q4_0.cc` unpacks one 16-block Q4_0 tile:
+`formats/q4_0/q4_0.cc` unpacks one 16-block Q4_0 tile:
 
-- 16 canonical 18-byte blocks = 8 output columns x 2 K blocks.
-- 64 K values x 8 columns = 512 weights.
+- 16 canonical 18-byte blocks = 8 output columns x 2 reduction blocks.
+- 64 reduction values x 8 columns = 512 weights.
 - Input is a host-repacked tile of aligned signed-int4 values.
-- Output is eight 8x8 bf16 subtiles in `aie::mmul` B layout.
-- The kernel is bracketed by `event0()` / `event1()`.
+- Output is eight 8x8 bf16 subtiles in `aie::mmul` weights tile layout.
+- The kernel is bracketed by `TRACE_ENTER()` / `TRACE_LEAVE()`.
 
-Current measurement (`q4_0.py`):
+Current measurement (`run.py --format q4_0`):
 
 ```text
 event0 -> event1: 227 cycles
@@ -64,13 +64,13 @@ This removed unaligned loads, nibble deinterleaving, and the zero-point add.
 
 ### 2. Transposed 4x8 layout (done)
 
-The repack now transposes values into 4 K x 8 N payloads:
+The repack now transposes values into 4 reduction x 8 outputs payloads:
 
 ```text
 per k block: [8 x 16-byte payloads][8 fp16 scales]
 ```
 
-The kernel emits the mmul B layout directly, with no in-kernel transpose and
+The kernel emits the weights tile layout directly, with no in-kernel transpose and
 no `col_vals` temporary. Each payload is multiplied by a 32-wide scale pattern
 `[s0..s7, s0..s7, s0..s7, s0..s7]`.
 
@@ -132,7 +132,7 @@ Per-core targets:
 | 1.4 GHz | 1.23 | 2.18 | 0.458 | 235 |
 | 1.6 GHz | 1.08 | 1.91 | 0.524 | 268 |
 
-The mmul still has to run in the same loop. For a 64x8 B tile with M=4, the
+The mmul still has to run in the same loop. For a 64x8 weights tile with 4 input rows, the
 mmul is 8 `aie::mmul<4,8,8>` MACs, plus A/C loads and stores. Reserve roughly
 20-50 cycles/tile for it.
 
@@ -178,19 +178,19 @@ the two paths would make the comparison easy.
 
 ### 2. Revisit tile shape
 
-The current tile is 64 K x 8 N. Sweep:
+The current tile is 64 reduction x 8 outputs. Sweep:
 
-- 8 blocks = 32 K x 8 N;
-- 16 blocks = 64 K x 8 N (current);
-- 32 blocks = 64 K x 16 N (two adjacent B tiles);
-- 64 blocks = 128 K x 8 N.
+- 8 blocks = 32 reduction x 8 outputs;
+- 16 blocks = 64 reduction x 8 outputs (current);
+- 32 blocks = 64 reduction x 16 outputs (two adjacent weights tiles);
+- 64 blocks = 128 reduction x 8 outputs.
 
 Larger tiles amortize scale-pattern and loop overhead but increase register
 pressure and code size. The 16-block version is a correctness reference, not
 necessarily the best throughput point.
 
 If the mmul uses a 2x2 expansion, produce two adjacent N tiles per dequant tile
-so the consumer can reuse A across two B tiles.
+so the consumer can reuse inputs across two weights tiles.
 
 ### 3. Fuse with the mmul loop and overlap
 
@@ -199,7 +199,7 @@ Once the dequant primitive is fast enough:
 - Keep the fused per-tile loop: dequantize into a small B buffer and consume it
   immediately.
 - Ensure weight FIFO depth is enough to overlap DMA with dequant and mmul.
-- Measure the actual mmul cost per 64x8 B tile; reserve it explicitly in the
+- Measure the actual mmul cost per 64x8 weights tile; reserve it explicitly in the
   budget.
 - Re-test a split dequant/mma design only if the fused loop is limited by
   scheduling; the earlier split prototype was slower.
@@ -245,7 +245,7 @@ useful reference point:
 
 ## Measurement plan
 
-- Use `q4_0.py` with the in-kernel `event0()` / `event1()` bracket.
+- Use `run.py --format q4_0` with the `TRACE_ENTER()` / `TRACE_LEAVE()` macros.
 - Keep the trace buffer small (4 KiB) and report cycles/tile and
   weights/cycle.
 - Run one NPU process at a time.
