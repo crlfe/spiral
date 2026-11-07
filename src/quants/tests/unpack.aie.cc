@@ -14,7 +14,7 @@
 #include <stdint.h>
 
 #include QUANTS_STRINGIFY(quants/QUANTS_FORMAT/layout.h)
-#include QUANTS_STRINGIFY(quants/QUANTS_FORMAT/unpack.h)
+#include QUANTS_STRINGIFY(quants/QUANTS_FORMAT/unpack.aie.h)
 
 extern "C" void quants_unpack_all(const uint8_t* packed, bfloat16* out) {
   using namespace spiral::quants::QUANTS_FORMAT;

@@ -21,8 +21,8 @@ TESTS_ROOT = Path(__file__).resolve().parent
 QUANTS_ROOT = TESTS_ROOT.parent
 SRC_ROOT = QUANTS_ROOT.parent
 REPACK_SHIM = TESTS_ROOT / "repack.cc"
-UNPACK_SHIM = TESTS_ROOT / "unpack.cc"
-MMUL_SHIM = TESTS_ROOT / "mmul.cc"
+UNPACK_SHIM = TESTS_ROOT / "unpack.aie.cc"
+MMUL_SHIM = TESTS_ROOT / "mmul.aie.cc"
 _TMP_DIR = tempfile.TemporaryDirectory(prefix="quants_tests_")
 TMP_ROOT = Path(_TMP_DIR.name)
 _TRACE_SIZE = 4096
@@ -360,12 +360,12 @@ def _npu_shim(format_name, body_path, weights_rows, weights_cols, tag):
 def _header_files(format_name, include_mmul=False):
     paths = [
         QUANTS_ROOT / "common" / "tile.h",
-        QUANTS_ROOT / "common" / "scale.h",
+        QUANTS_ROOT / "common" / "scale.aie.h",
         QUANTS_ROOT / format_name / "layout.h",
-        QUANTS_ROOT / format_name / "unpack.h",
+        QUANTS_ROOT / format_name / "unpack.aie.h",
     ]
     if include_mmul:
-        paths.append(QUANTS_ROOT / "common" / "mmul.h")
+        paths.append(QUANTS_ROOT / "common" / "mmul.aie.h")
     return [str(path) for path in paths]
 
 

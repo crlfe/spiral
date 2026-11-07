@@ -4,7 +4,7 @@
 
 #include <aie_api/aie.hpp>
 
-#include "quants/common/scale.h"
+#include "quants/common/scale.aie.h"
 #include "quants/q4_0/layout.h"
 
 namespace spiral::quants::q4_0 {

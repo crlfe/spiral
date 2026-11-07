@@ -13,10 +13,10 @@
 
 #include <stdint.h>
 
-#include "quants/common/mmul.h"
+#include "quants/common/mmul.aie.h"
 #include "quants/common/tile.h"
 #include QUANTS_STRINGIFY(quants/QUANTS_FORMAT/layout.h)
-#include QUANTS_STRINGIFY(quants/QUANTS_FORMAT/unpack.h)
+#include QUANTS_STRINGIFY(quants/QUANTS_FORMAT/unpack.aie.h)
 
 extern "C" void quants_unpack_mmul_all(const uint8_t* packed,
                                        const bfloat16* inputs,

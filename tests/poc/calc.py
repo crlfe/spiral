@@ -50,8 +50,8 @@ l1_weights_elems = l1_rows * l1_cols  # bf16 elements per compute tile
 l2_weights_elems = computes * l1_weights_elems  # bf16 elements per group
 
 kernel_dir = Path(__file__).resolve().parent
-calc_zero_source = kernel_dir / "calc_zero.cc"
-calc_mmul_source = kernel_dir / "calc_mmul.cc"
+calc_zero_source = kernel_dir / "calc_zero.aie.cc"
+calc_mmul_source = kernel_dir / "calc_mmul.aie.cc"
 kernel_sources = [calc_zero_source, calc_mmul_source]
 
 

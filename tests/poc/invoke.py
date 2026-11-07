@@ -334,12 +334,12 @@ def _bench_native(
         f"-I{site_packages}/mlir_aie/include",
         f"-I{work_dir}",
         "-oinvoke",
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "invoke.cpp"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "invoke.cc"),
         "-lxrt++",
         "-lxrt_coreutil",
     )
 
-    # invoke.cpp prints a total for the pipeline mode instead of a min-max range.
+    # invoke.cc prints a total for the pipeline mode instead of a min-max range.
     print(f"  {'mode':<20} {'avg us':>7}  {'(min-max)':>14}")
     for mode in modes:
         run_tool("./invoke", mode, str(num_calls), str(warmup))
