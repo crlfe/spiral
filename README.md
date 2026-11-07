@@ -13,16 +13,13 @@ NPU can be used as an accelerator, starting with offloading large matrix ops.
 The eventual code will build in a fork of the llama.cpp tree, but for now this
 repository will be for proving capabilities and benchmarking.
 
-### Done
-
-* tests/poc/memory.py: Check the available host->NPU memory bandwidth.
-* tests/poc/flow.py: Check the max bandwidth through a plausible data flow.
-* tests/poc/invoke.py: Check the latency of running multiple operations.
-* tests/poc/calc.py: Check the throughput of a matrix multiply kernel.
-
-### Future Plans
-
-* Backend for llama.cpp that offloads matrix multiplies to the NPU.
+My current focus is bringing up a basic set of dequantization routines, which
+take the highly-compressed weights typical of consumer models and expand them
+on the NPU to the bf16 blocks that its hardware can efficiently multiply.
+Optimizing those well enough to run at full bandwidth will be a challenge,
+so I have added a framework for fast unit testing and cycle counting. The first
+real model test will be Gemma 4 26B-A4B IT QAT Q4_0, where I aim to match the
+iGPU's tps when running on the NPU and double my throughput when running both.
 
 ## Development Hardware
 

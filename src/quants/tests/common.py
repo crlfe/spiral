@@ -99,13 +99,19 @@ def _eval_const_expr(expression, values, path, line_number):
 
 
 def parse_layout(path):
-    """Parse namespace-scope `constexpr int NAME = expression;` lines."""
+    """Parse namespace-scope `constexpr int NAME = expression;` declarations.
+
+    Expressions may span multiple lines; parsing continues through the
+    terminating semicolon.
+    """
     path = Path(path)
     values = {}
-    for line_number, raw_line in enumerate(
-        path.read_text().splitlines(), start=1
-    ):
-        line = raw_line.split("//", 1)[0].strip()
+    lines = path.read_text().splitlines()
+    index = 0
+    while index < len(lines):
+        line_number = index + 1
+        line = lines[index].split("//", 1)[0].strip()
+        index += 1
         if not line:
             continue
         if line.startswith("#"):
@@ -120,14 +126,26 @@ def parse_layout(path):
             raise ValueError(
                 f"{path}:{line_number}: inline constexpr is not allowed"
             )
-
-        match = _CONST_RE.match(line)
-        if not match:
-            if line.startswith("constexpr"):
-                raise ValueError(
-                    f"{path}:{line_number}: unsupported constexpr declaration"
-                )
+        if not line.startswith("constexpr"):
             continue
+
+        declaration = [line]
+        while not declaration[-1].endswith(";"):
+            if index >= len(lines):
+                raise ValueError(
+                    f"{path}:{line_number}: constexpr declaration is "
+                    "missing ';'"
+                )
+            continuation = lines[index].split("//", 1)[0].strip()
+            index += 1
+            if continuation:
+                declaration.append(continuation)
+
+        match = _CONST_RE.match(" ".join(declaration))
+        if not match:
+            raise ValueError(
+                f"{path}:{line_number}: unsupported constexpr declaration"
+            )
 
         name, expression = match.groups()
         values[name] = _eval_const_expr(

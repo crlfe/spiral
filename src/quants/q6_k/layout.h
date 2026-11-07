@@ -21,7 +21,8 @@ constexpr int kRecordRows = 256;
 constexpr int kChunksPerRecord = 4;
 constexpr int kCommonScaleBytes = 16;
 constexpr int kPackedChunkBytes = 416;
-constexpr int kPackedRecordBytes = kCommonScaleBytes + kChunksPerRecord * kPackedChunkBytes;
+constexpr int kPackedRecordBytes =
+    kCommonScaleBytes + kChunksPerRecord * kPackedChunkBytes;
 
 static_assert(kTileCols == ::spiral::quants::kMmulWeightsCols,
               "Q6_K tile columns must match the mmul tile width");

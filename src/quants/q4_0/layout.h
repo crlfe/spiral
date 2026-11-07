@@ -18,13 +18,15 @@ constexpr int kBlockPayloadRegionBytes = 128;
 // Repacked record/chunk layout.
 constexpr int kTileCols = 8;
 constexpr int kBlocksPerRecord = 2;
-constexpr int kUnitBytes = kBlockPayloadRegionBytes + kTileCols * kBlockScaleBytes;
+constexpr int kUnitBytes =
+    kBlockPayloadRegionBytes + kTileCols * kBlockScaleBytes;
 constexpr int kUnpackTileRows = 64;
 constexpr int kRecordRows = 64;
 constexpr int kChunksPerRecord = 1;
 constexpr int kCommonScaleBytes = 0;
 constexpr int kPackedChunkBytes = kBlocksPerRecord * kUnitBytes;
-constexpr int kPackedRecordBytes = kCommonScaleBytes + kChunksPerRecord * kPackedChunkBytes;
+constexpr int kPackedRecordBytes =
+    kCommonScaleBytes + kChunksPerRecord * kPackedChunkBytes;
 
 static_assert(kTileCols == ::spiral::quants::kMmulWeightsCols,
               "Q4_0 tile columns must match the mmul tile width");

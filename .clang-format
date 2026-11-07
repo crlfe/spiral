@@ -1,0 +1,6 @@
+# Match the existing project style (previously the cpptools/clangd fallback).
+BasedOnStyle: Chromium
+Standard: c++20
+ColumnLimit: 80
+IndentWidth: 2
+PointerAlignment: Left

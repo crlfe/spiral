@@ -6,8 +6,7 @@
 # file, and trace_to_json() + get_cycles_summary() turn it into per-invocation
 # cycle counts. Use this to check the tracing API, not as a benchmark.
 #
-#     source /home/crlfe/Projects/mlir-aie/iron_env.sh
-#     python tests/poc/trace_example.py
+#     source mlir-aie/iron_env.sh && python tests/poc/trace.py
 #
 
 import argparse
