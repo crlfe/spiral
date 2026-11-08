@@ -25,7 +25,7 @@ UNPACK_SHIM = TESTS_ROOT / "unpack.aie.cc"
 MMUL_SHIM = TESTS_ROOT / "mmul.aie.cc"
 _TMP_DIR = tempfile.TemporaryDirectory(prefix="quants_tests_")
 TMP_ROOT = Path(_TMP_DIR.name)
-_TRACE_SIZE = 4096
+_TRACE_SIZE = 16384
 
 
 class NpuUnavailable(Exception):
@@ -364,14 +364,12 @@ def _write_shim(source, tag):
 
 
 def _npu_shim(format_name, body_path, weights_rows, weights_cols, tag):
-    source = _shim_source(
-        body_path,
-        {
-            "QUANTS_FORMAT": format_name,
-            "QUANTS_WEIGHTS_ROWS": weights_rows,
-            "QUANTS_WEIGHTS_COLS": weights_cols,
-        },
-    )
+    definitions = {
+        "QUANTS_FORMAT": format_name,
+        "QUANTS_WEIGHTS_ROWS": weights_rows,
+        "QUANTS_WEIGHTS_COLS": weights_cols,
+    }
+    source = _shim_source(body_path, definitions)
     return _write_shim(source, tag)
 
 
@@ -384,6 +382,7 @@ def _header_files(format_name, include_mmul=False):
     ]
     if include_mmul:
         paths.append(QUANTS_ROOT / "common" / "mmul.aie.h")
+        paths.append(QUANTS_ROOT / format_name / "mmul.aie.h")
     return [str(path) for path in paths]
 
 
@@ -416,7 +415,11 @@ def _require_iron():
 
 
 def build_unpack_program(
-    format_name, packed_bytes, output_elems, weights_rows, weights_cols
+    format_name,
+    packed_bytes,
+    output_elems,
+    weights_rows,
+    weights_cols,
 ):
     (
         iron,
@@ -429,12 +432,13 @@ def build_unpack_program(
         Worker,
         NPU2,
     ) = _require_iron()
+    tag = f"quants_unpack_{format_name}_{weights_rows}x{weights_cols}"
     shim = _npu_shim(
         format_name,
         UNPACK_SHIM,
         weights_rows,
         weights_cols,
-        f"quants_unpack_{format_name}_{weights_rows}x{weights_cols}",
+        tag,
     )
     source_files = [
         str(shim),
@@ -515,12 +519,13 @@ def build_mmul_program(
         Worker,
         NPU2,
     ) = _require_iron()
+    tag = f"quants_mmul_{format_name}_{weights_rows}x{weights_cols}"
     shim = _npu_shim(
         format_name,
         MMUL_SHIM,
         weights_rows,
         weights_cols,
-        f"quants_mmul_{format_name}_{weights_rows}x{weights_cols}",
+        tag,
     )
     source_files = [
         str(shim),

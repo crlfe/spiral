@@ -1,4 +1,8 @@
-"""Repack and NPU-unpack test for `src/quants` formats."""
+"""Quant format/layout conformance test.
+
+Verifies host repack and exact bf16 unpack against the Python reference.
+The fused unpack + mmul path is covered by `mmul.py`.
+"""
 
 import argparse
 import sys

@@ -8,8 +8,8 @@ namespace spiral::quants {
 
 // Convert eight contiguous fp16 values to f32 with a packed bit trick:
 //   f32 = sign | ((exp16 + 112) << 23) | (mantissa << 13)
-static inline __attribute__((always_inline)) aie::vector<float, 8>
-load_fp16x8(const uint8_t* p) {
+static inline __attribute__((always_inline)) aie::vector<float, 8> load_fp16x8(
+    const uint8_t* p) {
   const auto h = aie::load_v<8>(reinterpret_cast<const uint16_t*>(p));
   const auto u = h.unpack();
 
@@ -29,8 +29,8 @@ static inline __attribute__((always_inline)) void split_bf16_hi_lo(
     aie::vector<bfloat16, 8>& lo) {
   hi = aie::to_vector<bfloat16>(aie::accum<accfloat, 8>(scales));
   const auto hi_f = aie::accum<accfloat, 8>(hi).template to_vector<float>();
-  lo = aie::to_vector<bfloat16>(
-      aie::accum<accfloat, 8>(aie::sub(scales, hi_f)));
+  lo =
+      aie::to_vector<bfloat16>(aie::accum<accfloat, 8>(aie::sub(scales, hi_f)));
 }
 
 }  // namespace spiral::quants

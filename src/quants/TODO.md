@@ -1,37 +1,37 @@
 # `src/quants` TODO
 
 Production code lives in `spiral::quants`. Host repack and NPU unpack are
-header-only.
+header-only. Optimization findings are recorded in `NOTES.md`.
 
 ## Status
 
-Q4_0 is implemented and verified on XDNA2:
-
 | item | state |
 | :-- | :-- |
-| Q4_0 layout, host repack, optimized hi/lo unpack | implemented |
+| Q4_0 layout, host repack, exact unpack | implemented |
+| Q4_0 fused unpack + mmul, two columns | implemented |
 | Q4_0 `tests/unpack.py` | passes, exact bf16 match |
 | Q4_0 `tests/mmul.py` | passes, exact mmul match |
 | Q6_K layout and Python reference | implemented |
-| Q6_K C++ repack/unpack | no-ops; accuracy tests fail |
+| Q6_K C++ unpack/mmul | skeleton; tests fail as expected |
 | NPU-less execution | clear error; NPU required |
 | Host header compilation | C++17, no AIE in `repack.h` |
-| Test shims | `tests/unpack.aie.cc`, `tests/mmul.aie.cc`, `tests/repack.cc` |
+| Test shims | `unpack.aie.cc`, `mmul.aie.cc`, `repack.cc` |
 
-Baseline (Q4_0, 64x64): **1,963 cycles for 8 tiles**, or **245 cycles per
-512-weight tile**; a single 64x8 tile is **241 cycles**. Fused unpack and mmul
-are **1,928** and **1,712 cycles**, so mmul is now a significant fraction of
-the loop.
+Current Q4_0 exact results, the standalone unpack baseline, and the fast-mode
+comparison are recorded in `NOTES.md`.
+
+Reaching 60 GB/s needs about **2.22 weights/core-cycle**, or 71.1 weights per
+device clock across 32 cores.
 
 ## Next implementation steps
 
-Ordering is by model impact: finish the Q6_K stub first, then Q8_0, then the
-K-quant families and conversion controls, then codebook formats. Defer other
-types until a target model or benchmark requires them.
+Ordering is by model impact: finish Q6_K first, then Q8_0, then the K-quant
+families and conversion controls, then codebook formats. Defer other types until
+a target model or benchmark requires them.
 
 ### 1. Finish Q6_K
 
-Q6_K already has a layout, Python reference, and failing tests. It validates the
+Q6_K has a layout, Python reference, and failing tests. It validates the
 four-chunk record model and shared-scale metadata.
 
 - Keep `kRecordRows = 256`, `kUnpackTileRows = 64`, `kChunksPerRecord = 4`,
@@ -48,7 +48,8 @@ four-chunk record model and shared-scale metadata.
 - Use hi/lo bf16 scales for the accurate path; retain a single-bf16 fast path
   for later comparison.
 - Update the Python packed-byte reference only after the layout is fixed.
-- Expected result: Q6_K `tests/unpack.py` and `tests/mmul.py` pass on a device.
+- Implement the real `q6_k/unpack.aie.h` and `q6_k/mmul.aie.h`; expected result:
+  Q6_K `tests/unpack.py` and `tests/mmul.py` pass on a device.
 
 ### 2. Q8_0
 
@@ -114,7 +115,8 @@ until a target model or benchmark requires them.
 - C++17, no exceptions, no RTTI.
 - Headers use `#pragma once`; all header functions are `inline` (or
   `constexpr` for compile-time helpers).
-- `repack.h` must be usable by the host loader without AIE headers.
+- `repack.h` and `layout.h` must be usable by the host loader without AIE
+  headers. Device-only code belongs in `.aie.h`.
 - `GGML_LOG_*` may be used by callers, not inside these headers.
 - Layout and shared constants are namespace-scope `constexpr`, **not**
   `inline constexpr`.
@@ -124,8 +126,10 @@ until a target model or benchmark requires them.
 - Host repack byte counts, capacities, strides, and offsets stay `int64_t`.
   NPU-side loop counters and record/chunk indices use `int32_t`; per-launch
   shapes are small enough that this is safe.
-- Production headers contain no tracing. The test shims call `event0()` and
-  `event1()` directly.
+- Production headers contain no tracing. Test shims select
+  `aie::rounding_mode::conv_even` once and call `event0()` / `event1()`.
+- Use device-side vector pointers for hot tile access. Avoid struct member
+  access in the hot loop; it regressed the fused kernel.
 
 ## Naming and canonical layouts
 
@@ -226,14 +230,22 @@ void unpack_weights_chunk(const uint8_t* record,
 ```
 
 `record` points at the start of the shared metadata. The unpack function writes
-the canonical bf16 weights tile directly. Formats with
-`kChunksPerRecord == 1` may also provide:
+the canonical bf16 weights tile directly. Formats call `unpack_weights_chunk`
+once per chunk, including single-chunk formats such as Q4_0.
+
+### Fused API
+
+Each format provides `mmul.aie.h` with:
 
 ```cpp
-void unpack_weights_tile(const uint8_t* record, bfloat16* weights_tile);
+template <int weights_rows, int weights_cols>
+inline void unpack_mmul(const uint8_t* packed,
+                        const bfloat16* inputs,
+                        float* outputs);
 ```
 
-Multi-chunk formats use `unpack_weights_chunk` only.
+The caller must zero `outputs` and select `conv_even` rounding. Q4_0 processes
+two column tiles together; Q6_K is still a skeleton.
 
 ## Format constants
 
@@ -241,11 +253,15 @@ Multi-chunk formats use `unpack_weights_chunk` only.
 
 ```text
 canonical block: 32 rows, 18 bytes
-payload: 8 x 16-byte signed-int4 4x8 payloads
-scales:  8 fp16, one per column, per 32-row block
-record:  64 rows, one chunk, no common scales
+payload: 8 x 16-byte signed-int4 4x8 payloads per 32-row block
+scales:  8 fp16 per 32-row block
+record:  64 rows, one chunk
+layout:  32 bytes of scales, then 256 bytes of payloads
 packed:  288 bytes per record
 ```
+
+The scales-first layout keeps every 32-byte tile payload 32-byte aligned.
+`load_v<32>` is valid for all tiles.
 
 ### Q6_K
 
@@ -284,33 +300,40 @@ Type counts across the current target model set:
 
 ```text
 src/quants/
+  NOTES.md                    optimization lessons and current results
   common/
-    k_quant.h               shared 6-bit K scale/min unpack
-    iq4nl.h                 shared IQ4_NL codebook
+    k_quant.h                 shared 6-bit K scale/min unpack
+    iq4nl.h                   shared IQ4_NL codebook
   q8_0/
     layout.h
     repack.h
     unpack.aie.h
+    mmul.aie.h
   q4_k/
     layout.h
     repack.h
     unpack.aie.h
+    mmul.aie.h
   q5_k/
     layout.h
     repack.h
     unpack.aie.h
+    mmul.aie.h
   bf16/
     layout.h
     repack.h
     unpack.aie.h
+    mmul.aie.h
   iq4_nl/
     layout.h
     repack.h
     unpack.aie.h
+    mmul.aie.h
   iq4_xs/
     layout.h
     repack.h
     unpack.aie.h
+    mmul.aie.h
   tests/
     conformance.py
     formats/
@@ -323,16 +346,19 @@ src/quants/
 ```
 
 Exact filenames may change if formats share a common layout, but each format
-must keep its own layout/repack/unpack units so tests and production kernels
-share one implementation.
+must keep its own layout/repack/unpack/mmul units so tests and production
+kernels share one implementation.
 
 ## Shared implementation work
 
 - `common/scale.aie.h` provides fp16x8 loading and hi/lo bf16 scale splitting.
   Reuse it for K-quant and codebook formats that need scale conversion.
-- Use `aie::scoped_mode rounding{aie::rounding_mode::conv_even};` around bf16
-  conversions. The default tile rounding mode truncates; `scoped_mode` restores
-  the previous mode on scope exit.
+- `common/mmul.aie.h` provides the vector mmul tile helper.
+- `q4_0/unpack.aie.h` provides shared `load_block_scales64()` and
+  `dequantize_tile()` helpers used by both the reference unpack and the fused
+  mmul.
+- Select `aie::rounding_mode::conv_even` once in the kernel shim; unpack
+  helpers assume that mode is already set.
 - Add a K-quant scale/min helper for 6-bit packed scales.
 - Add a shared codebook helper for IQ formats.
 - Keep host repack format-specific; do not leak format layout into
@@ -341,54 +367,41 @@ share one implementation.
   - `kTileCols == kMmulWeightsCols`
   - `kUnpackTileRows % kMmulWeightsRows == 0`
   - record and chunk size consistency
+  - payload alignment where the format uses 32-byte tile loads
 - Keep `layout.h` constants in the `constexpr int NAME = expression;` form
   parsed by `tests/common.py`; expressions may wrap across lines.
 
 ## Optimization roadmap
 
-### Q4_0 scale-mode variants
+### Q4_0 scale modes
 
-The optimized hi/lo path is now the default. Add variant testing without
-changing the packed layout:
+The exact hi/lo path is the default. A single-bf16 fast mode measured about 12%
+faster but failed the exact verification tolerance.
 
 - Add a `ScaleMode` compile-time parameter:
   - `exact`: current hi/lo bf16 scale split, bit-identical to float dequant.
   - `fast`: single bf16 scale, lower precision and fewer cycles.
 - Keep the current non-template `unpack_weights_chunk()` as the default wrapper
   around `unpack_weights_chunk_impl<ScaleMode::exact>()`.
-- Add named variants to the Python format module, with each variant carrying
-  its expected verification policy.
-- Add `--variant` to `tests/unpack.py` and `tests/mmul.py`. Do not expose raw
-  template arguments or blindly inject user-provided values.
-- Generate or select explicit NPU shim wrappers for each named variant.
+- Give each named variant an explicit verification policy. The fast variant
+  should not silently pass through the exact mmul tolerance.
+- Add a named variant selector to the test shims. Do not expose raw template
+  arguments or blindly inject user-provided values.
 - Report the variant name with cycle results.
-- Measure the fast path against the current 245 cycles/tile 64x64 result and
-  241 cycles/tile single-tile result.
-- Only add layout-changing variants (payload representation, tile shape,
-  column pairing) after a layout-policy design exists.
+- Measure against the current 300 cycles/tile 64x64 exact result.
 
 ### Fused unpack and mmul
 
-- Fuse at chunk level first: unpack one 64x8 chunk, then immediately run
-  `mmul_weights_tile<kUnpackTileRows / kMmulWeightsRows>`.
-- Avoid materializing multiple chunks at once.
-- Keep separate `event0()` / `event1()` scopes in `tests/mmul.aie.cc` for unpack
-  and mmul so stage timing remains visible.
-- Measure whether the current full-chunk materialization costs anything before
-  changing the public API.
+The production Q4_0 implementation is the direct two-column fused path:
 
-### Tile-at-a-time cursor experiment
+- share the input tile between two column tiles;
+- use two independent mmul accumulators;
+- load one aligned 32-byte payload per tile;
+- fully unroll the eight-tile inner loop;
+- use device-side vector pointers for input, output, and payload tiles.
 
-Only after the vectorized chunk path is measured:
-
-- Prototype an internal `UnpackCursor` that holds the chunk pointer, common
-  scale pointer, tile index, and cached decoded scales.
-- Use it to generate one 8x8 tile at a time for a fused mmul loop.
-- Keep `unpack_weights_chunk()` as the public correctness reference; implement
-  it as a loop over the cursor if the experiment wins.
-- Do not expose the cursor publicly unless a pipelined or multi-tile consumer
-  demonstrably needs it.
-- Add a test that concatenating cursor tiles equals `unpack_weights_chunk()`.
+Do not reintroduce cursor objects or struct-based hot-path access unless they
+measurably beat the direct path.
 
 ### Chunk routing and larger tiles
 
@@ -396,7 +409,9 @@ Only after the vectorized chunk path is measured:
   correctness and timing are stable.
 - Compare 64-row chunks against 256-row records for metadata amortization and
   L1 pressure.
-- Keep `mmul_weights_tile<weights_rows_tiles>` generic over tile count.
+- Keep `unpack_mmul<weights_rows, weights_cols>` generic over record and tile
+  counts.
+- Investigate larger mmul shapes only if the AIE API supports them for bf16.
 
 ### Pipelining and memory
 
@@ -408,20 +423,20 @@ Only after the vectorized chunk path is measured:
 
 ## Test and benchmark roadmap
 
-- Add a `tests/conformance.py` or per-format fixture that compares dequantized
-  values against the host reference dequant output for random canonical blocks.
+- Keep `unpack.py` as the exact format/layout conformance test.
+- Keep `mmul.py` as the end-to-end fused correctness test.
 - Add a real-model test path that extracts a small slice of a representative
   tensor, repacks it, and compares against the Python reference. This catches
   assumptions that synthetic data may miss.
 - Keep the no-NPU error path and invalid-shape rejection tests.
 - Benchmark at least:
-  - Q4_0 64x64 and 128x128, exact and fast scale modes;
+  - Q4_0 64x64, 64x128, and 64x256, exact and fast scale modes;
   - Q8_0 64x64 and 128x128;
   - Q6_K 256x64;
   - Q4_K/Q5_K 256x64 and 512x64, split output if DMA limits require it.
-- Report cycles/tile, cycles/weight, weights/cycle, implied GB/s at 1.4 and
-  1.6 GHz, and separate unpack/mmul stages from the trace stack.
-- Record a baseline table in this file or a results file after each format.
+- Report cycles/tile, cycles/weight, weights/cycle, and implied packed GB/s at
+  1.5 GHz with 32 compute cores.
+- Record new baselines in `NOTES.md`.
 
 ## Definition of done
 
@@ -429,6 +444,7 @@ Only after the vectorized chunk path is measured:
 - [ ] Q8_0 unpack and mmul pass on a device.
 - [ ] Q4_K and Q5_K host repacks and dequantization match the host reference.
 - [ ] Q4_K and Q5_K NPU unpack and mmul pass on a device.
+- [x] Q4_0 fused two-column unpack + mmul passes exactly.
 - [ ] Q4_0 exact and fast scale modes are exposed through named variants with
       per-variant verification.
 - [ ] Invalid shapes are rejected for every format.
@@ -436,9 +452,8 @@ Only after the vectorized chunk path is measured:
 
 ## Deliberately deferred
 
-- Public tile-at-a-time unpack cursor API.
 - Chunk-to-compute-tile routing for multi-chunk formats.
 - Software pipelining and double buffering.
-- Larger mmul variants and paired column tiles.
+- Larger mmul variants beyond the current 4x8x8 tile.
 - IQ2/IQ1/TQ/MXFP4/NVFP4 support.
 - Host backend integration beyond the header/API contract.

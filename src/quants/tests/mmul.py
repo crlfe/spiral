@@ -1,4 +1,4 @@
-"""Repack, NPU-unpack, and bf16 mmul test for `src/quants` formats."""
+"""End-to-end fused unpack + bf16 mmul test for `src/quants` formats."""
 
 import argparse
 import sys
@@ -38,7 +38,6 @@ def make_inputs(weights_rows, seed, inputs_vecs, inputs_len_tile):
 def main():
     args = parse_args()
     fmt = common.load_format(args.format)
-
     try:
         weights_rows, weights_cols, _ = common.resolve_shape(
             fmt, args.format, args.rows, args.cols
@@ -99,16 +98,7 @@ def main():
     print(f"cycles: {cycles}")
     print(f"cycles/tile: {cycles / case.tiles:.3f}")
     print(f"weights/cycle: {case.expected_weights.size / cycles:.3f}")
-    if len(flat) == 2 * case.tiles:
-        unpack_cycles = sum(interval["cycles"] for interval in flat[0::2])
-        mmul_cycles = sum(interval["cycles"] for interval in flat[1::2])
-        print(f"unpack cycles: {unpack_cycles}")
-        print(f"mmul cycles: {mmul_cycles}")
-    else:
-        print(
-            f"WARNING: expected {2 * case.tiles} trace intervals, "
-            f"found {len(flat)}"
-        )
+    print(f"trace intervals: {len(flat)}")
 
     weights_matrix = (
         case.expected_weights.reshape(
