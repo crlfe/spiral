@@ -25,7 +25,7 @@ UNPACK_SHIM = TESTS_ROOT / "unpack.aie.cc"
 MMUL_SHIM = TESTS_ROOT / "mmul.aie.cc"
 _TMP_DIR = tempfile.TemporaryDirectory(prefix="quants_tests_")
 TMP_ROOT = Path(_TMP_DIR.name)
-_TRACE_SIZE = 16384
+_TRACE_SIZE = 65536
 
 
 class NpuUnavailable(Exception):
@@ -73,7 +73,7 @@ def _eval_const_expr(expression, values, path, line_number):
             value = evaluate(node.operand)
             return value if isinstance(node.op, ast.UAdd) else -value
         if isinstance(node, ast.BinOp) and isinstance(
-            node.op, (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv, ast.Div)
+            node.op, (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv, ast.Div, ast.Mod)
         ):
             left = evaluate(node.left)
             right = evaluate(node.right)
@@ -89,6 +89,8 @@ def _eval_const_expr(expression, values, path, line_number):
                 )
             if isinstance(node.op, ast.FloorDiv):
                 return left // right
+            if isinstance(node.op, ast.Mod):
+                return left % right
             return int(left / right)
         raise ValueError(
             f"{path}:{line_number}: unsupported constant expression "

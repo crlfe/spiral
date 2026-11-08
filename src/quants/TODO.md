@@ -1,71 +1,78 @@
 # `src/quants` TODO
 
 Production code lives in `spiral::quants`. Host repack and NPU unpack are
-header-only. Optimization findings are recorded in `NOTES.md`.
+header-only. Current performance is summarized in `README.md`; detailed
+technique and benchmark findings are in `NOTES.md`.
 
-## Status
+## Status matrix
+
+| format | layout | host repack | exact unpack | fused mmul | tests | current best | next |
+| :-- | :-- | :-- | :-- | :-- | :-- | :-- | :-- |
+| Q4_0 | done | done | done | done | exact | 2.18-2.26 w/c | fast mode, multi-core |
+| Q6_K | done | done | done | done | exact | 1.60 w/c | multi-core, optional variants |
+| Q8_0 | done | done | done | done | exact | 1.99 w/c | multi-core |
+| Q4_K | not started | - | - | - | - | - | plan below |
+| Q5_K | not started | - | - | - | - | - | share Q4_K scale/min |
+| BF16 / F16 | not started | - | - | - | - | - | pass-through controls |
+| IQ4_NL | not started | - | - | - | - | - | codebook LUT |
+| IQ4_XS | not started | - | - | - | - | - | codebook LUT + scales |
+| Q3_K / IQ3_S | deferred | - | - | - | - | - | 3-bit/hmask |
+| Q2_K / IQ2 / IQ1 / TQ / MXFP4 / NVFP4 | deferred | - | - | - | - | - | target-dependent |
+
+Integration status:
 
 | item | state |
 | :-- | :-- |
-| Q4_0 layout, host repack, exact unpack | implemented |
-| Q4_0 fused unpack + mmul, two columns | implemented |
-| Q4_0 `tests/unpack.py` | passes, exact bf16 match |
-| Q4_0 `tests/mmul.py` | passes, exact mmul match |
-| Q6_K layout and Python reference | implemented |
-| Q6_K C++ unpack/mmul | skeleton; tests fail as expected |
-| NPU-less execution | clear error; NPU required |
-| Host header compilation | C++17, no AIE in `repack.h` |
-| Test shims | `unpack.aie.cc`, `mmul.aie.cc`, `repack.cc` |
+| Single-core unpack + fused mmul correctness | done |
+| Host repack shims and numpy references | done |
+| No-NPU error path | done |
+| Multi-core column partitioning | not started |
+| DMA streaming and descriptor tiling | not started |
+| 32-core aggregate bandwidth measurement | not started |
+| Gemma 4 E2B shape coverage | not started |
+| Tied `token_embd` row lookup + output head | not started |
+| PLE tensors on CPU | decided, not integrated |
+| Attention / KV cache | outside kernel package |
 
-Current Q4_0 exact results, the standalone unpack baseline, and the fast-mode
-comparison are recorded in `NOTES.md`.
+## Immediate work
 
-Reaching 60 GB/s needs about **2.22 weights/core-cycle**, or 71.1 weights per
-device clock across 32 cores.
+1. **Multi-core streaming driver**
+   - partition `weights_cols` across compute tiles;
+   - broadcast the shared input tile;
+   - stream packed records with DMA and join outputs;
+   - respect the 16,383-word FIFO descriptor limit;
+   - validate aggregate bandwidth with a memory-only flow before enabling
+     dequantization.
 
-## Next implementation steps
+2. **Gemma 4 E2B integration**
+   - instantiate K = 1536/2048/4096 and N = 256/512/2048/4096/6144/12288,
+     plus the Q6_K output head at K = 1536, N = 262144;
+   - handle the tied `token_embd` row lookup and full-matrix output head;
+   - keep PLE `per_layer_model_proj` and `per_layer_token_embd` on the CPU;
+   - start with a short context to keep attention/KV work small;
+   - verify single-token decode with the M=4 mmul zero-padded to four rows.
 
-Ordering is by model impact: finish Q6_K first, then Q8_0, then the K-quant
-families and conversion controls, then codebook formats. Defer other types until
-a target model or benchmark requires them.
+3. **Q4_0 scale-layout decision**
+   - exact host-precomputed hi/lo is the default for the 55 GB/s target;
+   - measure actual aggregate bandwidth;
+   - if it is below about 50 GB/s, expose the smaller canonical-scale layout
+     as a named variant because its compute path may win.
 
-### 1. Finish Q6_K
+4. **Output-head decision**
+   - keep int8 Q6_K for the exact path;
+   - evaluate a lossy Q4_0 output head only after a model-quality check;
+   - Q8_0 is not worth the extra conversion for a ~0.2 ms saving.
 
-Q6_K has a layout, Python reference, and failing tests. It validates the
-four-chunk record model and shared-scale metadata.
+5. **Test coverage**
+   - add full-shape streaming tests once the multi-core harness exists;
+   - add real-model slices from the target tensor set;
+   - keep the no-NPU and invalid-shape tests;
+   - cover host repack's subnormal-scale flush and the one-line warning, plus
+     a Q8_0 block containing `-128`.
 
-- Keep `kRecordRows = 256`, `kUnpackTileRows = 64`, `kChunksPerRecord = 4`,
-  `kCommonScaleBytes = 16`.
-- Choose the intra-chunk layout explicitly:
-  - **Native 6-bit packed:** preserves 6.5625 bits/weight and the provisional
-    416-byte chunk (384-byte payload plus 32 bytes of per-column sub-block
-    scales).
-  - **Int8 repack:** simpler first bring-up, 8 bits/weight (+22% bytes).
-- For the native path, remove cross-byte ql/qh interleaving during host repack
-  so the kernel only does aligned loads, shifts, and masks.
-- Hoist `d * int8_scale` per 16-row sub-block and per column. Reuse the scale
-  vector across the four 4x8 payloads in that sub-block.
-- Use hi/lo bf16 scales for the accurate path; retain a single-bf16 fast path
-  for later comparison.
-- Update the Python packed-byte reference only after the layout is fixed.
-- Implement the real `q6_k/unpack.aie.h` and `q6_k/mmul.aie.h`; expected result:
-  Q6_K `tests/unpack.py` and `tests/mmul.py` pass on a device.
+## Format bring-up plans
 
-### 2. Q8_0
-
-Q8_0 is the simplest remaining format and the largest remaining element share
-in the local model set. Use it as the second non-K format and as a vector
-conversion control.
-
-- Canonical block: 32 rows, 34 bytes, fp16 `d` plus 32 int8 values.
-- Choose a record depth (64 or 256 rows) that reuses the Q4_0 chunk machinery.
-- Host repack: copy scales and transpose int8 values into 4x8 or 8x8 payloads.
-- Unpack: convert int8 to bf16, multiply by `d`, and store directly into the
-  canonical tile.
-- Add `tests/formats/q8_0.py` with independent numpy generation and reference.
-- Expected result: exact or near-exact match with power-of-two scales.
-
-### 3. Q4_K and Q5_K
+### Q4_K and Q5_K
 
 Q4_K and Q5_K are the largest K-quant families in the local models and should
 share a scale/min implementation.
@@ -80,18 +87,23 @@ share a scale/min implementation.
 - Q5_K adds the `qh` high bit; reuse the Q4_K scale/min path.
 - Add a shared K-quant helper for unpacking 6-bit scale/min pairs from the
   12-byte scale block.
+- Prefer host-expanding the 6-bit scale/min fields to bytes: 16 six-bit
+  values are 12 bytes, so the cost is only +4 bytes per 256-weight block.
 - Validate against the host reference dequant output for random blocks before
   NPU bring-up.
+- Measure whether folding `-dmin*min` into host-precomputed terms is exact
+  enough; do not move scale application after the mmul without a tolerance
+  analysis.
 
-### 4. BF16 and F16 pass-through
+### BF16 and F16 pass-through
 
 Treat these as conversion controls, not quantized formats.
 
-- Choose a record layout and reuse the existing mmul path.
+- Choose a record layout and reuse the existing bf16 mmul path.
 - Use them to measure pure data movement and bf16 conversion cost.
 - Do not add a separate mmul implementation.
 
-### 5. IQ4_XS and IQ4_NL
+### IQ4_XS and IQ4_NL
 
 Both use the 16-entry `kvalues_iq4nl` codebook.
 
@@ -102,6 +114,8 @@ Both use the 16-entry `kvalues_iq4nl` codebook.
   the L1/constant budget.
 - Dequant: `scale * kvalues_iq4nl[index]`, with IQ4_XS scales reconstructed
   from `scales_l` and `scales_h`.
+- Prototype `aie::parallel_lookup` with a bf16 codebook; it is the most
+  promising replacement for per-lane codebook gathers.
 - Add a lookup-table path to the Python reference first.
 
 ### Later formats
@@ -109,6 +123,94 @@ Both use the 16-entry `kvalues_iq4nl` codebook.
 Q3_K and IQ3_S share 3-bit/hmask patterns and broaden model support. Q2_K,
 IQ2_XXS/XS/S, IQ1_S/M, Q4_1, Q5_1, MXFP4, NVFP4, and TQ formats are deferred
 until a target model or benchmark requires them.
+
+## Fast and relaxed modes
+
+These are separate named variants with explicit verification policies. They
+must not silently pass through the exact tolerances.
+
+### Q4_0 fast scale mode
+
+- `exact`: current pre-split bf16 hi/lo, bit-identical to float dequant,
+  320-byte records.
+- `fast`: single host-precomputed bf16 scale, 288-byte records (4.5
+  bits/weight), lower precision and fewer device cycles.
+- Keep the current non-template `unpack_weights_chunk()` as the exact default.
+- Add a named variant selector to the test shims; do not expose raw template
+  arguments.
+- Report the variant name with cycle results.
+
+### Q6_K host-scale-term variant
+
+- Precompute all three bf16 scale terms on the host.
+- Measured 8239 cycles at 256x64 (1.989 weights/cycle) but 2816-byte records.
+- Useful only for single-core/latency cases where the extra bytes are
+  acceptable; not the default for the 32-core 55 GB/s target.
+
+### bfp16-emulated bf16 mmul
+
+- Enabled with `AIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16=1`.
+- About 25% faster on one core but roughly 0.5-0.9% relative error.
+- Belongs to a future relaxed-accuracy mode with its own tolerance.
+
+### W4A8 / native int8 x int4
+
+- XDNA2 has a native `4x16x16` int8 x int4 mmul.
+- Only relevant if a future path quantizes activations to int8; not a drop-in
+  for the current bf16-activation kernels.
+
+## Technique backlog
+
+- Q5_K high bit: fold the `to_float<bfloat16>(..., -4)` shift instead of an
+  explicit `upshift`.
+- Q4_0/Q8_0: compare `grow_replicate<64>()` against the current
+  `broadcast_vector` scale expansion.
+- Q6_K/Q4_K/Q5_K: prefer masking `uint8` payloads over `int4` vectors; reserve
+  `int4` for the final `to_float`.
+- Q4_K/Q5_K: expand 6-bit scale/min metadata in host repack.
+- IQ formats: prototype the hardware LUT path before writing scalar gathers.
+- Re-measure code size after the host-scale and int8-payload changes if code
+  size becomes relevant.
+- Keep `split_bf16_hi_lo()` as the shared device-side scale split; Q8_0 uses
+  it for its fp16 `d`. Q4_0 no longer calls it because host repack now
+  precomputes the pair.
+- Do not reintroduce cursor objects, per-column `noinline` helpers, or
+  struct-based hot-path access unless they measurably beat the direct
+  two-column path.
+
+## Target model composition
+
+`gemma-4-E2B_q4_0-it.gguf` is the recommended first end-to-end target:
+
+- 35 dense blocks, hidden 1536, FFN 6144 (first 15) / 12288 (last 20).
+- Q4_0: 1.048 GB of block weights, including 876 MB of FFN.
+- Q6_K: 2.257 GB total, but only 0.330 GB is the tied `token_embd` output
+  head; the 1.927 GB `per_layer_token_embd` is a lookup-only tensor.
+- F16: 27.5 MB `per_layer_model_proj`, which llama.cpp runs on the CPU/input
+  layer.
+
+Active per-token traffic:
+
+| component | canonical | our repack |
+| :-- | --: | --: |
+| Q4_0 block weights | 1.048 GB | 1.164 GB |
+| tied Q6_K `token_embd` output head | 0.330 GB | 0.440 GB |
+| F16 `per_layer_model_proj` | 0.0275 GB | 0.0275 GB (CPU) |
+| **NPU total, excluding CPU F16** | **1.378 GB** | **1.605 GB** |
+
+At 55 GB/s the current repacks need 29.2 ms/token, or about 34.3 tok/s; at
+50 / 45 / 35 GB/s it is 31.2 / 28.0 / 21.8 tok/s. The FFN is 84% of Q4_0 block
+traffic. The tied output head is about 27% of total traffic; keeping int8 Q6_K
+is the exact choice, while a lossy Q4_0 head would save about 12% of token
+time.
+
+`gemma-4-26B-A4B-it-qat-q4_0.gguf` is not a good first target: it is MoE with
+128 experts and 8 active.
+
+- Q4_0: 13.772 GB, of which 12.846 GB is expert weights, 0.624 GB attention,
+  and 0.301 GB shared FFN.
+- Q6_K: 0.606 GB, only `token_embd`.
+- F32: 0.046 GB of norms, router weights/scales, and layer scales.
 
 ## Constraints
 
@@ -183,9 +285,10 @@ Helpers in `spiral::quants::<name>`:
 const uint8_t* chunk(const uint8_t* record, int chunk_index);
 ```
 
-Shared metadata is always at the start of the record. `chunk()` points past
-that metadata to a specific chunk; callers pass the record pointer directly
-when they need the shared metadata.
+Shared metadata is at the start of the record (or at a format-specific offset
+when payloads come first). `chunk()` points past the metadata to a specific
+chunk; callers pass the record pointer directly when they need the shared
+metadata.
 
 ### Repack API
 
@@ -217,7 +320,6 @@ weights_cols_tile * (weights_rows / kRecordRows) + weights_rows_record
 
 `src_col_stride_bytes` supports views with padding. `packed_bytes()` is
 independent of the source size so a format may expand or shrink during repack.
-
 There is no tail or padding path. Invalid dimensions or insufficient capacity
 return `0`.
 
@@ -229,7 +331,7 @@ void unpack_weights_chunk(const uint8_t* record,
                           bfloat16* weights_tile);
 ```
 
-`record` points at the start of the shared metadata. The unpack function writes
+`record` points at the start of the record metadata. The unpack function writes
 the canonical bf16 weights tile directly. Formats call `unpack_weights_chunk`
 once per chunk, including single-chunk formats such as Q4_0.
 
@@ -244,8 +346,9 @@ inline void unpack_mmul(const uint8_t* packed,
                         float* outputs);
 ```
 
-The caller must zero `outputs` and select `conv_even` rounding. Q4_0 processes
-two column tiles together; Q6_K is still a skeleton.
+The caller must zero `outputs` and select `conv_even` rounding. Q4_0 and Q6_K
+process two column tiles together. Q6_K uses an int8 payload expanded by the
+host repack, so the device dequantizer has no bit-plane decode.
 
 ## Format constants
 
@@ -254,13 +357,14 @@ two column tiles together; Q6_K is still a skeleton.
 ```text
 canonical block: 32 rows, 18 bytes
 payload: 8 x 16-byte signed-int4 4x8 payloads per 32-row block
-scales:  8 fp16 per 32-row block
+scales:  8 pre-split bf16 hi/lo pairs per 32-row block, 32 bytes
 record:  64 rows, one chunk
-layout:  32 bytes of scales, then 256 bytes of payloads
-packed:  288 bytes per record
+layout:  64 bytes of scales, then 256 bytes of payloads
+packed:  320 bytes per record (5.0 bits/weight)
 ```
 
-The scales-first layout keeps every 32-byte tile payload 32-byte aligned.
+The host repack computes the exact bf16 `hi + lo` split of each fp16 scale.
+The scales-first layout keeps every 32-byte tile payload 32-byte aligned;
 `load_v<32>` is valid for all tiles.
 
 ### Q6_K
@@ -268,81 +372,63 @@ The scales-first layout keeps every 32-byte tile payload 32-byte aligned.
 ```text
 canonical block: 256 rows, 210 bytes
 ql[128], qh[64], scales[16] int8, d fp16
-record:  256 rows, four 64-row chunks
-common:  16 bytes, eight fp16 d values
-packed:  416 provisional bytes per chunk, 1680 per record
+record:  256 rows, 2240 bytes
+payload: 2048 bytes, four 512-byte int8 chunks (signed q - 32)
+scales:  128 bytes, four chunks x 32 per-column int8 subgroup scales
+common:  16 bytes, one fp16 d per column
+padding: 48 bytes to keep every record 64-byte aligned
 ```
 
-The Q6_K intra-chunk packing is still deferred. The provisional sizes equal the
-unrepacked Q6_K bytes for a 256-row x 8-column region; the next implementation
-must choose an explicit layout.
+The host repack expands each 6-bit weight to signed int8, so the device decode
+is a 64-byte load and `to_float<bfloat16>`. The per-16-row scale structure is
+unchanged. Every payload chunk is 512 bytes, so all eight 64-byte 8x8 tiles in
+a chunk are naturally aligned. Payloads come first, then scales, then `d`; the
+2240-byte stride is the smallest 64-byte multiple that holds 2048 + 128 + 16
+bytes.
 
-## Local model inventory
+### Q8_0
 
-Type counts across the current target model set:
+```text
+canonical block: 32 rows, 34 bytes (fp16 d + 32 int8)
+record:  256 rows, 2176 bytes
+payload: 2048 bytes, 32 x 64-byte int8 tiles
+scales:  128 bytes, eight blocks x eight columns of fp16 d
+packed:  8.5 bits/weight
+```
 
-| type | tensors | elements | notes |
-| :-- | --: | --: | :-- |
-| Q8_0 | 820 | 39.85G | dominant in Q8_K_XL and DFlash Q8_0 models |
-| Q4_K | 233 | 16.32G | dominant in UD-Q4_K_XL and Q4_K_M models |
-| Q5_K | 231 | 15.31G | dominant in UD-Q4_K_XL models |
-| Q4_0 | 563 | 15.06G | implemented |
-| BF16 | 581 | 12.96G | Gemma E2B and control paths |
-| Q6_K | 70 | 6.56G | embeddings/output tensors and K-quant tails |
-| IQ4_XS | 70 | 3.13G | UD-Q4_K_XL |
-| IQ4_NL | 6 | 0.28G | UD-Q4_K_XL |
-| Q3_K | 3 | 0.12G | UD-Q4_K_XL |
-| IQ3_S | 1 | 0.04G | UD-Q4_K_XL |
-| F16 | 1 | 0.01G | control |
-| F32 | 3330 | 0.09G | mostly small/metadata tensors |
+Payloads first, then scales, so every 64-byte tile load is naturally aligned.
 
-## Planned files
+## Current and planned files
 
 ```text
 src/quants/
-  NOTES.md                    optimization lessons and current results
+  README.md                   status and current best performance
+  NOTES.md                    techniques and detailed results
+  TODO.md                     this file
   common/
-    k_quant.h                 shared 6-bit K scale/min unpack
-    iq4nl.h                   shared IQ4_NL codebook
+    tile.h                    mmul tile shape constants
+    scale.aie.h               fp16x8 load; device bf16 split helper
+    mmul.aie.h                mmul tile helper
+  q4_0/
+    layout.h, repack.h, unpack.aie.h, mmul.aie.h
+  q6_k/
+    layout.h, repack.h, unpack.aie.h, mmul.aie.h
   q8_0/
-    layout.h
-    repack.h
-    unpack.aie.h
-    mmul.aie.h
-  q4_k/
-    layout.h
-    repack.h
-    unpack.aie.h
-    mmul.aie.h
-  q5_k/
-    layout.h
-    repack.h
-    unpack.aie.h
-    mmul.aie.h
-  bf16/
-    layout.h
-    repack.h
-    unpack.aie.h
-    mmul.aie.h
-  iq4_nl/
-    layout.h
-    repack.h
-    unpack.aie.h
-    mmul.aie.h
-  iq4_xs/
-    layout.h
-    repack.h
-    unpack.aie.h
-    mmul.aie.h
+    layout.h, repack.h, unpack.aie.h, mmul.aie.h
   tests/
-    conformance.py
+    common.py, unpack.py, mmul.py
+    unpack.aie.cc, mmul.aie.cc, repack.cc
     formats/
-      q8_0.py
-      q4_k.py
-      q5_k.py
-      bf16.py
-      iq4_nl.py
-      iq4_xs.py
+      q4_0.py, q6_k.py, q8_0.py
+```
+
+Planned additions:
+
+```text
+  q4_k/  q5_k/  bf16/  iq4_nl/  iq4_xs/
+  common/k_quant.h            shared 6-bit K scale/min unpack
+  common/iq4nl.h              shared IQ4_NL codebook
+  tests/formats/q4_k.py q5_k.py bf16.py iq4_nl.py iq4_xs.py
 ```
 
 Exact filenames may change if formats share a common layout, but each format
@@ -351,12 +437,13 @@ kernels share one implementation.
 
 ## Shared implementation work
 
-- `common/scale.aie.h` provides fp16x8 loading and hi/lo bf16 scale splitting.
-  Reuse it for K-quant and codebook formats that need scale conversion.
+- `common/tile.h` holds the `aie::mmul<4,8,8>` shape constants.
+- `common/scale.aie.h` provides `load_fp16x8()`. Q4_0 now performs the hi/lo
+  split in host repack; the device-side `split_bf16_hi_lo()` is currently
+  unused and can be removed or kept for future formats that split on device.
 - `common/mmul.aie.h` provides the vector mmul tile helper.
-- `q4_0/unpack.aie.h` provides shared `load_block_scales64()` and
-  `dequantize_tile()` helpers used by both the reference unpack and the fused
-  mmul.
+- `q4_0/unpack.aie.h` provides `load_block_scales64()` and
+  `dequantize_tile()` used by both the reference unpack and fused mmul.
 - Select `aie::rounding_mode::conv_even` once in the kernel shim; unpack
   helpers assume that mode is already set.
 - Add a K-quant scale/min helper for 6-bit packed scales.
@@ -367,91 +454,47 @@ kernels share one implementation.
   - `kTileCols == kMmulWeightsCols`
   - `kUnpackTileRows % kMmulWeightsRows == 0`
   - record and chunk size consistency
-  - payload alignment where the format uses 32-byte tile loads
+  - payload alignment where the format uses 32/64-byte tile loads
 - Keep `layout.h` constants in the `constexpr int NAME = expression;` form
   parsed by `tests/common.py`; expressions may wrap across lines.
-
-## Optimization roadmap
-
-### Q4_0 scale modes
-
-The exact hi/lo path is the default. A single-bf16 fast mode measured about 12%
-faster but failed the exact verification tolerance.
-
-- Add a `ScaleMode` compile-time parameter:
-  - `exact`: current hi/lo bf16 scale split, bit-identical to float dequant.
-  - `fast`: single bf16 scale, lower precision and fewer cycles.
-- Keep the current non-template `unpack_weights_chunk()` as the default wrapper
-  around `unpack_weights_chunk_impl<ScaleMode::exact>()`.
-- Give each named variant an explicit verification policy. The fast variant
-  should not silently pass through the exact mmul tolerance.
-- Add a named variant selector to the test shims. Do not expose raw template
-  arguments or blindly inject user-provided values.
-- Report the variant name with cycle results.
-- Measure against the current 300 cycles/tile 64x64 exact result.
-
-### Fused unpack and mmul
-
-The production Q4_0 implementation is the direct two-column fused path:
-
-- share the input tile between two column tiles;
-- use two independent mmul accumulators;
-- load one aligned 32-byte payload per tile;
-- fully unroll the eight-tile inner loop;
-- use device-side vector pointers for input, output, and payload tiles.
-
-Do not reintroduce cursor objects or struct-based hot-path access unless they
-measurably beat the direct path.
-
-### Chunk routing and larger tiles
-
-- Route Q6_K/Q4_K/Q5_K chunks to separate compute tiles only after single-tile
-  correctness and timing are stable.
-- Compare 64-row chunks against 256-row records for metadata amortization and
-  L1 pressure.
-- Keep `unpack_mmul<weights_rows, weights_cols>` generic over record and tile
-  counts.
-- Investigate larger mmul shapes only if the AIE API supports them for bf16.
-
-### Pipelining and memory
-
-- Add double buffering only after single-buffer performance is understood.
-- Watch the AIE DMA descriptor limit: a single FIFO output is limited to 16,383
-  32-bit words. Large optional shapes must be split by record or chunk.
-- Measure packed-weight bandwidth against the 55 GB/s aggregate budget.
-- Preserve the existing trace-stack convention and balanced-stack validation.
 
 ## Test and benchmark roadmap
 
 - Keep `unpack.py` as the exact format/layout conformance test.
 - Keep `mmul.py` as the end-to-end fused correctness test.
 - Add a real-model test path that extracts a small slice of a representative
-  tensor, repacks it, and compares against the Python reference. This catches
-  assumptions that synthetic data may miss.
+  tensor, repacks it, and compares against the Python reference.
 - Keep the no-NPU error path and invalid-shape rejection tests.
+- Add full-shape streaming tests once the multi-core harness exists.
 - Benchmark at least:
-  - Q4_0 64x64, 64x128, and 64x256, exact and fast scale modes;
-  - Q8_0 64x64 and 128x128;
-  - Q6_K 256x64;
+  - Q4_0 64x64, 64x128, and 64x256, exact and fast scale variants;
+  - Q8_0 256x64 and 256x128;
+  - Q6_K 256x64 and 256x128;
   - Q4_K/Q5_K 256x64 and 512x64, split output if DMA limits require it.
-- Report cycles/tile, cycles/weight, weights/cycle, and implied packed GB/s at
-  1.5 GHz with 32 compute cores.
-- Record new baselines in `NOTES.md`.
+- Report cycles/tile, cycles/weight, weights/cycle, bytes/weight, and estimated
+  weights/s at 1.5 GHz and 55 GB/s.
+- Record new baselines in `NOTES.md` and update the summary in `README.md`.
 
 ## Definition of done
 
-- [ ] Q6_K native or int8-repacked unpack and mmul pass on a device.
-- [ ] Q8_0 unpack and mmul pass on a device.
+- [x] Q6_K exact int8-payload unpack and mmul pass on a device.
+- [x] Q6_K int8 payload is 2.94x faster than the native 6-bit baseline.
+- [x] Q8_0 unpack and mmul pass on a device.
 - [ ] Q4_K and Q5_K host repacks and dequantization match the host reference.
 - [ ] Q4_K and Q5_K NPU unpack and mmul pass on a device.
 - [x] Q4_0 fused two-column unpack + mmul passes exactly.
-- [ ] Q4_0 exact and fast scale modes are exposed through named variants with
+- [x] Q4_0 exact host-precomputed hi/lo scales pass on a device.
+- [ ] Q4_0 fast single-bf16 scale mode is exposed through a named variant with
       per-variant verification.
 - [ ] Invalid shapes are rejected for every format.
 - [ ] No format-specific runner or duplicate mmul implementation is introduced.
+- [ ] Multi-core column partitioning and DMA streaming are validated at the
+      target aggregate bandwidth.
+- [ ] Gemma 4 E2B Q4_0 runs end to end on the NPU.
 
 ## Deliberately deferred
 
+- bfp16-emulated bf16 mmul as a relaxed fast mode.
 - Chunk-to-compute-tile routing for multi-chunk formats.
 - Software pipelining and double buffering.
 - Larger mmul variants beyond the current 4x8x8 tile.
