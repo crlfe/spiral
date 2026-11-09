@@ -184,9 +184,9 @@ def resolve_shape(fmt, format_name, rows, cols):
     constants = layout_constants(format_name)
     if rows <= 0 or cols <= 0:
         raise ValueError("rows and cols must be positive")
-    if rows % constants["kRecordRows"] != 0:
+    if rows % constants["kRowsMultiple"] != 0:
         raise ValueError(
-            f"rows must be a multiple of {constants['kRecordRows']}"
+            f"rows must be a multiple of {constants['kRowsMultiple']}"
         )
     if cols % constants["kTileCols"] != 0:
         raise ValueError(

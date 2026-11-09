@@ -11,8 +11,10 @@
 
 namespace spiral::quants::q6_k {
 
-// Fused Q6_K unpack and mmul. The caller must zero outputs and select
-// aie::rounding_mode::conv_even before calling this.
+// Fused Q6_K unpack and mmul using the native six-bit payload. The vector
+// bit-plane expansion is still the dominant cost; this variant is a
+// comparison point for the int8-expanded layout. The caller must zero outputs
+// and select aie::rounding_mode::conv_even before calling this.
 template <int weights_rows, int weights_cols>
 inline void unpack_mmul(const uint8_t* packed,
                         const bfloat16* inputs,
@@ -32,82 +34,15 @@ inline void unpack_mmul(const uint8_t* packed,
   const auto input_tiles = reinterpret_cast<const InputVec*>(inputs);
   auto output_tiles = reinterpret_cast<OutputVec*>(outputs);
 
-  int weights_cols_tile = 0;
-  for (; weights_cols_tile + 1 < kColsTiles; weights_cols_tile += 2) {
-    const uint8_t* cols_tile0 =
-        packed + weights_cols_tile * kRowsRecords * kPackedRecordBytes;
-    const uint8_t* cols_tile1 = cols_tile0 + kRowsRecords * kPackedRecordBytes;
-    MMUL accumulator0;
-    MMUL accumulator1;
+  for (int weights_cols_tile = 0; weights_cols_tile < kColsTiles;
+       ++weights_cols_tile) {
+    OutputVec* output_tile = output_tiles + weights_cols_tile;
 
-#pragma unroll
-    for (int weights_rows_record = 0; weights_rows_record < kRowsRecords;
-         ++weights_rows_record) {
-      const uint8_t* record0 =
-          cols_tile0 + weights_rows_record * kPackedRecordBytes;
-      const uint8_t* record1 =
-          cols_tile1 + weights_rows_record * kPackedRecordBytes;
-      const auto d32_0 = detail::load_d32(record0);
-      const auto d32_1 = detail::load_d32(record1);
-
-#pragma unroll
-      for (int chunk_index = 0; chunk_index < kChunksPerRecord; ++chunk_index) {
-        const uint8_t* packed_chunk0 = chunk(record0, chunk_index);
-        const uint8_t* packed_chunk1 = chunk(record1, chunk_index);
-        const InputVec* inputs_slice =
-            input_tiles + (weights_rows_record * kRecordRows +
-                           chunk_index * kUnpackTileRows) /
-                              kTileRows;
-
-        aie::vector<bfloat16, kPackedChunkScalesBytes> hi32_0, mid32_0, lo32_0;
-        aie::vector<bfloat16, kPackedChunkScalesBytes> hi32_1, mid32_1, lo32_1;
-        detail::load_chunk_scales32(d32_0, chunk_scales(record0, chunk_index),
-                                    hi32_0, mid32_0, lo32_0);
-        detail::load_chunk_scales32(d32_1, chunk_scales(record1, chunk_index),
-                                    hi32_1, mid32_1, lo32_1);
-
-#pragma unroll
-        for (int subgroup = 0; subgroup < kTilesPerChunk / kTilesPerSubgroup;
-             ++subgroup) {
-          aie::vector<bfloat16, kMmulWeightsElems> hi0, mid0, lo0;
-          aie::vector<bfloat16, kMmulWeightsElems> hi1, mid1, lo1;
-          detail::load_subgroup_scales64(hi32_0, mid32_0, lo32_0, subgroup, hi0,
-                                         mid0, lo0);
-          detail::load_subgroup_scales64(hi32_1, mid32_1, lo32_1, subgroup, hi1,
-                                         mid1, lo1);
-
-#pragma unroll
-          for (int tile = 0; tile < kTilesPerSubgroup; ++tile) {
-            const int weights_rows_tile = subgroup * kTilesPerSubgroup + tile;
-            const InputVec& inputs_tile = inputs_slice[weights_rows_tile];
-            spiral::quants::mmul_weights_tile(
-                accumulator0, inputs_tile,
-                detail::dequantize_tile(packed_chunk0, weights_rows_tile, hi0,
-                                        mid0, lo0));
-            spiral::quants::mmul_weights_tile(
-                accumulator1, inputs_tile,
-                detail::dequantize_tile(packed_chunk1, weights_rows_tile, hi1,
-                                        mid1, lo1));
-          }
-        }
-      }
-    }
-    output_tiles[weights_cols_tile] = accumulator0.template to_vector<float>();
-    output_tiles[weights_cols_tile + 1] =
-        accumulator1.template to_vector<float>();
-  }
-
-  if constexpr (kColsTiles % 2 == 1) {
-    const uint8_t* cols_tile =
-        packed + weights_cols_tile * kRowsRecords * kPackedRecordBytes;
-    MMUL accumulator;
-
-#pragma unroll
     for (int weights_rows_record = 0; weights_rows_record < kRowsRecords;
          ++weights_rows_record) {
       const uint8_t* record =
-          cols_tile + weights_rows_record * kPackedRecordBytes;
-      const auto d32 = detail::load_d32(record);
+          packed + (weights_cols_tile * kRowsRecords + weights_rows_record) *
+                       kPackedRecordBytes;
 
       for (int chunk_index = 0; chunk_index < kChunksPerRecord; ++chunk_index) {
         const uint8_t* packed_chunk = chunk(record, chunk_index);
@@ -117,9 +52,11 @@ inline void unpack_mmul(const uint8_t* packed,
                               kTileRows;
 
         aie::vector<bfloat16, kPackedChunkScalesBytes> hi32, mid32, lo32;
+        const auto d32 = detail::load_d32(record);
         detail::load_chunk_scales32(d32, chunk_scales(record, chunk_index),
                                     hi32, mid32, lo32);
 
+        MMUL accumulator(*output_tile);
 #pragma unroll
         for (int subgroup = 0; subgroup < kTilesPerChunk / kTilesPerSubgroup;
              ++subgroup) {
@@ -127,18 +64,21 @@ inline void unpack_mmul(const uint8_t* packed,
           detail::load_subgroup_scales64(hi32, mid32, lo32, subgroup, hi, mid,
                                          lo);
 
-#pragma unroll
-          for (int tile = 0; tile < kTilesPerSubgroup; ++tile) {
-            const int weights_rows_tile = subgroup * kTilesPerSubgroup + tile;
-            spiral::quants::mmul_weights_tile(
-                accumulator, inputs_slice[weights_rows_tile],
-                detail::dequantize_tile(packed_chunk, weights_rows_tile, hi,
-                                        mid, lo));
-          }
+          static_assert(kTilesPerSubgroup == 2,
+                        "Q6_K pair decode expects two tiles per subgroup");
+          const int tile0 = subgroup * kTilesPerSubgroup;
+          const auto values0 =
+              detail::dequantize_tile(packed_chunk, tile0, hi, mid, lo);
+          const auto values1 =
+              detail::dequantize_tile(packed_chunk, tile0 + 1, hi, mid, lo);
+          spiral::quants::mmul_weights_tile(accumulator, inputs_slice[tile0],
+                                            values0);
+          spiral::quants::mmul_weights_tile(accumulator,
+                                            inputs_slice[tile0 + 1], values1);
         }
+        *output_tile = accumulator.template to_vector<float>();
       }
     }
-    output_tiles[weights_cols_tile] = accumulator.template to_vector<float>();
   }
 }
 

@@ -29,9 +29,9 @@ static inline __attribute__((always_inline)) void load_chunk_scales32(
     aie::vector<bfloat16, kPackedChunkScalesBytes>& hi,
     aie::vector<bfloat16, kPackedChunkScalesBytes>& mid,
     aie::vector<bfloat16, kPackedChunkScalesBytes>& lo) {
-  const auto subgroup_scales =
-      aie::to_float<float>(aie::load_v<kPackedChunkScalesBytes>(packed_scales)
-                               .template cast_to<int8>());
+  const auto subgroup_scales = aie::to_float<float>(
+      aie::load_unaligned_v<kPackedChunkScalesBytes>(packed_scales, 16)
+          .template cast_to<int8>());
   const auto product =
       aie::mul(d32, subgroup_scales).template to_vector<float>();
 
@@ -68,7 +68,10 @@ static inline __attribute__((always_inline)) void load_subgroup_scales64(
                                                                      subgroup);
 }
 
-// Dequantize one 8-row x 8-column tile from signed int8 weights.
+// Decode one 8-row x 8-column tile from the native six-bit payload. The low
+// nibble plane is reinterpreted as uint4 lanes; the high-two-bit plane is
+// expanded through 16-bit shifts and interleaved back to 64 byte lanes. The
+// decoded values then follow the shared bf16 scale/dequant path.
 static inline
     __attribute__((always_inline)) aie::vector<bfloat16, kMmulWeightsElems>
     dequantize_tile(const uint8_t* packed_chunk,
@@ -76,11 +79,37 @@ static inline
                     const aie::vector<bfloat16, kMmulWeightsElems>& hi,
                     const aie::vector<bfloat16, kMmulWeightsElems>& mid,
                     const aie::vector<bfloat16, kMmulWeightsElems>& lo) {
-  const uint8_t* packed = packed_chunk + weights_rows_tile * kMmulWeightsElems;
-  const auto quant =
-      aie::load_v<kMmulWeightsElems>(reinterpret_cast<const int8*>(packed));
-  const auto values = aie::to_float<bfloat16>(quant);
+  const uint8_t* packed_low = packed_chunk;
+  const uint8_t* packed_high = packed_low + kPackedChunkLowBytes;
+  const int low_offset = weights_rows_tile * (kTileRows * kTileCols / 2);
+  const int high_offset = weights_rows_tile * (kTileRows * kTileCols / 4);
+  const uint8_t* low = packed_low + low_offset;
+  const uint8_t* high = packed_high + high_offset;
 
+  const auto low_bytes =
+      aie::load_unaligned_v<kTileRows * kTileCols / 2>(low, 16);
+  const auto low_u8 =
+      low_bytes.template cast_to<uint4>().template unpack<uint8>();
+  const auto high_bytes = aie::load_v<kTileRows * kTileCols / 4>(high);
+  const auto high8 =
+      high_bytes.template cast_to<uint4>().template unpack<uint8>();
+  const auto high16 = high8.template unpack<uint16>();
+  const auto mask8 = aie::broadcast<uint8_t, kTileRows * kTileCols / 2>(
+      static_cast<uint8_t>(0x03));
+  const auto mask16 = aie::broadcast<uint16_t, kTileRows * kTileCols / 2>(
+      static_cast<uint16_t>(0x03));
+
+  const auto h_even = aie::bit_and(high8, mask8);
+  const auto h_odd_16 = aie::bit_and(aie::logical_downshift(high16, 2), mask16);
+  const auto h_odd = h_odd_16.template pack<uint8>();
+  const auto [c0, c1] = aie::interleave_zip(h_even, h_odd, 1);
+  const auto high_u8 = aie::concat(c0, c1);
+  const auto values_u8 = aie::bit_or(low_u8, aie::upshift(high_u8, 4));
+  const auto centered = aie::add(
+      values_u8,
+      aie::broadcast<uint8_t, kMmulWeightsElems>(static_cast<uint8_t>(0xE0)));
+  const auto quant = centered.template cast_to<int8>();
+  const auto values = aie::to_float<bfloat16>(quant);
   auto accumulator = aie::mul(values, hi);
   accumulator = aie::mac(accumulator, values, mid);
   accumulator = aie::mac(accumulator, values, lo);
@@ -89,6 +118,7 @@ static inline
 
 }  // namespace detail
 
+// Unpack one 64-row x 8-column chunk into the canonical bf16 weights tile.
 inline void unpack_weights_chunk(const uint8_t* record,
                                  const uint8_t* __restrict packed_chunk,
                                  bfloat16* __restrict weights_tile) {
@@ -114,12 +144,15 @@ inline void unpack_weights_chunk(const uint8_t* record,
     aie::vector<bfloat16, kMmulWeightsElems> lo;
     detail::load_subgroup_scales64(hi32, mid32, lo32, subgroup, hi, mid, lo);
 
-#pragma unroll
-    for (int tile = 0; tile < kTilesPerSubgroup; ++tile) {
-      const int weights_rows_tile = subgroup * kTilesPerSubgroup + tile;
-      output_tiles[weights_rows_tile] =
-          detail::dequantize_tile(packed_chunk, weights_rows_tile, hi, mid, lo);
-    }
+    static_assert(kTilesPerSubgroup == 2,
+                  "Q6_K pair decode expects two tiles per subgroup");
+    const int tile0 = subgroup * kTilesPerSubgroup;
+    const auto values0 =
+        detail::dequantize_tile(packed_chunk, tile0, hi, mid, lo);
+    const auto values1 =
+        detail::dequantize_tile(packed_chunk, tile0 + 1, hi, mid, lo);
+    output_tiles[tile0] = values0;
+    output_tiles[tile0 + 1] = values1;
   }
 }
 

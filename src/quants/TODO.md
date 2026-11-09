@@ -8,8 +8,10 @@ technique and benchmark findings are in `NOTES.md`.
 
 | format | layout | host repack | exact unpack | fused mmul | tests | current best | next |
 | :-- | :-- | :-- | :-- | :-- | :-- | :-- | :-- |
-| Q4_0 | done | done | done | done | exact | 2.18-2.26 w/c | fast mode, multi-core |
-| Q6_K | done | done | done | done | exact | 1.60 w/c | multi-core, optional variants |
+| Q4_0 | done | done | done | done | exact | 1.66 w/c | multi-core |
+| Q4_0_hilo | done | done | done | done | exact | 2.26 w/c | multi-core |
+| Q6_K | done | done | done | done | exact | 0.63 w/c | further optimize native decode |
+| Q6_K_int8 | done | done | done | done | exact | 1.60 w/c | multi-core, optional variants |
 | Q8_0 | done | done | done | done | exact | 1.99 w/c | multi-core |
 | Q4_K | not started | - | - | - | - | - | plan below |
 | Q5_K | not started | - | - | - | - | - | share Q4_K scale/min |
@@ -53,10 +55,12 @@ Integration status:
    - verify single-token decode with the M=4 mmul zero-padded to four rows.
 
 3. **Q4_0 scale-layout decision**
-   - exact host-precomputed hi/lo is the default for the 55 GB/s target;
-   - measure actual aggregate bandwidth;
-   - if it is below about 50 GB/s, expose the smaller canonical-scale layout
-     as a named variant because its compute path may win.
+   - both `q4_0` (canonical-size fp16 scales) and `q4_0_hilo` (expanded bf16
+     hi/lo scales) are available;
+   - at the measured 1.8 GHz clock, `q4_0` is compute-bound around 96B and
+     `q4_0_hilo` is memory-bound around 88B, so `q4_0` is the current default;
+   - re-measure actual aggregate bandwidth before fixing the default for the
+     final driver.
 
 4. **Output-head decision**
    - keep int8 Q6_K for the exact path;
@@ -129,13 +133,13 @@ until a target model or benchmark requires them.
 These are separate named variants with explicit verification policies. They
 must not silently pass through the exact tolerances.
 
-### Q4_0 fast scale mode
+### Q4_0 relaxed single-bf16 mode
 
-- `exact`: current pre-split bf16 hi/lo, bit-identical to float dequant,
-  320-byte records.
-- `fast`: single host-precomputed bf16 scale, 288-byte records (4.5
-  bits/weight), lower precision and fewer device cycles.
-- Keep the current non-template `unpack_weights_chunk()` as the exact default.
+- Exact variants: `q4_0` (raw fp16 scales, 288-byte records) and `q4_0_hilo`
+  (pre-split bf16 hi/lo scales, 320-byte records).
+- Relaxed `fast` mode: a single host-precomputed bf16 scale, 288-byte records,
+  lower precision and fewer device cycles.
+- Keep the exact non-template `unpack_weights_chunk()` as the default.
 - Add a named variant selector to the test shims; do not expose raw template
   arguments.
 - Report the variant name with cycle results.
@@ -193,16 +197,18 @@ Active per-token traffic:
 
 | component | canonical | our repack |
 | :-- | --: | --: |
-| Q4_0 block weights | 1.048 GB | 1.164 GB |
+| Q4_0 block weights | 1.048 GB | 1.048 GB |
 | tied Q6_K `token_embd` output head | 0.330 GB | 0.440 GB |
 | F16 `per_layer_model_proj` | 0.0275 GB | 0.0275 GB (CPU) |
-| **NPU total, excluding CPU F16** | **1.378 GB** | **1.605 GB** |
+| **NPU total, excluding CPU F16** | **1.378 GB** | **1.488 GB** |
 
-At 55 GB/s the current repacks need 29.2 ms/token, or about 34.3 tok/s; at
-50 / 45 / 35 GB/s it is 31.2 / 28.0 / 21.8 tok/s. The FFN is 84% of Q4_0 block
-traffic. The tied output head is about 27% of total traffic; keeping int8 Q6_K
-is the exact choice, while a lossy Q4_0 head would save about 12% of token
-time.
+The table uses the canonical-size `q4_0` variant. Selecting `q4_0_hilo` raises
+the Q4_0 block traffic to 1.164 GB and the NPU total to 1.604 GB. At 55 GB/s
+the default repacks need 27.1 ms/token, or about 37.0 tok/s; at 50 / 45 /
+35 GB/s it is 29.8 / 33.1 / 42.5 ms per token, or about 33.6 / 30.2 /
+23.5 tok/s. The FFN is 84% of Q4_0 block traffic. The tied output head is
+about 30% of total traffic; keeping int8 Q6_K is the exact choice, while a
+lossy Q4_0 head would save about 12% of token time.
 
 `gemma-4-26B-A4B-it-qat-q4_0.gguf` is not a good first target: it is MoE with
 128 experts and 8 active.
@@ -225,6 +231,9 @@ time.
 - Constants and functions live in `spiral::quants::<name>`; shared constants
   live in `spiral::quants`.
 - Keep the format/chunk API stable while optimizing behind it.
+- Tests and benchmark shapes require `weights_rows` to be a multiple of
+  `spiral::quants::kRowsMultiple` (256). Formats may use smaller internal
+  records.
 - Host repack byte counts, capacities, strides, and offsets stay `int64_t`.
   NPU-side loop counters and record/chunk indices use `int32_t`; per-launch
   shapes are small enough that this is safe.
@@ -346,37 +355,68 @@ inline void unpack_mmul(const uint8_t* packed,
                         float* outputs);
 ```
 
-The caller must zero `outputs` and select `conv_even` rounding. Q4_0 and Q6_K
-process two column tiles together. Q6_K uses an int8 payload expanded by the
-host repack, so the device dequantizer has no bit-plane decode.
+The caller must zero `outputs` and select `conv_even` rounding. Q4_0,
+Q4_0_hilo, and Q6_K_int8 process two column tiles together. Native Q6_K uses
+a simple one-column-at-a-time baseline. Q6_K_int8 uses an int8 payload expanded
+by the host repack, so its device dequantizer has no bit-plane decode.
 
 ## Format constants
 
 ### Q4_0
 
+`q4_0` (canonical-size):
+
 ```text
 canonical block: 32 rows, 18 bytes
 payload: 8 x 16-byte signed-int4 4x8 payloads per 32-row block
-scales:  8 pre-split bf16 hi/lo pairs per 32-row block, 32 bytes
+scales:  8 raw fp16 values per 32-row block, 16 bytes
 record:  64 rows, one chunk
+layout:  32 bytes of scales, then 256 bytes of payloads
+packed:  288 bytes per record (4.5 bits/weight)
+```
+
+The device loads the fp16 scales and splits them into bf16 hi/lo with
+`split_bf16_hi_lo()` per 32-row block.
+
+`q4_0_hilo` (host-expanded):
+
+```text
+scales:  8 pre-split bf16 hi/lo pairs per 32-row block, 32 bytes
 layout:  64 bytes of scales, then 256 bytes of payloads
 packed:  320 bytes per record (5.0 bits/weight)
 ```
 
 The host repack computes the exact bf16 `hi + lo` split of each fp16 scale.
-The scales-first layout keeps every 32-byte tile payload 32-byte aligned;
-`load_v<32>` is valid for all tiles.
+Both layouts keep every 32-byte tile payload 32-byte aligned; `load_v<32>` is
+valid for all tiles.
 
 ### Q6_K
+
+`q6_k` (native payload):
 
 ```text
 canonical block: 256 rows, 210 bytes
 ql[128], qh[64], scales[16] int8, d fp16
+record:  256 rows, 1680 bytes
+payload: 4 x (256-byte low-nibble plane + 128-byte high-two-bit plane)
+scales:  4 x 32 per-column int8 subgroup scales
+common:  16 bytes, one fp16 d per column
+```
+
+This preserves the canonical 6.5625-bit size. The device expands the bit
+planes with vector uint4/uint16 operations into signed `q - 32` bytes, then uses
+the same bf16 scale path as the expanded variant. It remains compute-bound and
+is retained as the optimization baseline.
+
+`q6_k_int8` (host-expanded):
+
+```text
 record:  256 rows, 2240 bytes
 payload: 2048 bytes, four 512-byte int8 chunks (signed q - 32)
 scales:  128 bytes, four chunks x 32 per-column int8 subgroup scales
 common:  16 bytes, one fp16 d per column
 padding: 48 bytes to keep every record 64-byte aligned
+packed:  8.75 bits/weight
 ```
 
 The host repack expands each 6-bit weight to signed int8, so the device decode
@@ -411,7 +451,11 @@ src/quants/
     mmul.aie.h                mmul tile helper
   q4_0/
     layout.h, repack.h, unpack.aie.h, mmul.aie.h
+  q4_0_hilo/
+    layout.h, repack.h, unpack.aie.h, mmul.aie.h
   q6_k/
+    layout.h, repack.h, unpack.aie.h, mmul.aie.h
+  q6_k_int8/
     layout.h, repack.h, unpack.aie.h, mmul.aie.h
   q8_0/
     layout.h, repack.h, unpack.aie.h, mmul.aie.h
@@ -419,7 +463,7 @@ src/quants/
     common.py, unpack.py, mmul.py
     unpack.aie.cc, mmul.aie.cc, repack.cc
     formats/
-      q4_0.py, q6_k.py, q8_0.py
+      q4_0.py, q4_0_hilo.py, q6_k.py, q6_k_int8.py, q8_0.py
 ```
 
 Planned additions:
@@ -438,9 +482,9 @@ kernels share one implementation.
 ## Shared implementation work
 
 - `common/tile.h` holds the `aie::mmul<4,8,8>` shape constants.
-- `common/scale.aie.h` provides `load_fp16x8()`. Q4_0 now performs the hi/lo
-  split in host repack; the device-side `split_bf16_hi_lo()` is currently
-  unused and can be removed or kept for future formats that split on device.
+- `common/scale.aie.h` provides `load_fp16x8()`. `q4_0` uses it with
+  `split_bf16_hi_lo()` on the device; `q4_0_hilo` performs the split in host
+  repack. The same device split path is reused by both Q6_K variants.
 - `common/mmul.aie.h` provides the vector mmul tile helper.
 - `q4_0/unpack.aie.h` provides `load_block_scales64()` and
   `dequantize_tile()` used by both the reference unpack and fused mmul.
@@ -467,23 +511,24 @@ kernels share one implementation.
 - Keep the no-NPU error path and invalid-shape rejection tests.
 - Add full-shape streaming tests once the multi-core harness exists.
 - Benchmark at least:
-  - Q4_0 64x64, 64x128, and 64x256, exact and fast scale variants;
+  - Q4_0 256x64 canonical and hilo variants;
   - Q8_0 256x64 and 256x128;
-  - Q6_K 256x64 and 256x128;
+  - Q6_K 256x64 native and int8 variants;
   - Q4_K/Q5_K 256x64 and 512x64, split output if DMA limits require it.
 - Report cycles/tile, cycles/weight, weights/cycle, bytes/weight, and estimated
-  weights/s at 1.5 GHz and 55 GB/s.
+  weights/s at 1.8 GHz and 55 GB/s.
 - Record new baselines in `NOTES.md` and update the summary in `README.md`.
 
 ## Definition of done
 
 - [x] Q6_K exact int8-payload unpack and mmul pass on a device.
-- [x] Q6_K int8 payload is 2.94x faster than the native 6-bit baseline.
+- [x] Q6_K int8 payload is much faster than the native bit-plane baseline;
+      native decode remains the optimization target.
 - [x] Q8_0 unpack and mmul pass on a device.
 - [ ] Q4_K and Q5_K host repacks and dequantization match the host reference.
 - [ ] Q4_K and Q5_K NPU unpack and mmul pass on a device.
 - [x] Q4_0 fused two-column unpack + mmul passes exactly.
-- [x] Q4_0 exact host-precomputed hi/lo scales pass on a device.
+- [x] Both Q4_0 variants (canonical fp16 scales and host hi/lo) pass on a device.
 - [ ] Q4_0 fast single-bf16 scale mode is exposed through a named variant with
       per-variant verification.
 - [ ] Invalid shapes are rejected for every format.

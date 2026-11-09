@@ -19,14 +19,16 @@ status and future plans live in `TODO.md`; the quick summary lives in
 - Report logical weights/cycle for one core:
   `weights/cycle = weights_rows * weights_cols / cycles`.
 - Use the physical packed size, not the canonical format size, for bandwidth:
-  - Q4_0: 4.5 -> 5.0 bits/weight (0.625 bytes/weight)
-  - Q6_K: 6.5625 -> 8.75 bits/weight (1.09375 bytes/weight)
+  - Q4_0: 4.5 bits/weight (`q4_0`, 0.5625 bytes/weight) or 5.0 bits/weight
+    (`q4_0_hilo`, 0.625 bytes/weight)
+  - Q6_K: 6.5625 bits/weight (`q6_k`, 0.8203 bytes/weight) or 8.75 bits/weight
+    (`q6_k_int8`, 1.09375 bytes/weight)
   - Q8_0: 8.5 bits/weight (1.0625 bytes/weight)
 - Full-device estimate:
-  `min(weights/cycle * 1.5 GHz * 32, 55 GB/s / bytes-per-weight)`.
+  `min(weights/cycle * 1.8 GHz * 32, 55 GB/s / bytes-per-weight)`.
   The first term is the compute cap, the second the packed-weight memory cap.
-- 60 GB/s requires about 2.00 weights/core-cycle at the current 5.0-bit Q4_0
-  layout, or 2.22 at canonical 4.5 bits.
+- 60 GB/s requires about 1.67 weights/core-cycle at the 5.0-bit Q4_0 layout,
+  or 1.85 at canonical 4.5 bits.
 - One AIE2 VLIW bundle is 16 bytes.
 
 ## Reusable AIE2 techniques
@@ -57,9 +59,10 @@ programming guide, `third_party/aie_api/include/aie_api/aie.hpp`, and the
   the vector type. It is useful for IQ4 indices or mixed signed/unsigned
   payloads without separate kernels.
 - For sub-byte payloads, pack bit planes so lane order can be reconstructed
-  with shifts, masks, and in-order `concat`. The abandoned native Q6_K layout
-  used low-nibble/high-nibble and 2-bit-field planes this way; it worked, but
-  the device bit-plane decode was still the throughput bottleneck.
+  with shifts, masks, and in-order `concat`. The native Q6_K layout uses a
+  low-nibble plane and a two-bit high plane this way. Vectorizing the expansion
+  removed most of the decode cost, but it is still the native variant's
+  bottleneck.
 
 ### Bitwise and shift operations
 
@@ -94,6 +97,13 @@ programming guide, `third_party/aie_api/include/aie_api/aie.hpp`, and the
   `{0x0F, 0xF0}` or 2-bit plane masks.
 - `concat()` has a tuple overload, so `concat(interleave_zip(even, odd, 1))`
   joins the two halves of a deinterleave. `interleave_unzip` is the inverse.
+- Q6_K's native six-bit decode uses `vector<uint8, 32>.cast_to<uint4>()` plus
+  `unpack<uint8>()` for the low nibbles. For the high plane, the same cast
+  first splits each byte into two nibbles holding two 2-bit fields each. The
+  even field is masked directly; only the odd field needs a shift. Shifting it
+  in a 32-lane `uint16` intermediate and `pack<uint8>()`-ing back avoids the
+  compiler crash seen when shifting 8-bit lanes directly. A single
+  `interleave_zip` then assembles the 64 high-bit lanes.
 - `filter_even` / `filter_odd(v, chunk_size)` return a half-size vector by
   selecting alternating chunks in one permute-style op. For 8-bit data this is
   byte granularity, so it fits separating ql/qh planes, not nibbles.
@@ -229,9 +239,10 @@ What did not help:
   repack call; zero scales need no special case because the two-term split
   cancels exactly. Q6_K and Q8_0 still convert fp16 on the device, so this is
   the only place that can catch the subnormal case.
-- Q4_0 now has the host repack the exact bf16 `hi + lo` pair of each fp16
+- `q4_0_hilo` has the host repack the exact bf16 `hi + lo` pair of each fp16
   scale. The record grows from 288 to 320 bytes, but the device avoids the
-  fp16 decode and split, and the larger format is still faster at 55 GB/s.
+  fp16 decode and split. `q4_0` keeps the canonical 288-byte layout and splits
+  on the device.
 - Expand the eight scale lanes to 64 once per block, not per tile.
   `broadcast_vector<8, bfloat16, 64>` is the preferred expansion.
 - The 64-lane active scale cache is the best balance found. 32-lane scales
@@ -281,8 +292,10 @@ constant-dequantizer profile is about 3786 cycles (46% of total).
 
 ### Q4_0
 
-Current exact layout: one 64-row x 8-column record is 320 bytes (5.0
-bits/weight).
+Two exact layouts are available.
+
+`q4_0_hilo` (host-expanded) is one 64-row x 8-column record of 320 bytes
+(5.0 bits/weight):
 
 ```text
  64 bytes  2 x 32-byte pre-split bf16 hi/lo scale blocks
@@ -292,32 +305,46 @@ bits/weight).
 The host repack writes the exact bf16 `hi + lo` split of each fp16 scale.
 Scales come first, payloads second; every 32-byte tile is naturally aligned.
 
-Results, 1.5 GHz:
+`q4_0` (canonical-size) is 288 bytes (4.5 bits/weight): the same payload
+layout with raw fp16 scales, split on the device with `split_bf16_hi_lo()`.
 
-| shape | cycles | cycles/tile | weights/cycle | implied 32-core GB/s |
-| --: | --: | --: | --: | --: |
-| 64x64 | 1880 | 235.000 | 2.179 | 65.4 |
-| 64x128 | 3740 | 233.750 | 2.190 | 65.7 |
-| 64x256 | 7236 | 226.125 | 2.264 | 67.9 |
+Results at the measured 1.8 GHz H clock:
 
-The old fp16-scale layout measured 2400 / 4764 / 9268 cycles, so host
-pre-splitting is about 21-22% faster on one core. The implied GB/s uses the
-current 5.0-bit packed size; the measured aggregate limit is 55-57 GB/s, so
-the full device becomes memory-bound around 1.83-1.90 weights/core-cycle.
-Long-K checks hold about 2.25 weights/cycle at 768 and 1536 rows.
+| variant | shape | cycles | cycles/tile | weights/cycle | compute-implied 32-core GB/s |
+| :-- | --: | --: | --: | --: | --: |
+| q4_0 | 256x64 | 9872 | 308.500 | 1.660 | 53.8 |
+| q4_0_hilo | 256x64 | 7267 | 227.094 | 2.255 | 81.2 |
 
-Standalone exact unpack: 707 cycles (was 1499). The fast single-bf16 mode
-measured 2119 cycles at 64 columns on the old layout but is not exact.
+`q4_0` is compute-bound at about 96B weights/s, while `q4_0_hilo` is
+memory-bound at the 55 GB/s target (88B weights/s). The canonical-size layout
+is therefore the current default if actual aggregate bandwidth is near
+55 GB/s. The previous 1.5 GHz long-K checks are not directly comparable and
+have not been re-run under the locked 1.8 GHz clock.
+
+Standalone exact unpack: 6156 cycles for `q4_0`, 2891 cycles for
+`q4_0_hilo`. The fast single-bf16 mode measured 2119 cycles at 64 columns on
+the old layout but is not exact.
 
 ### Q6_K
 
-Canonical Q6_K is 6.5625 bits/weight. The native 6-bit payload was compute
-bound at 30160 cycles for 256x64 (0.543 weights/cycle); the device bit-plane
-decode dominated.
+Canonical Q6_K is 6.5625 bits/weight. The `q6_k` variant preserves the native
+six-bit payload and the exact 1680-byte record size:
 
-The production layout expands every 6-bit weight to signed int8 (`q - 32`) in
-the host repack. The per-16-row scale structure is unchanged, so the expansion
-is lossless. Device decode is a 64-byte load plus `to_float<bfloat16>`.
+```text
+4 x (256-byte low-nibble plane + 128-byte high-two-bit plane)
+4 x 32 per-column int8 subgroup scales
+16 bytes  per-column fp16 d
+```
+
+The device decoder expands the low-nibble and high-two-bit planes with vector
+uint4/uint16 operations, then follows the same bf16 scale path as the expanded
+variant. It is kept as a size/optimization baseline, not as the production
+path.
+
+The `q6_k_int8` variant expands every 6-bit weight to signed int8 (`q - 32`)
+in the host repack. The per-16-row scale structure is unchanged, so the
+expansion is lossless. Device decode is a 64-byte load plus
+`to_float<bfloat16>`.
 
 Record layout: 256 rows x 8 columns, 2240 bytes (8.75 bits/weight).
 
@@ -328,29 +355,38 @@ Record layout: 256 rows x 8 columns, 2240 bytes (8.75 bits/weight).
   48 bytes  padding so every record is 64-byte aligned
 ```
 
-Results, 1.5 GHz:
+Results at the measured 1.8 GHz H clock:
 
 | shape | cycles | cycles/tile | weights/cycle | bytes/weight |
 | --: | --: | --: | --: | --: |
-| 256x64 native 6-bit baseline | 30160 | 942.500 | 0.543 | 0.828 |
-| 256x128 native 6-bit baseline | 60276 | 941.812 | 0.544 | 0.828 |
-| 256x64 int8 payload | 10254 | 320.438 | 1.598 | 1.094 |
-| 256x128 int8 payload | 20425 | 319.141 | 1.604 | 1.094 |
-| standalone unpack 256x64 | 6708 | 209.625 | 2.442 | - |
+| 256x64 q6_k native baseline | 25957 | 811.156 | 0.631 | 0.8203 |
+| 256x64 q6_k_int8 payload | 10254 | 320.438 | 1.598 | 1.09375 |
+| 256x128 q6_k_int8 payload | 20425 | 319.141 | 1.604 | 1.09375 |
+| 256x64 q6_k_int8 standalone unpack | 6708 | 209.625 | 2.442 | - |
 | 256x64 host scale terms | 8239 | 257.469 | 1.989 | 1.375 |
 | Q8_0 256x64 reference | 8245 | 257.656 | 1.987 | 1.0625 |
 
-The int8 payload is an exact 2.94x speedup on one core. At 55 GB/s it is
-memory-bound at about 1.05 weights/core-cycle, roughly 1.93x the native 6-bit
-format. Long-K checks hold 1.55-1.58 weights/cycle at 1024/1536 rows.
+The native baseline is compute-bound at about 36B weights/s, versus about 50B
+for `q6_k_int8` at 55 GB/s. The int8 payload is therefore still the production
+choice. The native layout is still valuable: if aggregate bandwidth drops below
+roughly 40 GB/s, or clocks approach 2.5 GHz, or the bit-plane decode improves
+past about 0.87 weights/cycle, the smaller 6.5625-bit format becomes
+competitive. Further vectorization is the next optimization step. A padded
+1728-byte record was measured about 1.4% faster in the fused mmul and 5.5%
+faster in standalone unpack, but costs 2.9% more bytes and was not kept.
+
+The largest single win was decoding the two tiles in a 16-row subgroup together
+instead of one at a time. They share the scale vectors, so the independent
+vector chains fill the emulated-FP32 latency slots.
 
 Rejected or alternate approaches:
 
 - host-precomputing all three bf16 scale terms: 8239 cycles on one core but
   2816-byte records (1.375 bytes/weight), worse at the 32-core memory budget;
 - applying the exact scale after the mmul: 14258 cycles and max abs error 5.0;
-- dropping the third scale term: only ~3% faster and unsafe for canonical
-  scales up to 127;
+- dropping the third scale term for native Q6_K: about 3% faster unpack and
+  9% faster mmul, but not exact for canonical scales up to 127 (five random
+  seeds produced up to 1.0 absolute error);
 - reusing the accumulator directly in the split: neutral;
 - fp32 scale plus emulated float `aie::mul`: exact but much slower;
 - four column tiles: memory-bound, extra ILP does not help.
@@ -377,12 +413,12 @@ is one 8x8 row-major matrix, so decode is `load 64 signed bytes -> int8 vector
 -> bf16 vector`, then `q * d`. An fp16 `d` needs only two bf16 terms; the
 `hi + lo` split is exact and accumulates to one bf16 rounding.
 
-Results, 1.5 GHz:
+Results at the measured 1.8 GHz H clock:
 
-| shape | cycles | cycles/tile | weights/cycle | 32-core packed GB/s |
+| shape | cycles | cycles/tile | weights/cycle | compute-implied 32-core GB/s |
 | --: | --: | --: | --: | --: |
-| 256x64 | 8245 | 257.656 | 1.987 | 101.3 |
-| 256x128 | 16453 | 257.078 | 1.992 | 101.6 |
+| 256x64 | 8245 | 257.656 | 1.987 | 121.6 |
+| 256x128 | 16453 | 257.078 | 1.992 | 121.8 |
 | standalone unpack 256x64 | 5098 | 159.313 | 3.214 | - |
 
 What helped: payload-first 64-byte alignment, signed int8 to bf16 without a

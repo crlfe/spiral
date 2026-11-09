@@ -15,13 +15,11 @@ constexpr int kPayloadsPerBlock = 8;
 constexpr int kPayloadBytes = 16;
 constexpr int kBlockPayloadRegionBytes = 128;
 
-// Repacked record/chunk layout. Scales for both blocks are stored first as
-// host-precomputed bf16 hi/lo pairs, then all payloads, so every 32-byte tile
-// payload is 32-byte aligned.
+// Repacked record/chunk layout. Scales for both blocks are stored first, then
+// all payloads, so every 32-byte tile payload is 32-byte aligned.
 constexpr int kTileCols = 8;
 constexpr int kBlocksPerRecord = 2;
-constexpr int kPackedScaleBytesPerCol = 4;  // bf16 hi + bf16 lo
-constexpr int kScaleBytesPerBlock = kTileCols * kPackedScaleBytesPerCol;
+constexpr int kScaleBytesPerBlock = kTileCols * kBlockScaleBytes;
 constexpr int kScalesBytes = kBlocksPerRecord * kScaleBytesPerBlock;
 constexpr int kPayloadsBytes = kBlocksPerRecord * kBlockPayloadRegionBytes;
 constexpr int kScalesOffset = 0;
@@ -40,8 +38,8 @@ static_assert(kTileCols == ::spiral::quants::kMmulWeightsCols,
               "Q4_0 tile columns must match the mmul tile width");
 static_assert(kRecordRows == kChunksPerRecord * kUnpackTileRows,
               "Q4_0 record and chunk depths disagree");
-static_assert(kPackedChunkBytes == 320, "Q4_0 packed chunk size changed");
-static_assert(kPackedRecordBytes == 320, "Q4_0 packed record size changed");
+static_assert(kPackedChunkBytes == 288, "Q4_0 packed chunk size changed");
+static_assert(kPackedRecordBytes == 288, "Q4_0 packed record size changed");
 static_assert(kPayloadsOffset % 32 == 0,
               "Q4_0 payload region must be 32-byte aligned");
 static_assert(kBlockPayloadRegionBytes % 32 == 0,

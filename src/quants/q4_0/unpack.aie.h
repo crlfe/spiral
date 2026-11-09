@@ -11,20 +11,22 @@ namespace spiral::quants::q4_0 {
 
 namespace detail {
 
-// Load the host-precomputed bf16 hi/lo scale pair for one 32-row block and
-// expand each component to 64 lanes.
+// Load, split, and expand one 32-row block's scales to one 64-lane vector per
+// bf16 component.
 static inline __attribute__((always_inline)) void load_block_scales64(
     const uint8_t* packed_chunk,
     int weights_rows_block,
     aie::vector<bfloat16, kMmulWeightsElems>& hi,
     aie::vector<bfloat16, kMmulWeightsElems>& lo) {
-  const uint8_t* scales = block_scales(packed_chunk, weights_rows_block);
-  const auto hi8 =
-      aie::load_v<kTileCols>(reinterpret_cast<const bfloat16*>(scales));
-  const auto lo8 = aie::load_v<kTileCols>(
-      reinterpret_cast<const bfloat16*>(scales + kScaleBytesPerBlock / 2));
-  hi = aie::broadcast_vector<kTileCols, bfloat16, kMmulWeightsElems>(hi8, 0);
-  lo = aie::broadcast_vector<kTileCols, bfloat16, kMmulWeightsElems>(lo8, 0);
+  const auto scales =
+      load_fp16x8(block_scales(packed_chunk, weights_rows_block));
+  aie::vector<bfloat16, 8> hi8;
+  aie::vector<bfloat16, 8> lo8;
+  split_bf16_hi_lo(scales, hi8, lo8);
+  const auto hi32 = aie::concat(hi8, hi8, hi8, hi8);
+  const auto lo32 = aie::concat(lo8, lo8, lo8, lo8);
+  hi = aie::concat(hi32, hi32);
+  lo = aie::concat(lo32, lo32);
 }
 
 // Dequantize one 8x8 tile from the packed chunk.
