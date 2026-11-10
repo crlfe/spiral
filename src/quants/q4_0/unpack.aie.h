@@ -59,7 +59,6 @@ inline void unpack_weights_chunk(const uint8_t* record,
   auto output_tiles = reinterpret_cast<OutputVec*>(weights_tile);
 
   constexpr int kTilesPerBlock = kBlockRows / kMmulWeightsRows;
-#pragma unroll
   for (int weights_rows_block = 0; weights_rows_block < kBlocksPerRecord;
        ++weights_rows_block) {
     aie::vector<bfloat16, kMmulWeightsElems> hi;

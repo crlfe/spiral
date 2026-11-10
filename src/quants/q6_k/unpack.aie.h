@@ -88,22 +88,20 @@ static inline
 
   const auto low_bytes =
       aie::load_unaligned_v<kTileRows * kTileCols / 2>(low, 16);
-  const auto low_u8 =
-      low_bytes.template cast_to<uint4>().template unpack<uint8>();
+  const auto low4 = low_bytes.template cast_to<uint4>();
+
   const auto high_bytes = aie::load_v<kTileRows * kTileCols / 4>(high);
   const auto high8 =
       high_bytes.template cast_to<uint4>().template unpack<uint8>();
-  const auto high16 = high8.template unpack<uint16>();
   const auto mask8 = aie::broadcast<uint8_t, kTileRows * kTileCols / 2>(
       static_cast<uint8_t>(0x03));
-  const auto mask16 = aie::broadcast<uint16_t, kTileRows * kTileCols / 2>(
-      static_cast<uint16_t>(0x03));
 
   const auto h_even = aie::bit_and(high8, mask8);
-  const auto h_odd_16 = aie::bit_and(aie::logical_downshift(high16, 2), mask16);
-  const auto h_odd = h_odd_16.template pack<uint8>();
+  const auto h_odd = aie::bit_and(aie::logical_downshift(high8, 2), mask8);
   const auto [c0, c1] = aie::interleave_zip(h_even, h_odd, 1);
   const auto high_u8 = aie::concat(c0, c1);
+
+  const auto low_u8 = low4.template unpack<uint8>();
   const auto values_u8 = aie::bit_or(low_u8, aie::upshift(high_u8, 4));
   const auto centered = aie::add(
       values_u8,
@@ -136,7 +134,6 @@ inline void unpack_weights_chunk(const uint8_t* record,
   detail::load_chunk_scales32(d32, chunk_scales(record, chunk_index), hi32,
                               mid32, lo32);
 
-#pragma unroll
   for (int subgroup = 0; subgroup < kTilesPerChunk / kTilesPerSubgroup;
        ++subgroup) {
     aie::vector<bfloat16, kMmulWeightsElems> hi;

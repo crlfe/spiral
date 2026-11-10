@@ -8,7 +8,9 @@ import importlib
 import json
 import os
 import re
+import struct
 import subprocess
+import sys
 import tempfile
 from collections import defaultdict
 from dataclasses import dataclass
@@ -26,6 +28,10 @@ MMUL_SHIM = TESTS_ROOT / "mmul.aie.cc"
 _TMP_DIR = tempfile.TemporaryDirectory(prefix="quants_tests_")
 TMP_ROOT = Path(_TMP_DIR.name)
 _TRACE_SIZE = 65536
+
+# AIE2P compute-tile instruction memory, per `Aie2PCoreMod` in aie-rt's
+# xaie2pgbl_reginit.c and the `program` region of the generated linker script.
+CORE_PROGRAM_MEMORY_BYTES = 16 * 1024
 
 
 class NpuUnavailable(Exception):
@@ -388,6 +394,57 @@ def _header_files(format_name, include_mmul=False):
     return [str(path) for path in paths]
 
 
+def kernel_compile_flags():
+    """Return the Peano flags used for test kernel builds.
+
+    `-Rpass-missed=loop-unroll` is always enabled so failed forced unrolls are
+    reported at the loop line instead of the inlined function. Extra flags may
+    be supplied through `QUANTS_KERNEL_FLAGS`; add `-Werror=pass-failed` to
+    make failed `#pragma unroll` transformations fatal.
+    """
+    return [
+        "-Rpass-missed=loop-unroll",
+        *os.environ.get("QUANTS_KERNEL_FLAGS", "").split(),
+    ]
+
+
+def _install_compiler_diagnostics():
+    """Print compiler warnings that the JIT helper captures and discards.
+
+    `aie.utils.compile.utils` captures each compiler subprocess's stderr and
+    only logs it on failure, so successful builds hide warnings such as
+    `-Wpass-failed=transform-warning` for failed `#pragma unroll`
+    transformations. Wrap its `subprocess` reference so warnings and remarks
+    are echoed while preserving the original captured result.
+    """
+    import aie.utils.compile.utils as compile_utils
+
+    if getattr(compile_utils, "_quants_diagnostics_installed", False):
+        return
+
+    real_subprocess = compile_utils.subprocess
+
+    class _SubprocessProxy:
+        def __getattr__(self, name):
+            return getattr(real_subprocess, name)
+
+        def run(self, *args, **kwargs):
+            result = real_subprocess.run(*args, **kwargs)
+            if result.returncode == 0 and result.stderr:
+                command = args[0] if args else kwargs.get("args", ())
+                show_all = any("debug-only" in str(arg) for arg in command)
+                stderr = result.stderr
+                if isinstance(stderr, bytes):
+                    stderr = stderr.decode(errors="replace")
+                for line in stderr.splitlines():
+                    if show_all or "warning:" in line or "remark:" in line:
+                        print(f"compiler: {line}", file=sys.stderr)
+            return result
+
+    compile_utils.subprocess = _SubprocessProxy()
+    compile_utils._quants_diagnostics_installed = True
+
+
 def _require_iron():
     try:
         from aie import iron
@@ -403,6 +460,7 @@ def _require_iron():
         from aie.iron.device import NPU2
     except ImportError as exc:
         raise NpuUnavailable(f"AIE/IRON is not installed: {exc}") from exc
+    _install_compiler_diagnostics()
     return (
         iron,
         ExternalFunction,
@@ -447,6 +505,7 @@ def build_unpack_program(
         str(UNPACK_SHIM),
     ] + _header_files(format_name)
     include_dirs = [str(SRC_ROOT)]
+    compile_flags = kernel_compile_flags()
 
     def build(
         packed: In,
@@ -463,6 +522,7 @@ def build_unpack_program(
             source_file=str(shim),
             arg_types=[packed_ty, out_ty],
             include_dirs=include_dirs,
+            compile_flags=compile_flags,
         )
         packed_fifo = ObjectFifo(packed_ty, name="packed", depth=1)
         out_fifo = ObjectFifo(out_ty, name="weights", depth=1)
@@ -499,7 +559,9 @@ def build_unpack_program(
             program.enable_trace(trace_size, workers=[worker])
         return program.resolve_program()
 
-    return iron.jit(source_files=source_files)(build)
+    return iron.jit(
+        source_files=source_files, compile_flags=compile_flags
+    )(build)
 
 
 def build_mmul_program(
@@ -534,6 +596,7 @@ def build_mmul_program(
         str(MMUL_SHIM),
     ] + _header_files(format_name, include_mmul=True)
     include_dirs = [str(SRC_ROOT)]
+    compile_flags = kernel_compile_flags()
 
     def build(
         packed: In,
@@ -552,6 +615,7 @@ def build_mmul_program(
             source_file=str(shim),
             arg_types=[packed_ty, inputs_ty, outputs_ty],
             include_dirs=include_dirs,
+            compile_flags=compile_flags,
         )
         packed_fifo = ObjectFifo(packed_ty, name="packed", depth=1)
         inputs_fifo = ObjectFifo(inputs_ty, name="inputs", depth=1)
@@ -606,7 +670,9 @@ def build_mmul_program(
             program.enable_trace(trace_size, workers=[worker])
         return program.resolve_program()
 
-    return iron.jit(source_files=source_files)(build)
+    return iron.jit(
+        source_files=source_files, compile_flags=compile_flags
+    )(build)
 
 
 def parse_trace_intervals(trace_path):
@@ -696,4 +762,58 @@ def run_traced(program, args, tag):
     trace_config.trace_to_json(
         trace_config.physical_mlir_path, str(trace_json)
     )
-    return parse_trace_intervals(trace_json)
+    kernel_dir = None
+    if trace_config.physical_mlir_path:
+        kernel_dir = Path(trace_config.physical_mlir_path).parent
+    return parse_trace_intervals(trace_json), kernel_dir
+
+
+def _elf_text_size(path):
+    """Return the `.text` section size of an ELF32 little-endian core ELF."""
+    data = Path(path).read_bytes()
+    if data[:6] != b"\x7fELF\x01\x01":
+        raise ValueError(f"{path}: not a 32-bit little-endian ELF")
+    section_offset = struct.unpack_from("<I", data, 0x20)[0]
+    section_entry_size = struct.unpack_from("<H", data, 0x2E)[0]
+    section_count = struct.unpack_from("<H", data, 0x30)[0]
+    names_index = struct.unpack_from("<H", data, 0x32)[0]
+
+    def section(index):
+        return struct.unpack_from(
+            "<IIIIII", data, section_offset + index * section_entry_size
+        )
+
+    _, _, _, _, names_offset, names_size = section(names_index)
+    names = data[names_offset : names_offset + names_size]
+    for index in range(section_count):
+        name_offset, _, _, _, _, size = section(index)
+        name = names[name_offset:].split(b"\0", 1)[0]
+        if name == b".text":
+            return size
+    raise ValueError(f"{path}: no .text section")
+
+
+def print_text_size(kernel_dir):
+    """Report each core ELF's `.text` size against AIE2P program memory."""
+    if kernel_dir is None:
+        print("program memory: unavailable")
+        return
+    elfs = sorted(Path(kernel_dir).glob("elfs_*/*.elf"))
+    if not elfs:
+        print("program memory: unavailable (no core ELF)")
+        return
+    sizes = [(_elf_text_size(elf), elf) for elf in elfs]
+    if len({size for size, _ in sizes}) == 1:
+        size = sizes[0][0]
+        suffix = f" per core x{len(sizes)}" if len(sizes) > 1 else ""
+        print(
+            f"program memory: {size} B / {CORE_PROGRAM_MEMORY_BYTES} B "
+            f"({100 * size / CORE_PROGRAM_MEMORY_BYTES:.1f}%){suffix}"
+        )
+        return
+    for size, elf in sizes:
+        print(
+            f"program memory: {size} B / {CORE_PROGRAM_MEMORY_BYTES} B "
+            f"({100 * size / CORE_PROGRAM_MEMORY_BYTES:.1f}%) "
+            f"[{elf.parent.name}]"
+        )

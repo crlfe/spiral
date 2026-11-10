@@ -61,7 +61,6 @@ inline void unpack_weights_chunk(const uint8_t* record,
   auto output_tiles = reinterpret_cast<OutputVec*>(weights_tile);
   (void)record;
 
-#pragma unroll
   for (int block = 0; block < kBlocksPerRecord; ++block) {
     aie::vector<bfloat16, kTileCols> hi8;
     aie::vector<bfloat16, kTileCols> lo8;

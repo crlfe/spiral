@@ -50,7 +50,7 @@ inline void unpack_mmul(const uint8_t* packed,
       const auto d32_0 = detail::load_d32(record0);
       const auto d32_1 = detail::load_d32(record1);
 
-#pragma unroll
+#pragma clang loop unroll(disable)
       for (int chunk_index = 0; chunk_index < kChunksPerRecord; ++chunk_index) {
         const uint8_t* packed_chunk0 = chunk(record0, chunk_index);
         const uint8_t* packed_chunk1 = chunk(record1, chunk_index);
@@ -109,6 +109,7 @@ inline void unpack_mmul(const uint8_t* packed,
           cols_tile + weights_rows_record * kPackedRecordBytes;
       const auto d32 = detail::load_d32(record);
 
+#pragma clang loop unroll(disable)
       for (int chunk_index = 0; chunk_index < kChunksPerRecord; ++chunk_index) {
         const uint8_t* packed_chunk = chunk(record, chunk_index);
         const InputVec* inputs_slice =

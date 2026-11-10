@@ -10,8 +10,8 @@ technique and benchmark findings are in `NOTES.md`.
 | :-- | :-- | :-- | :-- | :-- | :-- | :-- | :-- |
 | Q4_0 | done | done | done | done | exact | 1.66 w/c | multi-core |
 | Q4_0_hilo | done | done | done | done | exact | 2.26 w/c | multi-core |
-| Q6_K | done | done | done | done | exact | 0.63 w/c | further optimize native decode |
-| Q6_K_int8 | done | done | done | done | exact | 1.60 w/c | multi-core, optional variants |
+| Q6_K | done | done | done | done | exact | 0.67 w/c | further optimize native decode |
+| Q6_K_int8 | done | done | done | done | exact | 1.61 w/c | multi-core, optional variants |
 | Q8_0 | done | done | done | done | exact | 1.99 w/c | multi-core |
 | Q4_K | not started | - | - | - | - | - | plan below |
 | Q5_K | not started | - | - | - | - | - | share Q4_K scale/min |
@@ -57,9 +57,12 @@ Integration status:
 3. **Q4_0 scale-layout decision**
    - both `q4_0` (canonical-size fp16 scales) and `q4_0_hilo` (expanded bf16
      hi/lo scales) are available;
-   - at the measured 1.8 GHz clock, `q4_0` is compute-bound around 96B and
-     `q4_0_hilo` is memory-bound around 88B, so `q4_0` is the current default;
-   - re-measure actual aggregate bandwidth before fixing the default for the
+   - `q4_0` is compute-bound (about 80B weights/s at 1.5 GHz, 96B at 1.8 GHz)
+     and `q4_0_hilo` is memory-bound at 88B, so the default depends on clock:
+     `q4_0_hilo` wins at 1.5 GHz, `q4_0` at 1.8 GHz, crossing over near
+     1.66 GHz at the 55 GB/s target;
+   - re-measure actual aggregate bandwidth (below about 50 GB/s the smaller
+     `q4_0` layout wins at either clock) before fixing the default for the
      final driver.
 
 4. **Output-head decision**
@@ -404,9 +407,9 @@ common:  16 bytes, one fp16 d per column
 ```
 
 This preserves the canonical 6.5625-bit size. The device expands the bit
-planes with vector uint4/uint16 operations into signed `q - 32` bytes, then uses
-the same bf16 scale path as the expanded variant. It remains compute-bound and
-is retained as the optimization baseline.
+planes with uint4 low-nibble lanes and uint8 high-bit lanes into signed
+`q - 32` bytes, then uses the same bf16 scale path as the expanded variant. It
+remains compute-bound and is retained as the optimization baseline.
 
 `q6_k_int8` (host-expanded):
 
@@ -426,6 +429,10 @@ a chunk are naturally aligned. Payloads come first, then scales, then `d`; the
 2240-byte stride is the smallest 64-byte multiple that holds 2048 + 128 + 16
 bytes.
 
+The mmul keeps the four-iteration chunk loop rolled, which holds the kernel at
+5008 bytes (30.6% of the 16 KiB compute-tile program memory). Fully unrolling
+it grew the kernel to 12256 bytes (74.8%) without improving throughput.
+
 ### Q8_0
 
 ```text
@@ -442,7 +449,7 @@ Payloads first, then scales, so every 64-byte tile load is naturally aligned.
 
 ```text
 src/quants/
-  README.md                   status and current best performance
+  README.md                   performance summary
   NOTES.md                    techniques and detailed results
   TODO.md                     this file
   common/
@@ -516,7 +523,7 @@ kernels share one implementation.
   - Q6_K 256x64 native and int8 variants;
   - Q4_K/Q5_K 256x64 and 512x64, split output if DMA limits require it.
 - Report cycles/tile, cycles/weight, weights/cycle, bytes/weight, and estimated
-  weights/s at 1.8 GHz and 55 GB/s.
+  weights/s at 1.5 and 1.8 GHz and 55 GB/s.
 - Record new baselines in `NOTES.md` and update the summary in `README.md`.
 
 ## Definition of done

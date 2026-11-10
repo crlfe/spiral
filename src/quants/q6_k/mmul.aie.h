@@ -57,7 +57,6 @@ inline void unpack_mmul(const uint8_t* packed,
                                     hi32, mid32, lo32);
 
         MMUL accumulator(*output_tile);
-#pragma unroll
         for (int subgroup = 0; subgroup < kTilesPerChunk / kTilesPerSubgroup;
              ++subgroup) {
           aie::vector<bfloat16, kMmulWeightsElems> hi, mid, lo;

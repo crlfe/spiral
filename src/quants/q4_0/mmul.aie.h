@@ -58,7 +58,6 @@ inline void unpack_mmul(const uint8_t* packed,
         MMUL accumulator0(*outputs_tile0);
         MMUL accumulator1(*outputs_tile1);
 
-#pragma unroll
         for (int block = 0; block < kBlocksPerRecord; ++block) {
           aie::vector<bfloat16, kMmulWeightsElems> hi0;
           aie::vector<bfloat16, kMmulWeightsElems> lo0;

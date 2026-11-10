@@ -78,7 +78,7 @@ def main():
         packed_tensor = iron.tensor(case.packed, dtype=np.uint8)
         inputs_tensor = iron.tensor(packed_inputs, dtype=bfloat16)
         outputs = iron.zeros((outputs_elems,), dtype=np.float32)
-        intervals = common.run_traced(
+        intervals, kernel_dir = common.run_traced(
             program,
             [packed_tensor, inputs_tensor, outputs],
             f"quants_mmul_{case.format_name}_"
@@ -99,6 +99,7 @@ def main():
     print(f"cycles/tile: {cycles / case.tiles:.3f}")
     print(f"weights/cycle: {case.expected_weights.size / cycles:.3f}")
     print(f"trace intervals: {len(flat)}")
+    common.print_text_size(kernel_dir)
 
     weights_matrix = (
         case.expected_weights.reshape(

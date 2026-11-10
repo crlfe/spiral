@@ -24,12 +24,40 @@ status and future plans live in `TODO.md`; the quick summary lives in
   - Q6_K: 6.5625 bits/weight (`q6_k`, 0.8203 bytes/weight) or 8.75 bits/weight
     (`q6_k_int8`, 1.09375 bytes/weight)
   - Q8_0: 8.5 bits/weight (1.0625 bytes/weight)
-- Full-device estimate:
-  `min(weights/cycle * 1.8 GHz * 32, 55 GB/s / bytes-per-weight)`.
+- Full-device estimate at clock `f`:
+  `min(weights/cycle * f * 32, 55 GB/s / bytes-per-weight)`.
   The first term is the compute cap, the second the packed-weight memory cap.
-- 60 GB/s requires about 1.67 weights/core-cycle at the 5.0-bit Q4_0 layout,
-  or 1.85 at canonical 4.5 bits.
+  Only the compute cap scales with clock. Report 1.5 GHz as the typical NPU
+  clock and 1.8 GHz as the measured one; `README.md` tabulates both.
+- Cycle counts and weights/cycle are clock-independent, while weights/s and
+  bytes/s scale linearly with clock. The per-format tables below carry the
+  1.8 GHz measurement; multiply those throughput figures by 0.833 for 1.5 GHz.
+- 60 GB/s at 1.8 GHz requires about 1.67 weights/core-cycle at the 5.0-bit
+  Q4_0 layout, or 1.85 at canonical 4.5 bits (scale by 1.2 for 1.5 GHz).
 - One AIE2 VLIW bundle is 16 bytes.
+- The `mmul.py` harness reports each core ELF's `.text` size as a share of the
+  16 KiB AIE2P compute-tile program memory. Fully unrolling is not
+  automatically faster; wide unrolled loops can lose more to instruction fetch
+  than they gain in ILP.
+- Set `QUANTS_KERNEL_FLAGS` to append Peano flags to the test builds. The
+  harness always enables `-Rpass-missed=loop-unroll` and prints captured
+  compiler warnings (including `-Wpass-failed=transform-warning` for failed
+  `#pragma unroll` transformations) to stderr as `compiler: ...`, with the
+  loop line. Add `-Werror=pass-failed` to make those failures fatal. All
+  current formats are clean after removing the pragmas the compiler ignored.
+- `#pragma unroll` maps to `llvm.loop.unroll.enable`, a hint equivalent to
+  `unroll(enable)`. `#pragma clang loop unroll(full)` maps to
+  `llvm.loop.unroll.full`, but it did not override the removed failures.
+  `-O3` produced identical code and cycles to `-O2` for every quants kernel.
+- The removed pragmas were not a code-size threshold. With
+  `-mllvm -debug-only=loop-unroll` the compiler reported `Invalid loop size
+  prevents unrolling. / Loop not considered unrollable.`: `CodeMetrics` could
+  not produce a valid loop size, so `canUnroll()` rejected the loop before the
+  pragma was considered. The affected loops correlate with the 8-lane
+  `v16accfloat`/`v16bf16` conversions in `split_bf16_hi_lo` (`q4_0`,
+  `q8_0`) and the runtime `broadcast_vector` switch in `q6_k`. The kernels
+  now follow the compiler heuristic. Manual expansion remains a potential
+  optimization; it is worth about 25% on native `q6_k`.
 
 ## Reusable AIE2 techniques
 
@@ -97,13 +125,13 @@ programming guide, `third_party/aie_api/include/aie_api/aie.hpp`, and the
   `{0x0F, 0xF0}` or 2-bit plane masks.
 - `concat()` has a tuple overload, so `concat(interleave_zip(even, odd, 1))`
   joins the two halves of a deinterleave. `interleave_unzip` is the inverse.
-- Q6_K's native six-bit decode uses `vector<uint8, 32>.cast_to<uint4>()` plus
-  `unpack<uint8>()` for the low nibbles. For the high plane, the same cast
-  first splits each byte into two nibbles holding two 2-bit fields each. The
-  even field is masked directly; only the odd field needs a shift. Shifting it
-  in a 32-lane `uint16` intermediate and `pack<uint8>()`-ing back avoids the
-  compiler crash seen when shifting 8-bit lanes directly. A single
-  `interleave_zip` then assembles the 64 high-bit lanes.
+- Q6_K's native six-bit decode keeps the low nibbles in `uint4` until the
+  final combine. The high plane is expanded to `uint8` lanes, where the even
+  2-bit field is masked directly and the odd field uses a logical right shift
+  by 2. A single `interleave_zip` then assembles the 64 high-bit lanes. An
+  earlier 32-lane `uint16` intermediate was a workaround for a compiler crash
+  on 8-bit shifts; the current compiler handles the direct shift and it is
+  faster (24453 vs 25957 cycles, 2352 vs 2416 bytes).
 - `filter_even` / `filter_odd(v, chunk_size)` return a half-size vector by
   selecting alternating chunks in one permute-style op. For 8-bit data this is
   byte granularity, so it fits separating ql/qh planes, not nibbles.
@@ -315,11 +343,12 @@ Results at the measured 1.8 GHz H clock:
 | q4_0 | 256x64 | 9872 | 308.500 | 1.660 | 53.8 |
 | q4_0_hilo | 256x64 | 7267 | 227.094 | 2.255 | 81.2 |
 
-`q4_0` is compute-bound at about 96B weights/s, while `q4_0_hilo` is
-memory-bound at the 55 GB/s target (88B weights/s). The canonical-size layout
-is therefore the current default if actual aggregate bandwidth is near
-55 GB/s. The previous 1.5 GHz long-K checks are not directly comparable and
-have not been re-run under the locked 1.8 GHz clock.
+`q4_0` is compute-bound at both clocks (about 80B weights/s at 1.5 GHz, 96B
+at 1.8 GHz), while `q4_0_hilo` is memory-bound at the 55 GB/s target (88B).
+The better default therefore depends on clock: at that bandwidth `q4_0_hilo`
+wins at 1.5 GHz and `q4_0` wins at 1.8 GHz, crossing over near 1.66 GHz. The
+previous 1.5 GHz long-K checks are not directly comparable and have not been
+re-run under the locked 1.8 GHz clock.
 
 Standalone exact unpack: 6156 cycles for `q4_0`, 2891 cycles for
 `q4_0_hilo`. The fast single-bf16 mode measured 2119 cycles at 64 columns on
@@ -336,10 +365,10 @@ six-bit payload and the exact 1680-byte record size:
 16 bytes  per-column fp16 d
 ```
 
-The device decoder expands the low-nibble and high-two-bit planes with vector
-uint4/uint16 operations, then follows the same bf16 scale path as the expanded
-variant. It is kept as a size/optimization baseline, not as the production
-path.
+The device decoder keeps the low nibbles in `uint4` until the final combine
+and expands the two-bit high plane in `uint8` lanes, then follows the same
+bf16 scale path as the expanded variant. It is kept as a size/optimization
+baseline, not as the production path.
 
 The `q6_k_int8` variant expands every 6-bit weight to signed int8 (`q - 32`)
 in the host repack. The per-16-row scale structure is unchanged, so the
@@ -359,25 +388,38 @@ Results at the measured 1.8 GHz H clock:
 
 | shape | cycles | cycles/tile | weights/cycle | bytes/weight |
 | --: | --: | --: | --: | --: |
-| 256x64 q6_k native baseline | 25957 | 811.156 | 0.631 | 0.8203 |
-| 256x64 q6_k_int8 payload | 10254 | 320.438 | 1.598 | 1.09375 |
-| 256x128 q6_k_int8 payload | 20425 | 319.141 | 1.604 | 1.09375 |
+| 256x64 q6_k native baseline | 24453 | 764.156 | 0.670 | 0.8203 |
+| 256x64 q6_k native standalone unpack | 19922 | 622.563 | 0.822 | - |
+| 256x64 q6_k_int8 payload | 10191 | 318.469 | 1.608 | 1.09375 |
+| 256x128 q6_k_int8 payload | 20318 | 317.469 | 1.613 | 1.09375 |
 | 256x64 q6_k_int8 standalone unpack | 6708 | 209.625 | 2.442 | - |
 | 256x64 host scale terms | 8239 | 257.469 | 1.989 | 1.375 |
 | Q8_0 256x64 reference | 8245 | 257.656 | 1.987 | 1.0625 |
 
-The native baseline is compute-bound at about 36B weights/s, versus about 50B
-for `q6_k_int8` at 55 GB/s. The int8 payload is therefore still the production
-choice. The native layout is still valuable: if aggregate bandwidth drops below
-roughly 40 GB/s, or clocks approach 2.5 GHz, or the bit-plane decode improves
-past about 0.87 weights/cycle, the smaller 6.5625-bit format becomes
-competitive. Further vectorization is the next optimization step. A padded
+The native baseline is compute-bound at both clocks (about 32B weights/s at
+1.5 GHz, 39B at 1.8 GHz), versus about 50B for `q6_k_int8` at 55 GB/s. The
+int8 payload is therefore still the production choice. The native layout is
+still valuable: if aggregate bandwidth drops below roughly 42 GB/s, or clocks
+approach 2.5 GHz, or the bit-plane decode improves past about 0.87
+weights/cycle, the smaller 6.5625-bit format becomes competitive. Further
+vectorization is the next optimization step. A padded
 1728-byte record was measured about 1.4% faster in the fused mmul and 5.5%
 faster in standalone unpack, but costs 2.9% more bytes and was not kept.
 
 The largest single win was decoding the two tiles in a 16-row subgroup together
 instead of one at a time. They share the scale vectors, so the independent
 vector chains fill the emulated-FP32 latency slots.
+
+Instruction memory: the fully unrolled `q6_k_int8` mmul used 12256 of the
+16384-byte AIE2P compute-tile program memory (74.8%). Rolling the
+four-iteration chunk loop (`#pragma clang loop unroll(disable)`) reduces that
+to 5008 bytes (30.6%) and is neutral on throughput: 10191 vs 10254 cycles at
+256x64, and 20318 vs 20425 at 256x128. The unrolled body loses more to
+instruction fetch than it gains from cross-chunk ILP. Rolling the subgroup
+loop as well shrinks the kernel to 2928 bytes (17.9%) but costs about 15.5%
+more cycles, so only the chunk loop is rolled. For comparison, `q4_0_hilo`
+rolls nothing and uses 3616 bytes; rolling its block loop saves 32% of the
+code for a 7.6% cycle cost.
 
 Rejected or alternate approaches:
 
@@ -449,12 +491,14 @@ output buffer; the fused kernel works at 64/128 columns. 256 columns need about
   A two-term bf16 split can still pass the end-to-end test because final bf16
   rounding hides the residual. Add a direct split-residual test if the scale
   representation changes.
-- Code-size measurements from earlier kernels are stale after the host-scale
-  and int8-payload changes; re-measure only if code size matters.
+- Code-size figures in `README.md` are current; older per-format `.text` numbers
+  in this file may predate the host-scale and int8-payload changes.
 
 ## Target model context
 
 `gemma-4-E2B_q4_0-it.gguf` is the first end-to-end target: 35 dense blocks,
-about 1.605 GB/token of active NPU weights with the current repacks, or roughly
-34.3 tok/s at 55 GB/s. The traffic breakdown and bring-up checklist live in
-`TODO.md`; the summary lives in `README.md`.
+about 1.488 GB/token of active NPU weights with the canonical `q4_0` repack, or
+roughly 37.0 tok/s at 55 GB/s. With `q4_0_hilo` those rise to 1.604 GB and
+34.3 tok/s. The traffic figures are memory-bound and therefore clock-invariant.
+The breakdown and bring-up checklist live in `TODO.md`; the performance summary
+lives in `README.md`.

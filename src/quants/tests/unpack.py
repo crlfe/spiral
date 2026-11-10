@@ -57,7 +57,7 @@ def main():
         actual = iron.zeros(
             (case.expected_weights.size,), dtype=bfloat16
         )
-        intervals = common.run_traced(
+        intervals, _ = common.run_traced(
             program,
             [packed_tensor, actual],
             f"quants_unpack_{case.format_name}_"

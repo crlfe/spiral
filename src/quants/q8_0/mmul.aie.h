@@ -33,7 +33,6 @@ inline void unpack_mmul(const uint8_t* packed,
   auto output_tiles = reinterpret_cast<OutputVec*>(outputs);
 
   int weights_cols_tile = 0;
-#pragma unroll
   for (; weights_cols_tile + 1 < kColsTiles; weights_cols_tile += 2) {
     const uint8_t* cols_tile0 =
         packed + weights_cols_tile * kRowsRecords * kPackedRecordBytes;
@@ -53,7 +52,6 @@ inline void unpack_mmul(const uint8_t* packed,
       const InputVec* inputs_slice =
           input_tiles + weights_rows_record * kRecordRows / kTileRows;
 
-#pragma unroll
       for (int block = 0; block < kBlocksPerRecord; ++block) {
         aie::vector<bfloat16, kTileCols> hi8_0, lo8_0;
         aie::vector<bfloat16, kTileCols> hi8_1, lo8_1;
@@ -99,7 +97,6 @@ inline void unpack_mmul(const uint8_t* packed,
       const InputVec* inputs_slice =
           input_tiles + weights_rows_record * kRecordRows / kTileRows;
 
-#pragma unroll
       for (int block = 0; block < kBlocksPerRecord; ++block) {
         aie::vector<bfloat16, kTileCols> hi8, lo8;
         detail::load_block_scales(block_scales(packed_chunk, block), hi8, lo8);
