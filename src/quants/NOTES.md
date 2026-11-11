@@ -92,6 +92,46 @@ programming guide, `third_party/aie_api/include/aie_api/aie.hpp`, and the
   removed most of the decode cost, but it is still the native variant's
   bottleneck.
 
+### float16 on XDNA2
+
+- XDNA2 is AIE2P / arch 21. The AIE API defines `float16` only for arch 22
+  (AIE-MLv2); on XDNA2 it is a placeholder. The capability probe in
+  `tests/bench/fp16_ops.*` confirms:
+  - `sizeof(float16) == 1`, so it cannot hold a 16-bit value;
+  - `aie::vector<float16, N>` fails its `static_assert` constraints;
+  - there is no fp16 load/store, int8/f32/accfloat conversion, add, mul, or
+    `mmul`;
+  - `to_v16float16` / `to_v32float16` exist only in the `aie2ps` intrinsics,
+    not in `aie2p`.
+- Treat fp16 as a storage and scale format only. Canonical fp16 `d` values must
+  be decoded from raw bits to f32 (`load_fp16x8`) and split into bf16 hi/lo
+  terms, as Q4_0/Q6_K/Q8_0 already do. Do not build a kernel around fp16
+  arithmetic.
+- Prefer the shift-based decode when fp16 decoding is hot: zero-extend the
+  pattern, `(u << 17) >> 4` to form `(h & 0x7fff) << 13`, OR in the sign, and
+  add `0x38000000` for the f32 exponent bias. With the same zero/subnormal
+  flush it is exact and measures 33.2 vs 37.3 cycles per eight scales; with the
+  bf16 hi/lo split it is 43.2 vs 47.3.
+- One-core probe timings, cycles per iteration over 32 iterations:
+
+  | operation per iteration | cycles |
+  | :-- | --: |
+  | 128-byte uint16 load + store | 11.0 |
+  | 128-byte bf16 load + store | 11.0 |
+  | 8 fp16 -> f32, mask/rebias | 37.3 |
+  | 8 fp16 -> bf16 hi/lo, mask/rebias | 47.3 |
+  | 8 fp16 -> f32, shift | 33.2 |
+  | 8 fp16 -> bf16 hi/lo, shift | 43.2 |
+  | 64 int8 -> bf16, one bf16 scale | 27.1 |
+  | 64 int8 -> f32, one f32 scale (emulated) | 109.2 |
+
+  The emulated f32 scale path is 4x the bf16 path, consistent with the
+  element-wise float emulation noted above.
+- A small scalar packed immediately before an aligned tile load is unsafe. A
+  probe that loaded int8 at `in + 2` silently read from `in` because
+  `load_v<64>` requires 64-byte alignment. Reserve an aligned block for scales
+  and payload tiles rather than relying on an offset within a vector load.
+
 ### Bitwise and shift operations
 
 - On XDNA2, `bit_and` / `bit_or` / `bit_xor` / `bit_not` for 8/16/32-bit are
@@ -169,6 +209,10 @@ programming guide, `third_party/aie_api/include/aie_api/aie.hpp`, and the
   and `8x8x8` only through bfp16 emulation. There is no bf16 x int4 mode, so
   bf16-activation dequantization must still produce bf16 weights. `4x4x8` bf16
   is unavailable.
+- XDNA2 also exposes int8 x int16 (`8x2x8`, `4x4x8`) and int16 x int16 mmul
+  modes. They are not usable with bf16 activations, but they matter for a
+  future integer-activation path. `aie::mul<int8, int16>` is also available and
+  returns an `acc32` accumulator.
 - `mmul<..., int8, int4>` consumes packed int4 B directly on XDNA2. This is
   only a drop-in win for a future W4A8 path with int8 activations.
 - `mmul<8, 8, 8, bfloat16, bfp16ebs8>` lets bf16 A consume a block-float8 B
