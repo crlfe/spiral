@@ -10,8 +10,8 @@ technique and benchmark findings are in `NOTES.md`.
 | :-- | :-- | :-- | :-- | :-- | :-- | :-- | :-- |
 | Q4_0 | done | done | done | done | exact | 1.66 w/c | multi-core |
 | Q4_0_hilo | done | done | done | done | exact | 2.26 w/c | multi-core |
-| Q6_K | done | done | done | done | exact | 0.67 w/c | further optimize native decode |
-| Q6_K_int8 | done | done | done | done | exact | 1.61 w/c | multi-core, optional variants |
+| Q6_K | done | done | done | done | exact | 0.86 w/c | choose native vs int8 at target clock |
+| Q6_K_int8 | done | done | done | done | exact | 1.81 w/c | multi-core, optional variants |
 | Q8_0 | done | done | done | done | exact | 1.99 w/c | multi-core |
 | Q4_K | not started | - | - | - | - | - | plan below |
 | Q5_K | not started | - | - | - | - | - | share Q4_K scale/min |
@@ -57,12 +57,10 @@ Integration status:
 3. **Q4_0 scale-layout decision**
    - both `q4_0` (canonical-size fp16 scales) and `q4_0_hilo` (expanded bf16
      hi/lo scales) are available;
-   - `q4_0` is compute-bound (about 80B weights/s at 1.5 GHz, 96B at 1.8 GHz)
-     and `q4_0_hilo` is memory-bound at 88B, so the default depends on clock:
-     `q4_0_hilo` wins at 1.5 GHz, `q4_0` at 1.8 GHz, crossing over near
-     1.66 GHz at the 55 GB/s target;
-   - re-measure actual aggregate bandwidth (below about 50 GB/s the smaller
-     `q4_0` layout wins at either clock) before fixing the default for the
+   - `q4_0` is compute-bound at 1.5 GHz (about 90B weights/s) and memory-bound
+     at 1.8 GHz (about 98B), while `q4_0_hilo` is memory-bound at 88B;
+   - `q4_0` now wins at both target clocks, crossing over near 1.47 GHz;
+   - re-measure actual aggregate bandwidth before fixing the default for the
      final driver.
 
 4. **Output-head decision**

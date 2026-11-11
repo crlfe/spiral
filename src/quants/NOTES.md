@@ -36,9 +36,11 @@ status and future plans live in `TODO.md`; the quick summary lives in
   Q4_0 layout, or 1.85 at canonical 4.5 bits (scale by 1.2 for 1.5 GHz).
 - One AIE2 VLIW bundle is 16 bytes.
 - The `mmul.py` harness reports each core ELF's `.text` size as a share of the
-  16 KiB AIE2P compute-tile program memory. Fully unrolling is not
-  automatically faster; wide unrolled loops can lose more to instruction fetch
-  than they gain in ILP.
+  16 KiB AIE2P compute-tile program memory, and its largest per-function
+  `.stack_sizes` frame. That figure is a single-frame maximum, not a transitive
+  call-chain total, and is a lower bound when a reachable function was built
+  without stack-size information. Fully unrolling is not automatically faster;
+  wide unrolled loops can lose more to instruction fetch than they gain in ILP.
 - Set `QUANTS_KERNEL_FLAGS` to append Peano flags to the test builds. The
   harness always enables `-Rpass-missed=loop-unroll` and prints captured
   compiler warnings (including `-Wpass-failed=transform-warning` for failed
@@ -384,17 +386,16 @@ Results at the measured 1.8 GHz H clock:
 
 | variant | shape | cycles | cycles/tile | weights/cycle | compute-implied 32-core GB/s |
 | :-- | --: | --: | --: | --: | --: |
-| q4_0 | 256x64 | 9872 | 308.500 | 1.660 | 53.8 |
+| q4_0 | 256x64 | 8752 | 273.500 | 1.872 | 60.7 |
 | q4_0_hilo | 256x64 | 7267 | 227.094 | 2.255 | 81.2 |
 
-`q4_0` is compute-bound at both clocks (about 80B weights/s at 1.5 GHz, 96B
-at 1.8 GHz), while `q4_0_hilo` is memory-bound at the 55 GB/s target (88B).
-The better default therefore depends on clock: at that bandwidth `q4_0_hilo`
-wins at 1.5 GHz and `q4_0` wins at 1.8 GHz, crossing over near 1.66 GHz. The
-previous 1.5 GHz long-K checks are not directly comparable and have not been
-re-run under the locked 1.8 GHz clock.
+`q4_0` is compute-bound at 1.5 GHz (about 90B weights/s) and memory-bound at
+1.8 GHz (about 98B), while `q4_0_hilo` is memory-bound at the 55 GB/s target
+(88B). `q4_0` now wins at both target clocks, crossing over near 1.47 GHz.
+The previous 1.5 GHz long-K checks are not directly comparable and have not
+been re-run under the locked 1.8 GHz clock.
 
-Standalone exact unpack: 6156 cycles for `q4_0`, 2891 cycles for
+Standalone exact unpack: 5196 cycles for `q4_0`, 2891 cycles for
 `q4_0_hilo`. The fast single-bf16 mode measured 2119 cycles at 64 columns on
 the old layout but is not exact.
 
@@ -432,36 +433,52 @@ Results at the measured 1.8 GHz H clock:
 
 | shape | cycles | cycles/tile | weights/cycle | bytes/weight |
 | --: | --: | --: | --: | --: |
-| 256x64 q6_k native baseline | 24453 | 764.156 | 0.670 | 0.8203 |
-| 256x64 q6_k native standalone unpack | 19922 | 622.563 | 0.822 | - |
-| 256x64 q6_k_int8 payload | 10191 | 318.469 | 1.608 | 1.09375 |
-| 256x128 q6_k_int8 payload | 20318 | 317.469 | 1.613 | 1.09375 |
-| 256x64 q6_k_int8 standalone unpack | 6708 | 209.625 | 2.442 | - |
+| 256x64 q6_k native | 18967 | 592.719 | 0.864 | 0.8203 |
+| 256x64 q6_k native standalone unpack | 16434 | 513.562 | 0.997 | - |
+| 256x64 q6_k_int8 payload | 9055 | 282.969 | 1.809 | 1.09375 |
+| 256x128 q6_k_int8 payload | 18071 | 282.359 | 1.813 | 1.09375 |
+| 256x64 q6_k_int8 standalone unpack | 5364 | 167.625 | 3.054 | - |
 | 256x64 host scale terms | 8239 | 257.469 | 1.989 | 1.375 |
 | Q8_0 256x64 reference | 8245 | 257.656 | 1.987 | 1.0625 |
 
-The native baseline is compute-bound at both clocks (about 32B weights/s at
-1.5 GHz, 39B at 1.8 GHz), versus about 50B for `q6_k_int8` at 55 GB/s. The
-int8 payload is therefore still the production choice. The native layout is
-still valuable: if aggregate bandwidth drops below roughly 42 GB/s, or clocks
-approach 2.5 GHz, or the bit-plane decode improves past about 0.87
-weights/cycle, the smaller 6.5625-bit format becomes competitive. Further
-vectorization is the next optimization step. A padded
+The native baseline is now compute-bound at about 41B weights/s at 1.5 GHz
+and 50B at 1.8 GHz, versus about 50B for `q6_k_int8` at 55 GB/s. At 1.8 GHz
+the smaller 6.5625-bit format matches the int8 payload while using about 25%
+less traffic; at 1.5 GHz the int8 payload still wins (50B vs 41B). The
+production choice therefore depends on the measured clock and bandwidth; the
+native format is competitive at the 1.8 GHz target. A padded
 1728-byte record was measured about 1.4% faster in the fused mmul and 5.5%
 faster in standalone unpack, but costs 2.9% more bytes and was not kept.
 
 The largest single win was decoding the two tiles in a 16-row subgroup together
 instead of one at a time. They share the scale vectors, so the independent
-vector chains fill the emulated-FP32 latency slots.
+vector chains fill the emulated-FP32 latency slots. The native `q6_k` kernel
+now uses the same paired decode, which halves the payload loads and shares the
+high-plane masks.
 
-Instruction memory: the fully unrolled `q6_k_int8` mmul used 12256 of the
-16384-byte AIE2P compute-tile program memory (74.8%). Rolling the
-four-iteration chunk loop (`#pragma clang loop unroll(disable)`) reduces that
-to 5008 bytes (30.6%) and is neutral on throughput: 10191 vs 10254 cycles at
-256x64, and 20318 vs 20425 at 256x128. The unrolled body loses more to
-instruction fetch than it gains from cross-chunk ILP. Rolling the subgroup
-loop as well shrinks the kernel to 2928 bytes (17.9%) but costs about 15.5%
-more cycles, so only the chunk loop is rolled. For comparison, `q4_0_hilo`
+The `q6_k_int8` variant picked up the exact bf16 scale product and per-tile
+scale expansion as well: 10191 -> 9055 cycles at 256x64, standalone unpack
+6708 -> 5364. It remains memory-bound at about 50B weights/s, so the native
+6.5625-bit format is the one that closes the gap at 1.8 GHz.
+
+The rest of the native improvement came from the scale path. The fp16 `d` is
+split into exact bf16 hi/lo terms once per record, and the `d * int8` product is
+formed with two bf16 multiplies in `accfloat` rather than an emulated f32
+multiply. This is exact, and it removes the int8-to-f32 conversion as well.
+The other changes were hoisting `d` out of the chunk loop and removing the
+redundant high-plane mask on the odd two-bit field. Keeping the mmul
+accumulator in registers across chunks was throughput-neutral in this build,
+but it removes the per-chunk output-tile read/write. Exact standalone unpack
+improved from 19922 to 16434 cycles, and the fused 256x64 kernel from 24453 to
+18967 cycles (2128 bytes of program memory, 13.0%).
+
+Instruction memory: the current `q6_k_int8` mmul uses 4752 of the 16384-byte
+AIE2P compute-tile program memory (29.0%) with the four-iteration chunk loop
+rolled. Before the scale-path and per-tile changes, fully unrolling the chunk
+loop grew the kernel to 12256 bytes (74.8%) without improving throughput, and
+rolling the subgroup loop as well cost about 15.5% more cycles. Those two
+variants have not been re-measured on the current body. For comparison,
+`q4_0_hilo`
 rolls nothing and uses 3616 bytes; rolling its block loop saves 32% of the
 code for a 7.6% cycle cost.
 

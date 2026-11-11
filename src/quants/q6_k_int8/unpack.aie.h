@@ -12,28 +12,37 @@ namespace spiral::quants::q6_k_int8 {
 
 namespace detail {
 
-// Load the per-column fp16 `d` values once per record and expand them to 32
-// lanes. The product of `d` and an 8-bit subgroup scale needs up to 18
-// significand bits, so the product is split into three bf16 terms: two terms
-// are not always enough to round to the same bf16 as an fp32 multiply.
-static inline
-    __attribute__((always_inline)) aie::vector<float, kPackedChunkScalesBytes>
-    load_d32(const uint8_t* record) {
-  const auto d8 = load_fp16x8(record_scales(record));
-  return aie::concat(d8, d8, d8, d8);
+// Load the per-column fp16 `d` values once per record and split them into
+// exact bf16 hi/lo terms. The product of `d` and an 8-bit subgroup scale needs
+// up to 18 significand bits, so the product is split into three bf16 terms:
+// two terms are not always enough to round to the same bf16 as an fp32
+// multiply.
+static inline __attribute__((always_inline)) void load_d16(
+    const uint8_t* record,
+    aie::vector<bfloat16, kPackedChunkScalesBytes>& d_hi32,
+    aie::vector<bfloat16, kPackedChunkScalesBytes>& d_lo32) {
+  aie::vector<bfloat16, 8> d_hi8;
+  aie::vector<bfloat16, 8> d_lo8;
+  split_bf16_hi_lo(load_fp16x8(record_scales(record)), d_hi8, d_lo8);
+  d_hi32 = aie::broadcast_vector<kTileCols, bfloat16, kPackedChunkScalesBytes>(
+      d_hi8, 0);
+  d_lo32 = aie::broadcast_vector<kTileCols, bfloat16, kPackedChunkScalesBytes>(
+      d_lo8, 0);
 }
 
 static inline __attribute__((always_inline)) void load_chunk_scales32(
-    const aie::vector<float, kPackedChunkScalesBytes>& d32,
+    const aie::vector<bfloat16, kPackedChunkScalesBytes>& d_hi32,
+    const aie::vector<bfloat16, kPackedChunkScalesBytes>& d_lo32,
     const uint8_t* packed_scales,
     aie::vector<bfloat16, kPackedChunkScalesBytes>& hi,
     aie::vector<bfloat16, kPackedChunkScalesBytes>& mid,
     aie::vector<bfloat16, kPackedChunkScalesBytes>& lo) {
-  const auto subgroup_scales =
-      aie::to_float<float>(aie::load_v<kPackedChunkScalesBytes>(packed_scales)
-                               .template cast_to<int8>());
-  const auto product =
-      aie::mul(d32, subgroup_scales).template to_vector<float>();
+  const auto subgroup_scales = aie::to_float<bfloat16>(
+      aie::load_v<kPackedChunkScalesBytes>(packed_scales)
+          .template cast_to<int8>());
+  auto accumulator = aie::mul(d_hi32, subgroup_scales);
+  accumulator = aie::mac(accumulator, d_lo32, subgroup_scales);
+  const auto product = accumulator.template to_vector<float>();
 
   hi = aie::to_vector<bfloat16>(
       aie::accum<accfloat, kPackedChunkScalesBytes>(product));
@@ -102,9 +111,11 @@ inline void unpack_weights_chunk(const uint8_t* record,
   aie::vector<bfloat16, kPackedChunkScalesBytes> lo32;
   const int chunk_index =
       static_cast<int>((packed_chunk - record) / kPackedChunkBytes);
-  const auto d32 = detail::load_d32(record);
-  detail::load_chunk_scales32(d32, chunk_scales(record, chunk_index), hi32,
-                              mid32, lo32);
+  aie::vector<bfloat16, kPackedChunkScalesBytes> d_hi32;
+  aie::vector<bfloat16, kPackedChunkScalesBytes> d_lo32;
+  detail::load_d16(record, d_hi32, d_lo32);
+  detail::load_chunk_scales32(d_hi32, d_lo32, chunk_scales(record, chunk_index),
+                              hi32, mid32, lo32);
 
 #pragma unroll
   for (int subgroup = 0; subgroup < kTilesPerChunk / kTilesPerSubgroup;

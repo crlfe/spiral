@@ -99,7 +99,7 @@ def main():
     print(f"cycles/tile: {cycles / case.tiles:.3f}")
     print(f"weights/cycle: {case.expected_weights.size / cycles:.3f}")
     print(f"trace intervals: {len(flat)}")
-    common.print_text_size(kernel_dir)
+    common.print_program_size(kernel_dir)
 
     weights_matrix = (
         case.expected_weights.reshape(

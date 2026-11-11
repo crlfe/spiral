@@ -28,6 +28,8 @@ inline void unpack_mmul(const uint8_t* packed,
   constexpr int kRowsRecords = weights_rows / kRecordRows;
   constexpr int kTilesPerChunk = kUnpackTileRows / kTileRows;
   constexpr int kTilesPerSubgroup = 16 / kTileRows;
+  static_assert(kTilesPerSubgroup == 2,
+                "Q6_K pair decode expects two tiles per subgroup");
   using InputVec = aie::vector<bfloat16, kMmulInputsElems>;
   using OutputVec = aie::vector<float, kMmulOutputsElems>;
 
@@ -37,12 +39,16 @@ inline void unpack_mmul(const uint8_t* packed,
   for (int weights_cols_tile = 0; weights_cols_tile < kColsTiles;
        ++weights_cols_tile) {
     OutputVec* output_tile = output_tiles + weights_cols_tile;
+    MMUL accumulator(*output_tile);
 
     for (int weights_rows_record = 0; weights_rows_record < kRowsRecords;
          ++weights_rows_record) {
       const uint8_t* record =
           packed + (weights_cols_tile * kRowsRecords + weights_rows_record) *
                        kPackedRecordBytes;
+
+      aie::vector<bfloat16, kPackedChunkScalesBytes> d_hi32, d_lo32;
+      detail::load_d16(record, d_hi32, d_lo32);
 
       for (int chunk_index = 0; chunk_index < kChunksPerRecord; ++chunk_index) {
         const uint8_t* packed_chunk = chunk(record, chunk_index);
@@ -52,32 +58,28 @@ inline void unpack_mmul(const uint8_t* packed,
                               kTileRows;
 
         aie::vector<bfloat16, kPackedChunkScalesBytes> hi32, mid32, lo32;
-        const auto d32 = detail::load_d32(record);
-        detail::load_chunk_scales32(d32, chunk_scales(record, chunk_index),
-                                    hi32, mid32, lo32);
+        detail::load_chunk_scales32(d_hi32, d_lo32,
+                                    chunk_scales(record, chunk_index), hi32,
+                                    mid32, lo32);
 
-        MMUL accumulator(*output_tile);
         for (int subgroup = 0; subgroup < kTilesPerChunk / kTilesPerSubgroup;
              ++subgroup) {
+          const int tile0 = subgroup * kTilesPerSubgroup;
           aie::vector<bfloat16, kMmulWeightsElems> hi, mid, lo;
+          aie::vector<bfloat16, kMmulWeightsElems> values0, values1;
           detail::load_subgroup_scales64(hi32, mid32, lo32, subgroup, hi, mid,
                                          lo);
-
-          static_assert(kTilesPerSubgroup == 2,
-                        "Q6_K pair decode expects two tiles per subgroup");
-          const int tile0 = subgroup * kTilesPerSubgroup;
-          const auto values0 =
-              detail::dequantize_tile(packed_chunk, tile0, hi, mid, lo);
-          const auto values1 =
-              detail::dequantize_tile(packed_chunk, tile0 + 1, hi, mid, lo);
+          detail::dequantize_pair(packed_chunk, tile0, hi, mid, lo, values0,
+                                  values1);
           spiral::quants::mmul_weights_tile(accumulator, inputs_slice[tile0],
                                             values0);
           spiral::quants::mmul_weights_tile(accumulator,
                                             inputs_slice[tile0 + 1], values1);
         }
-        *output_tile = accumulator.template to_vector<float>();
       }
     }
+
+    *output_tile = accumulator.template to_vector<float>();
   }
 }
 

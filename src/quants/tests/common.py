@@ -768,8 +768,8 @@ def run_traced(program, args, tag):
     return parse_trace_intervals(trace_json), kernel_dir
 
 
-def _elf_text_size(path):
-    """Return the `.text` section size of an ELF32 little-endian core ELF."""
+def _elf_section(path, wanted):
+    """Return one section's bytes from an ELF32 little-endian core ELF."""
     data = Path(path).read_bytes()
     if data[:6] != b"\x7fELF\x01\x01":
         raise ValueError(f"{path}: not a 32-bit little-endian ELF")
@@ -783,18 +783,64 @@ def _elf_text_size(path):
             "<IIIIII", data, section_offset + index * section_entry_size
         )
 
-    _, _, _, _, names_offset, names_size = section(names_index)
+    names_offset, names_size = section(names_index)[4:6]
     names = data[names_offset : names_offset + names_size]
     for index in range(section_count):
-        name_offset, _, _, _, _, size = section(index)
+        name_offset, _, _, _, offset, size = section(index)
         name = names[name_offset:].split(b"\0", 1)[0]
-        if name == b".text":
-            return size
-    raise ValueError(f"{path}: no .text section")
+        if name == wanted:
+            return data[offset : offset + size]
+    return None
 
 
-def print_text_size(kernel_dir):
-    """Report each core ELF's `.text` size against AIE2P program memory."""
+def _elf_text_size(path):
+    """Return the `.text` section size of an ELF32 little-endian core ELF."""
+    section = _elf_section(path, b".text")
+    if section is None:
+        raise ValueError(f"{path}: no .text section")
+    return len(section)
+
+
+def _read_uleb128(data, offset):
+    value = 0
+    shift = 0
+    while True:
+        if offset >= len(data):
+            raise ValueError("truncated ULEB128 in .stack_sizes")
+        byte = data[offset]
+        offset += 1
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value, offset
+        shift += 7
+        if shift > 63:
+            raise ValueError("invalid ULEB128 in .stack_sizes")
+
+
+def _elf_max_stack_size(path):
+    """Return the largest `.stack_sizes` entry, or None when absent.
+
+    `.stack_sizes` holds one frame size per function. This is the largest
+    individual frame, not a transitive call-chain bound; callers and callees
+    with their own entries are not summed.
+    """
+    section = _elf_section(path, b".stack_sizes")
+    if section is None:
+        return None
+    values = []
+    offset = 0
+    # Each entry is a 4-byte function address followed by a ULEB128 size. Stop
+    # before any trailing alignment padding, which is shorter than an entry and
+    # must not be mistaken for a truncated address.
+    while offset + 5 <= len(section):
+        offset += 4
+        value, offset = _read_uleb128(section, offset)
+        values.append(value)
+    return max(values) if values else 0
+
+
+def print_program_size(kernel_dir):
+    """Report `.text` usage and the largest per-function stack frame."""
     if kernel_dir is None:
         print("program memory: unavailable")
         return
@@ -802,18 +848,27 @@ def print_text_size(kernel_dir):
     if not elfs:
         print("program memory: unavailable (no core ELF)")
         return
-    sizes = [(_elf_text_size(elf), elf) for elf in elfs]
-    if len({size for size, _ in sizes}) == 1:
-        size = sizes[0][0]
+    sizes = [
+        (_elf_text_size(elf), _elf_max_stack_size(elf), elf) for elf in elfs
+    ]
+
+    def stack_text(stack):
+        if stack is None:
+            return "max stack frame: n/a"
+        return f"max stack frame: {stack} B"
+
+    if len({(size, stack) for size, stack, _ in sizes}) == 1:
+        size, stack, _ = sizes[0]
         suffix = f" per core x{len(sizes)}" if len(sizes) > 1 else ""
         print(
             f"program memory: {size} B / {CORE_PROGRAM_MEMORY_BYTES} B "
-            f"({100 * size / CORE_PROGRAM_MEMORY_BYTES:.1f}%){suffix}"
+            f"({100 * size / CORE_PROGRAM_MEMORY_BYTES:.1f}%), "
+            f"{stack_text(stack)}{suffix}"
         )
         return
-    for size, elf in sizes:
+    for size, stack, elf in sizes:
         print(
             f"program memory: {size} B / {CORE_PROGRAM_MEMORY_BYTES} B "
-            f"({100 * size / CORE_PROGRAM_MEMORY_BYTES:.1f}%) "
-            f"[{elf.parent.name}]"
+            f"({100 * size / CORE_PROGRAM_MEMORY_BYTES:.1f}%), "
+            f"{stack_text(stack)} [{elf.parent.name}]"
         )

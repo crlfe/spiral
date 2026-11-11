@@ -130,6 +130,27 @@ than the f32 round-trip it avoids. A hardware `parallel_lookup` table could
 remove the normalization, but for eight scales per block the 4-way interleaved
 LUT setup and minimum 16-lane fetch are unlikely to pay off.
 
+The Q6_K kernel-level experiments kept the paired tile decode, the exact
+bf16 `d_hi/d_lo` scale product, the hoisted `d`, the `broadcast_vector` scale
+expansion, and the redundant-mask removal: 256x64 fused mmul 24453 -> 18967
+cycles and standalone unpack 19922 -> 16434. Two-column fusion reached 18803
+cycles (~1% better) but grew program memory from 2128 to 3392 bytes and the
+stack frame from 576 to 2816 bytes, so it was rejected. For native Q6_K,
+per-tile scale expansion was also not kept; the paired decode already retains
+the 32-lane scale cache and expands once per pair.
+
+The Q6_K_int8 kernel picked up the same exact bf16 scale product plus per-tile
+scale expansion: fused mmul 10191 -> 9055 cycles, standalone unpack
+6708 -> 5364, program memory 5008 -> 4752 bytes, and stack frame
+2880 -> 2624 bytes. Column-sequential ordering (+1.0%) and forcing the
+input tile into a register (+1.1%) were slower and were not kept.
+
+The bitwise three-term scale split was also tried. It is exact and produces
+bit-identical bf16 weights, but it is slower than the hardware conversion
+round-trip (measured before the `broadcast_vector` change): Q6_K unpack
+16594 -> 16914 with `filter_odd` and 17650 with shift+pack; Q6_K_int8 unpack
+5524 -> 5972 and 6708 respectively. The existing rounded split was kept.
+
 The nine fp16 probes that remain are unsupported operations; `q6k_int_full` is
 the compiler bug above. The driver prints the first compiler error for each.
 The durable write-up lives in `src/quants/NOTES.md` under "float16 on XDNA2".
