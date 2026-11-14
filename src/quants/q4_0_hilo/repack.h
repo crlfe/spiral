@@ -46,6 +46,19 @@ static inline float bf16_to_f32(uint16_t h) {
 
 }  // namespace detail
 
+constexpr int64_t tile_count(int64_t weights_rows, int64_t weights_cols) {
+  if (weights_rows <= 0 || weights_cols <= 0) {
+    return 0;
+  }
+  if (weights_rows % kTransportTileRows != 0 ||
+      weights_cols % kTransportTileCols != 0) {
+    return 0;
+  }
+  return (weights_rows / kTransportTileRows) *
+         (weights_cols / kTransportTileCols);
+}
+
+// Number of 64-row x 8-column records (legacy count).
 constexpr int64_t record_count(int64_t weights_rows, int64_t weights_cols) {
   if (weights_rows <= 0 || weights_cols <= 0) {
     return 0;
@@ -57,21 +70,21 @@ constexpr int64_t record_count(int64_t weights_rows, int64_t weights_cols) {
 }
 
 constexpr int64_t packed_bytes(int64_t weights_rows, int64_t weights_cols) {
-  return record_count(weights_rows, weights_cols) * kPackedRecordBytes;
+  return tile_count(weights_rows, weights_cols) * kPackedTransportTileBytes;
 }
 
-// Repack canonical column-major Q4_0 tensor bytes into
-// [weights_cols_tile][weights_rows_record][packed_record] order.
-// `dst` must be 32-byte aligned for the device's aligned tile loads.
+// Repack canonical column-major Q4_0 tensor bytes into 256-row x 16-column
+// transport tiles. Values are reordered inside each tile so payloads and
+// host-precomputed bf16 hi/lo scale pairs are contiguous.
 inline int64_t repack_weights(const uint8_t* src,
                               int64_t src_col_stride_bytes,
                               uint8_t* dst,
                               int64_t dst_capacity,
                               int64_t weights_rows,
                               int64_t weights_cols) {
-  const int64_t records = record_count(weights_rows, weights_cols);
-  const int64_t bytes = records * kPackedRecordBytes;
-  if (records == 0 || bytes > dst_capacity || src == nullptr ||
+  const int64_t tiles = tile_count(weights_rows, weights_cols);
+  const int64_t bytes = tiles * kPackedTransportTileBytes;
+  if (tiles == 0 || bytes > dst_capacity || src == nullptr ||
       dst == nullptr) {
     return 0;
   }
@@ -80,25 +93,35 @@ inline int64_t repack_weights(const uint8_t* src,
   }
 
   const int64_t cols_tiles = weights_cols / kTileCols;
+  const int64_t cols_pairs = weights_cols / kTransportTileCols;
   const int64_t rows_records = weights_rows / kRecordRows;
   const int64_t blocks_per_record = kRecordRows / kBlockRows;
+  memset(dst, 0, bytes);
   spiral::quants::detail::RepackWarnings warnings;
 
   for (int64_t weights_cols_tile = 0; weights_cols_tile < cols_tiles;
        ++weights_cols_tile) {
+    const int64_t col_pair = weights_cols_tile / 2;
+    const int local_col = static_cast<int>(weights_cols_tile % 2);
     for (int64_t weights_rows_record = 0; weights_rows_record < rows_records;
          ++weights_rows_record) {
-      const int64_t record_index =
-          weights_cols_tile * rows_records + weights_rows_record;
-      uint8_t* record = dst + record_index * kPackedRecordBytes;
-      uint8_t* packed_chunk = record + kCommonScaleBytes;
+      const int local_row =
+          static_cast<int>(weights_rows_record % kRowsRecordsPerTile);
+      const int64_t rows_tile = weights_rows_record / kRowsRecordsPerTile;
+      uint8_t* tile =
+          dst + (rows_tile * cols_pairs + col_pair) *
+                    kPackedTransportTileBytes;
+      uint8_t* record_payload_base =
+          record_payloads(tile, local_col, local_row);
+      uint8_t* record_scale_base =
+          record_scales(tile, local_col, local_row);
 
       for (int weights_rows_block = 0; weights_rows_block < blocks_per_record;
            ++weights_rows_block) {
-        uint8_t* payloads = packed_chunk + kPayloadsOffset +
-                            weights_rows_block * kBlockPayloadRegionBytes;
-        uint8_t* scales = packed_chunk + kScalesOffset +
-                          weights_rows_block * kScaleBytesPerBlock;
+        uint8_t* payloads =
+            block_payloads(record_payload_base, weights_rows_block);
+        uint8_t* scales =
+            block_scales(record_scale_base, weights_rows_block);
 
         for (int weights_cols_in_tile = 0; weights_cols_in_tile < kTileCols;
              ++weights_cols_in_tile) {

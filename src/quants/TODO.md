@@ -8,9 +8,9 @@ technique and benchmark findings are in `NOTES.md`.
 
 | format | layout | host repack | exact unpack | fused mmul | tests | current best | next |
 | :-- | :-- | :-- | :-- | :-- | :-- | :-- | :-- |
-| Q4_0 | done | done | done | done | exact | 1.66 w/c | multi-core |
-| Q4_0_hilo | done | done | done | done | exact | 2.26 w/c | multi-core |
-| Q6_K | done | done | done | done | exact | 0.86 w/c | choose native vs int8 at target clock |
+| Q4_0 | done | done | done | done | exact | 1.88 w/c | multi-core |
+| Q4_0_hilo | done | done | done | done | exact | 2.25 w/c | multi-core |
+| Q6_K | done | done | done | done | exact | 1.19 w/c | multi-core, optional wider decode |
 | Q6_K_int8 | done | done | done | done | exact | 1.81 w/c | multi-core, optional variants |
 | Q8_0 | done | done | done | done | exact | 1.99 w/c | multi-core |
 | Q4_K | not started | - | - | - | - | - | plan below |
@@ -41,7 +41,7 @@ Integration status:
 1. **Multi-core streaming driver**
    - partition `weights_cols` across compute tiles;
    - broadcast the shared input tile;
-   - stream packed records with DMA and join outputs;
+   - stream packed 256x16 transport tiles with DMA and join outputs;
    - respect the 16,383-word FIFO descriptor limit;
    - validate aggregate bandwidth with a memory-only flow before enabling
      dequantization.
@@ -59,7 +59,7 @@ Integration status:
      hi/lo scales) are available;
    - `q4_0` is compute-bound at 1.5 GHz (about 90B weights/s) and memory-bound
      at 1.8 GHz (about 98B), while `q4_0_hilo` is memory-bound at 88B;
-   - `q4_0` now wins at both target clocks, crossing over near 1.47 GHz;
+   - `q4_0` wins at both target clocks, crossing over near 1.46 GHz;
    - re-measure actual aggregate bandwidth before fixing the default for the
      final driver.
 
@@ -137,7 +137,8 @@ must not silently pass through the exact tolerances.
 ### Q4_0 relaxed single-bf16 mode
 
 - Exact variants: `q4_0` (raw fp16 scales, 288-byte records) and `q4_0_hilo`
-  (pre-split bf16 hi/lo scales, 320-byte records).
+  (pre-split bf16 hi/lo scales, 320-byte records), packed eight per 256x16
+  transport tile.
 - Relaxed `fast` mode: a single host-precomputed bf16 scale, 288-byte records,
   lower precision and fewer device cycles.
 - Keep the exact non-template `unpack_weights_chunk()` as the default.
@@ -148,7 +149,8 @@ must not silently pass through the exact tolerances.
 ### Q6_K host-scale-term variant
 
 - Precompute all three bf16 scale terms on the host.
-- Measured 8239 cycles at 256x64 (1.989 weights/cycle) but 2816-byte records.
+- Measured 8239 cycles at 256x64 (1.989 weights/cycle) on the old record layout,
+  but 2816-byte records.
 - Useful only for single-core/latency cases where the extra bytes are
   acceptable; not the default for the 32-core 55 GB/s target.
 
@@ -199,17 +201,19 @@ Active per-token traffic:
 | component | canonical | our repack |
 | :-- | --: | --: |
 | Q4_0 block weights | 1.048 GB | 1.048 GB |
-| tied Q6_K `token_embd` output head | 0.330 GB | 0.440 GB |
+| tied Q6_K `token_embd` output head | 0.330 GB | 0.434 GB |
 | F16 `per_layer_model_proj` | 0.0275 GB | 0.0275 GB (CPU) |
-| **NPU total, excluding CPU F16** | **1.378 GB** | **1.488 GB** |
+| **NPU total, excluding CPU F16** | **1.378 GB** | **1.482 GB** |
 
-The table uses the canonical-size `q4_0` variant. Selecting `q4_0_hilo` raises
-the Q4_0 block traffic to 1.164 GB and the NPU total to 1.604 GB. At 55 GB/s
-the default repacks need 27.1 ms/token, or about 37.0 tok/s; at 50 / 45 /
-35 GB/s it is 29.8 / 33.1 / 42.5 ms per token, or about 33.6 / 30.2 /
-23.5 tok/s. The FFN is 84% of Q4_0 block traffic. The tied output head is
-about 30% of total traffic; keeping int8 Q6_K is the exact choice, while a
-lossy Q4_0 head would save about 12% of token time.
+The table uses the canonical-size `q4_0` variant and the 8.625-bit
+`q6_k_int8` output head. Selecting `q4_0_hilo` raises the Q4_0 block traffic
+to 1.164 GB and the NPU total to 1.598 GB. At 55 GB/s the default repacks need
+26.9 ms/token, or about 37.1 tok/s; at 50 / 45 / 35 GB/s it is 29.6 / 32.9 /
+42.3 ms per token, or about 33.7 / 30.4 / 23.6 tok/s. The FFN is 84% of Q4_0
+block traffic. The tied output head is about 29% of total traffic; keeping
+int8 Q6_K is the exact choice, while a lossy Q4_0 head would save about 12% of
+token time. The 6.625-bit native `q6_k` head would reduce the total to about
+1.381 GB (≈39.8 tok/s at 55 GB/s).
 
 `gemma-4-26B-A4B-it-qat-q4_0.gguf` is not a good first target: it is MoE with
 128 experts and 8 active.
@@ -233,8 +237,8 @@ lossy Q4_0 head would save about 12% of token time.
   live in `spiral::quants`.
 - Keep the format/chunk API stable while optimizing behind it.
 - Tests and benchmark shapes require `weights_rows` to be a multiple of
-  `spiral::quants::kRowsMultiple` (256). Formats may use smaller internal
-  records.
+  `spiral::quants::kRowsMultiple` (256) and `weights_cols` to be a multiple of
+  16 (one 256x16 transport tile). Formats may use smaller internal records.
 - Host repack byte counts, capacities, strides, and offsets stay `int64_t`.
   NPU-side loop counters and record/chunk indices use `int32_t`; per-launch
   shapes are small enough that this is safe.
@@ -277,34 +281,30 @@ outputs: [kMmulOutputsVecs][kMmulOutputsLen] f32, accumulated
 dimension. The outer `weights_rows_tile` index in the inputs layout tiles that
 dimension; it is not an `inputs_vecs` tile.
 
-## Record/chunk contract
+## Transport-tile contract
 
-Separate repack record depth from per-compute-tile unpack depth:
+Repack and transport operate on 256-row x 16-column tiles:
 
-- `kTileCols = 8`, equal to `spiral::quants::kMmulWeightsCols`.
-- `kUnpackTileRows` rows handled by one unpack call.
-- `kRecordRows` rows in one repacked record.
-- `kChunksPerRecord = kRecordRows / kUnpackTileRows`.
-- `kCommonScaleBytes` metadata shared by all chunks in a record.
-- `kPackedChunkBytes` per-chunk payload.
-- `kPackedRecordBytes = kCommonScaleBytes + kChunksPerRecord * kPackedChunkBytes`.
+- `kTransportTileRows = 256`, `kTransportTileCols = 16`.
+- `kTransportTileBytes` is the packed data size rounded up to the next
+  64-byte multiple. Every tile starts on a 64-byte boundary.
+- Tiles are stored row-block-major then column-pair-major:
+  `tile_index = rows_tile * (weights_cols / kTransportTileCols) + col_pair`.
+- Q8_0, Q6_K, and Q6_K_int8 have 256-row records, so one tile holds two records.
+- Q4_0 and Q4_0_hilo have 64-row records, so one tile holds eight records
+  (four row records x two columns).
 
-Helpers in `spiral::quants::<name>`:
-
-```cpp
-const uint8_t* chunk(const uint8_t* record, int chunk_index);
-```
-
-Shared metadata is at the start of the record (or at a format-specific offset
-when payloads come first). `chunk()` points past the metadata to a specific
-chunk; callers pass the record pointer directly when they need the shared
-metadata.
+Each format defines tile-local pointer helpers in `layout.h`, typically
+`record_payloads()`, `record_scales()`, `block_payloads()`,
+`block_scales()`, and `chunk()`.
 
 ### Repack API
 
 ```cpp
 constexpr int64_t record_count(int64_t weights_rows,
-                               int64_t weights_cols);
+                               int64_t weights_cols);  // legacy records
+constexpr int64_t tile_count(int64_t weights_rows,
+                             int64_t weights_cols);
 constexpr int64_t packed_bytes(int64_t weights_rows,
                                int64_t weights_cols);
 
@@ -316,34 +316,25 @@ int64_t repack_weights(const uint8_t* src,
                        int64_t weights_cols);
 ```
 
-Destination order:
-
-```text
-[weights_cols_tile][weights_rows_record][packed_record]
-```
-
-The record index is:
-
-```text
-weights_cols_tile * (weights_rows / kRecordRows) + weights_rows_record
-```
-
-`src_col_stride_bytes` supports views with padding. `packed_bytes()` is
-independent of the source size so a format may expand or shrink during repack.
-There is no tail or padding path. Invalid dimensions or insufficient capacity
-return `0`.
+`packed_bytes()` is `tile_count * kTransportTileBytes`. Repack requires
+`weights_rows % 256 == 0` and `weights_cols % 16 == 0`. `src_col_stride_bytes`
+supports views with padding. Invalid dimensions or insufficient capacity return
+`0`.
 
 ### Unpack API
 
 ```cpp
-void unpack_weights_chunk(const uint8_t* record,
-                          const uint8_t* packed_chunk,
+void unpack_weights_chunk(const uint8_t* packed,
+                          int weights_cols_tile,
+                          int weights_rows_record,
+                          int cols_pairs,
+                          int chunk_index,
                           bfloat16* weights_tile);
 ```
 
-`record` points at the start of the record metadata. The unpack function writes
-the canonical bf16 weights tile directly. Formats call `unpack_weights_chunk`
-once per chunk, including single-chunk formats such as Q4_0.
+The shim passes the packed base and the logical column-tile/row-record index;
+each format resolves the transport tile and its local record. The function
+writes the canonical bf16 weights tile directly.
 
 ### Fused API
 
@@ -357,79 +348,65 @@ inline void unpack_mmul(const uint8_t* packed,
 ```
 
 The caller must zero `outputs` and select `conv_even` rounding. Q4_0,
-Q4_0_hilo, and Q6_K_int8 process two column tiles together. Native Q6_K uses
-a simple one-column-at-a-time baseline. Q6_K_int8 uses an int8 payload expanded
-by the host repack, so its device dequantizer has no bit-plane decode.
+Q4_0_hilo, Q8_0, and Q6_K_int8 process two column tiles together. Native Q6_K
+processes one column tile at a time and decodes four row tiles per group.
 
 ## Format constants
 
 ### Q4_0
 
-`q4_0` (canonical-size):
+`q4_0` keeps canonical 288-byte records (4.5 bits/weight):
 
 ```text
 canonical block: 32 rows, 18 bytes
 payload: 8 x 16-byte signed-int4 4x8 payloads per 32-row block
 scales:  8 raw fp16 values per 32-row block, 16 bytes
-record:  64 rows, one chunk
-layout:  32 bytes of scales, then 256 bytes of payloads
-packed:  288 bytes per record (4.5 bits/weight)
+record:  64 rows, 32 bytes of scales then 256 bytes of payloads
 ```
 
-The device loads the fp16 scales and splits them into bf16 hi/lo with
-`split_bf16_hi_lo()` per 32-row block.
-
-`q4_0_hilo` (host-expanded):
+`q4_0_hilo` (host-expanded) uses 320-byte records (5.0 bits/weight):
 
 ```text
 scales:  8 pre-split bf16 hi/lo pairs per 32-row block, 32 bytes
-layout:  64 bytes of scales, then 256 bytes of payloads
-packed:  320 bytes per record (5.0 bits/weight)
+record:  64 rows, 64 bytes of scales then 256 bytes of payloads
 ```
 
-The host repack computes the exact bf16 `hi + lo` split of each fp16 scale.
-Both layouts keep every 32-byte tile payload 32-byte aligned; `load_v<32>` is
-valid for all tiles.
+Both pack eight records into a 256x16 transport tile (2304 bytes for `q4_0`,
+2560 bytes for `q4_0_hilo`). Records are ordered by local column tile, then
+local row record. Every 32-byte payload tile is 32-byte aligned; `load_v<32>`
+is valid.
 
 ### Q6_K
 
-`q6_k` (native payload):
+`q6_k` (native payload) packs two 256-row records into a 3392-byte tile
+(6.625 bits/weight):
 
 ```text
-canonical block: 256 rows, 210 bytes
-ql[128], qh[64], scales[16] int8, d fp16
-record:  256 rows, 1680 bytes
-payload: 4 x (256-byte low-nibble plane + 128-byte high-two-bit plane)
-scales:  4 x 32 per-column int8 subgroup scales
-common:  16 bytes, one fp16 d per column
+3072 bytes  2 x 4 x (256-byte low-nibble plane + 128-byte high plane)
+ 256 bytes  2 x 4 x 32 per-column int8 subgroup scales
+  32 bytes  2 x 16 per-column fp16 d
+  32 bytes  shared tile tail padding
 ```
 
-This preserves the canonical 6.5625-bit size. The device expands the bit
-planes with uint4 low-nibble lanes and uint8 high-bit lanes into signed
-`q - 32` bytes, then uses the same bf16 scale path as the expanded variant. It
-remains compute-bound and is retained as the optimization baseline.
+The device decodes four 8x8 row tiles at a time, sharing one 64-byte high-plane
+load across the group. A 64-row chunk needs six 64-byte payload loads.
 
-`q6_k_int8` (host-expanded):
+`q6_k_int8` (host-expanded) packs two 256-row records into a 4416-byte tile
+(8.625 bits/weight):
 
 ```text
-record:  256 rows, 2240 bytes
-payload: 2048 bytes, four 512-byte int8 chunks (signed q - 32)
-scales:  128 bytes, four chunks x 32 per-column int8 subgroup scales
-common:  16 bytes, one fp16 d per column
-padding: 48 bytes to keep every record 64-byte aligned
-packed:  8.75 bits/weight
+4096 bytes  2 x 4 x 512-byte int8 chunks (signed q - 32)
+ 256 bytes  2 x 4 x 32 per-column int8 subgroup scales
+  32 bytes  2 x 16 per-column fp16 d
+  32 bytes  shared tile tail padding
 ```
 
-The host repack expands each 6-bit weight to signed int8, so the device decode
-is a 64-byte load and `to_float<bfloat16>`. The per-16-row scale structure is
-unchanged. Every payload chunk is 512 bytes, so all eight 64-byte 8x8 tiles in
-a chunk are naturally aligned. Payloads come first, then scales, then `d`; the
-2240-byte stride is the smallest 64-byte multiple that holds 2048 + 128 + 16
-bytes.
+The host repack expands each 6-bit weight to signed int8, so device decode is a
+64-byte load and `to_float<bfloat16>`. Every payload chunk is 512 bytes, so all
+eight 64-byte 8x8 tiles in a chunk are naturally aligned.
 
-The mmul keeps the four-iteration chunk loop rolled, which holds the kernel at
-5008 bytes (30.6% of the 16 KiB compute-tile program memory). Fully unrolling
-it grew the kernel to 12256 bytes (74.8%) without improving throughput.
+The `q6_k_int8` mmul keeps its four-iteration chunk loop rolled (4752 bytes,
+29.0% of program memory). Native `q6_k` uses 2576 bytes (15.7%).
 
 ### Q8_0
 
@@ -438,10 +415,11 @@ canonical block: 32 rows, 34 bytes (fp16 d + 32 int8)
 record:  256 rows, 2176 bytes
 payload: 2048 bytes, 32 x 64-byte int8 tiles
 scales:  128 bytes, eight blocks x eight columns of fp16 d
-packed:  8.5 bits/weight
+tile:    two records, 4352 bytes (8.5 bits/weight)
 ```
 
-Payloads first, then scales, so every 64-byte tile load is naturally aligned.
+Payloads come first inside each record, so every 64-byte tile load is naturally
+aligned. Two records are grouped per 256x16 transport tile.
 
 ## Current and planned files
 
@@ -493,6 +471,9 @@ kernels share one implementation.
 - `common/mmul.aie.h` provides the vector mmul tile helper.
 - `q4_0/unpack.aie.h` provides `load_block_scales64()` and
   `dequantize_tile()` used by both the reference unpack and fused mmul.
+- Each `layout.h` exposes tile-local `record_payloads()`, `record_scales()`,
+  `block_payloads()`, `block_scales()`, and `chunk()` helpers for the device
+  paths; keep these pointer computations out of the hot loops where possible.
 - Select `aie::rounding_mode::conv_even` once in the kernel shim; unpack
   helpers assume that mode is already set.
 - Add a K-quant scale/min helper for 6-bit packed scales.
@@ -503,9 +484,12 @@ kernels share one implementation.
   - `kTileCols == kMmulWeightsCols`
   - `kUnpackTileRows % kMmulWeightsRows == 0`
   - record and chunk size consistency
+  - `kPackedTransportTileBytes % 64 == 0`
   - payload alignment where the format uses 32/64-byte tile loads
 - Keep `layout.h` constants in the `constexpr int NAME = expression;` form
-  parsed by `tests/common.py`; expressions may wrap across lines.
+  parsed by `tests/common.py`; expressions may wrap across lines. Do not put
+  `inline constexpr` functions in `layout.h`; the parser treats them as
+  constants.
 
 ## Test and benchmark roadmap
 
@@ -516,6 +500,7 @@ kernels share one implementation.
 - Keep the no-NPU error path and invalid-shape rejection tests.
 - Add full-shape streaming tests once the multi-core harness exists.
 - Benchmark at least:
+  - every format at the 256x16 transport-tile shape;
   - Q4_0 256x64 canonical and hilo variants;
   - Q8_0 256x64 and 256x128;
   - Q6_K 256x64 native and int8 variants;
@@ -534,6 +519,7 @@ kernels share one implementation.
 - [ ] Q4_K and Q5_K NPU unpack and mmul pass on a device.
 - [x] Q4_0 fused two-column unpack + mmul passes exactly.
 - [x] Both Q4_0 variants (canonical fp16 scales and host hi/lo) pass on a device.
+- [x] All formats repack into contiguous, 64-byte-aligned 256x16 transport tiles.
 - [ ] Q4_0 fast single-bf16 scale mode is exposed through a named variant with
       per-variant verification.
 - [ ] Invalid shapes are rejected for every format.

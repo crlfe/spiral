@@ -18,12 +18,13 @@ namespace detail {
 // two terms are not always enough to round to the same bf16 as an fp32
 // multiply.
 static inline __attribute__((always_inline)) void load_d16(
-    const uint8_t* record,
+    const uint8_t* tile,
+    int local_col,
     aie::vector<bfloat16, kPackedChunkScalesBytes>& d_hi32,
     aie::vector<bfloat16, kPackedChunkScalesBytes>& d_lo32) {
   aie::vector<bfloat16, 8> d_hi8;
   aie::vector<bfloat16, 8> d_lo8;
-  split_bf16_hi_lo(load_fp16x8(record_scales(record)), d_hi8, d_lo8);
+  split_bf16_hi_lo(load_fp16x8(record_scales(tile, local_col)), d_hi8, d_lo8);
   d_hi32 = aie::broadcast_vector<kTileCols, bfloat16, kPackedChunkScalesBytes>(
       d_hi8, 0);
   d_lo32 = aie::broadcast_vector<kTileCols, bfloat16, kPackedChunkScalesBytes>(
@@ -38,7 +39,7 @@ static inline __attribute__((always_inline)) void load_chunk_scales32(
     aie::vector<bfloat16, kPackedChunkScalesBytes>& mid,
     aie::vector<bfloat16, kPackedChunkScalesBytes>& lo) {
   const auto subgroup_scales = aie::to_float<bfloat16>(
-      aie::load_unaligned_v<kPackedChunkScalesBytes>(packed_scales, 16)
+      aie::load_v<kPackedChunkScalesBytes>(packed_scales)
           .template cast_to<int8>());
   auto accumulator = aie::mul(d_hi32, subgroup_scales);
   accumulator = aie::mac(accumulator, d_lo32, subgroup_scales);
@@ -90,18 +91,22 @@ static inline
   return accumulator.template to_vector<bfloat16>();
 }
 
-// Decode two adjacent 8-row x 8-column tiles together. The two tiles are
-// contiguous in both planes, so this halves the payload loads and shares the
-// high-plane masks.
-static inline __attribute__((always_inline)) void dequantize_pair(
+// Decode four adjacent 8-row x 8-column tiles. The 32-row group shares one
+// 64-byte high-plane load across both pairs; the low plane needs two 64-byte
+// loads. This cuts the high-plane load count in half relative to pair decode.
+static inline __attribute__((always_inline)) void dequantize_quad(
     const uint8_t* packed_chunk,
     int weights_rows_tile,
-    const aie::vector<bfloat16, kMmulWeightsElems>& hi,
-    const aie::vector<bfloat16, kMmulWeightsElems>& mid,
-    const aie::vector<bfloat16, kMmulWeightsElems>& lo,
+    const aie::vector<bfloat16, kPackedChunkScalesBytes>& hi32,
+    const aie::vector<bfloat16, kPackedChunkScalesBytes>& mid32,
+    const aie::vector<bfloat16, kPackedChunkScalesBytes>& lo32,
+    int subgroup,
     aie::vector<bfloat16, kMmulWeightsElems>& values0,
-    aie::vector<bfloat16, kMmulWeightsElems>& values1) {
+    aie::vector<bfloat16, kMmulWeightsElems>& values1,
+    aie::vector<bfloat16, kMmulWeightsElems>& values2,
+    aie::vector<bfloat16, kMmulWeightsElems>& values3) {
   constexpr int kPairElems = 2 * kTileRows * kTileCols;
+  constexpr int kQuadElems = 2 * kPairElems;
   const uint8_t* packed_low = packed_chunk;
   const uint8_t* packed_high = packed_low + kPackedChunkLowBytes;
   const int low_offset = weights_rows_tile * (kTileRows * kTileCols / 2);
@@ -109,71 +114,90 @@ static inline __attribute__((always_inline)) void dequantize_pair(
   const uint8_t* low = packed_low + low_offset;
   const uint8_t* high = packed_high + high_offset;
 
-  const auto low_bytes = aie::load_unaligned_v<kPairElems / 2>(low, 16);
-  const auto low4 = low_bytes.template cast_to<uint4>();
+  const auto low0 = aie::load_v<kPairElems / 2>(low);
+  const auto low1 = aie::load_v<kPairElems / 2>(low + kPairElems / 2);
+  const auto high_bytes = aie::load_v<kPairElems / 2>(high);
 
-  const auto high_bytes = aie::load_unaligned_v<kPairElems / 4>(high, 16);
+  const auto low4 = aie::concat(low0, low1).template cast_to<uint4>();
   const auto high8 =
       high_bytes.template cast_to<uint4>().template unpack<uint8>();
   const auto mask8 =
-      aie::broadcast<uint8_t, kPairElems / 2>(static_cast<uint8_t>(0x03));
-
+      aie::broadcast<uint8_t, kQuadElems / 2>(static_cast<uint8_t>(0x03));
   const auto h_even = aie::bit_and(high8, mask8);
   const auto h_odd = aie::logical_downshift(high8, 2);
   const auto [c0, c1] = aie::interleave_zip(h_even, h_odd, 1);
   const auto high_u8 = aie::concat(c0, c1);
-
   const auto low_u8 = low4.template unpack<uint8>();
   const auto values_u8 = aie::bit_or(low_u8, aie::upshift(high_u8, 4));
   const auto centered =
       aie::add(values_u8,
-               aie::broadcast<uint8_t, kPairElems>(static_cast<uint8_t>(0xE0)));
+               aie::broadcast<uint8_t, kQuadElems>(static_cast<uint8_t>(0xE0)));
   const auto quant = centered.template cast_to<int8>();
   const auto values = aie::to_float<bfloat16>(quant);
 
+  aie::vector<bfloat16, kMmulWeightsElems> hi0, mid0, lo0;
+  aie::vector<bfloat16, kMmulWeightsElems> hi1, mid1, lo1;
+  load_subgroup_scales64(hi32, mid32, lo32, subgroup, hi0, mid0, lo0);
+  load_subgroup_scales64(hi32, mid32, lo32, subgroup + 1, hi1, mid1, lo1);
+
   values0 =
-      apply_scales(values.template extract<kMmulWeightsElems>(0), hi, mid, lo);
+      apply_scales(values.template extract<kMmulWeightsElems>(0), hi0, mid0,
+                   lo0);
   values1 =
-      apply_scales(values.template extract<kMmulWeightsElems>(1), hi, mid, lo);
+      apply_scales(values.template extract<kMmulWeightsElems>(1), hi0, mid0,
+                   lo0);
+  values2 =
+      apply_scales(values.template extract<kMmulWeightsElems>(2), hi1, mid1,
+                   lo1);
+  values3 =
+      apply_scales(values.template extract<kMmulWeightsElems>(3), hi1, mid1,
+                   lo1);
 }
 
 }  // namespace detail
 
 // Unpack one 64-row x 8-column chunk into the canonical bf16 weights tile.
-inline void unpack_weights_chunk(const uint8_t* record,
-                                 const uint8_t* __restrict packed_chunk,
+inline void unpack_weights_chunk(const uint8_t* packed,
+                                 int weights_cols_tile,
+                                 int weights_rows_record,
+                                 int cols_pairs,
+                                 int chunk_index,
                                  bfloat16* __restrict weights_tile) {
   using OutputVec = aie::vector<bfloat16, kMmulWeightsElems>;
   auto output_tiles = reinterpret_cast<OutputVec*>(weights_tile);
   constexpr int kTilesPerChunk = kUnpackTileRows / kTileRows;
-  constexpr int kTilesPerSubgroup = 16 / kTileRows;
+  constexpr int kTilesPerQuad = 4;
+
+  const int col_pair = weights_cols_tile / 2;
+  const int local_col = weights_cols_tile % 2;
+  const uint8_t* tile =
+      packed + (weights_rows_record * cols_pairs + col_pair) *
+                   kPackedTransportTileBytes;
+  const uint8_t* packed_chunk =
+      chunk(record_payloads(tile, local_col), chunk_index);
 
   aie::vector<bfloat16, kPackedChunkScalesBytes> hi32;
   aie::vector<bfloat16, kPackedChunkScalesBytes> mid32;
   aie::vector<bfloat16, kPackedChunkScalesBytes> lo32;
-  const int chunk_index =
-      static_cast<int>((packed_chunk - record) / kPackedChunkBytes);
   aie::vector<bfloat16, kPackedChunkScalesBytes> d_hi32;
   aie::vector<bfloat16, kPackedChunkScalesBytes> d_lo32;
-  detail::load_d16(record, d_hi32, d_lo32);
-  detail::load_chunk_scales32(d_hi32, d_lo32, chunk_scales(record, chunk_index),
-                              hi32, mid32, lo32);
+  detail::load_d16(tile, local_col, d_hi32, d_lo32);
+  detail::load_chunk_scales32(d_hi32, d_lo32,
+                              chunk_scales(tile, local_col, chunk_index), hi32,
+                              mid32, lo32);
 
-  for (int subgroup = 0; subgroup < kTilesPerChunk / kTilesPerSubgroup;
-       ++subgroup) {
-    aie::vector<bfloat16, kMmulWeightsElems> hi;
-    aie::vector<bfloat16, kMmulWeightsElems> mid;
-    aie::vector<bfloat16, kMmulWeightsElems> lo;
-    detail::load_subgroup_scales64(hi32, mid32, lo32, subgroup, hi, mid, lo);
-
-    static_assert(kTilesPerSubgroup == 2,
-                  "Q6_K pair decode expects two tiles per subgroup");
-    const int tile0 = subgroup * kTilesPerSubgroup;
+  for (int quad = 0; quad < kTilesPerChunk / kTilesPerQuad; ++quad) {
+    const int tile0 = quad * kTilesPerQuad;
     aie::vector<bfloat16, kMmulWeightsElems> values0;
     aie::vector<bfloat16, kMmulWeightsElems> values1;
-    detail::dequantize_pair(packed_chunk, tile0, hi, mid, lo, values0, values1);
+    aie::vector<bfloat16, kMmulWeightsElems> values2;
+    aie::vector<bfloat16, kMmulWeightsElems> values3;
+    detail::dequantize_quad(packed_chunk, tile0, hi32, mid32, lo32, quad * 2,
+                            values0, values1, values2, values3);
     output_tiles[tile0] = values0;
     output_tiles[tile0 + 1] = values1;
+    output_tiles[tile0 + 2] = values2;
+    output_tiles[tile0 + 3] = values3;
   }
 }
 

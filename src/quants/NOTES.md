@@ -21,8 +21,8 @@ status and future plans live in `TODO.md`; the quick summary lives in
 - Use the physical packed size, not the canonical format size, for bandwidth:
   - Q4_0: 4.5 bits/weight (`q4_0`, 0.5625 bytes/weight) or 5.0 bits/weight
     (`q4_0_hilo`, 0.625 bytes/weight)
-  - Q6_K: 6.5625 bits/weight (`q6_k`, 0.8203 bytes/weight) or 8.75 bits/weight
-    (`q6_k_int8`, 1.09375 bytes/weight)
+  - Q6_K: 6.625 bits/weight (`q6_k`, 0.828125 bytes/weight) or 8.625
+    bits/weight (`q6_k_int8`, 1.078125 bytes/weight)
   - Q8_0: 8.5 bits/weight (1.0625 bytes/weight)
 - Full-device estimate at clock `f`:
   `min(weights/cycle * f * 32, 55 GB/s / bytes-per-weight)`.
@@ -45,21 +45,15 @@ status and future plans live in `TODO.md`; the quick summary lives in
   harness always enables `-Rpass-missed=loop-unroll` and prints captured
   compiler warnings (including `-Wpass-failed=transform-warning` for failed
   `#pragma unroll` transformations) to stderr as `compiler: ...`, with the
-  loop line. Add `-Werror=pass-failed` to make those failures fatal. All
-  current formats are clean after removing the pragmas the compiler ignored.
+  loop line. Add `-Werror=pass-failed` to make those failures fatal.
 - `#pragma unroll` maps to `llvm.loop.unroll.enable`, a hint equivalent to
   `unroll(enable)`. `#pragma clang loop unroll(full)` maps to
-  `llvm.loop.unroll.full`, but it did not override the removed failures.
-  `-O3` produced identical code and cycles to `-O2` for every quants kernel.
-- The removed pragmas were not a code-size threshold. With
-  `-mllvm -debug-only=loop-unroll` the compiler reported `Invalid loop size
-  prevents unrolling. / Loop not considered unrollable.`: `CodeMetrics` could
-  not produce a valid loop size, so `canUnroll()` rejected the loop before the
-  pragma was considered. The affected loops correlate with the 8-lane
-  `v16accfloat`/`v16bf16` conversions in `split_bf16_hi_lo` (`q4_0`,
-  `q8_0`) and the runtime `broadcast_vector` switch in `q6_k`. The kernels
-  now follow the compiler heuristic. Manual expansion remains a potential
-  optimization; it is worth about 25% on native `q6_k`.
+  `llvm.loop.unroll.full`. `-O3` produced identical code and cycles to `-O2`
+  for every quants kernel.
+- Unroll pragmas matter on a per-loop basis. The 2-iteration block loop in
+  `q4_0_hilo` is worth keeping unrolled: dropping the pragma regressed the
+  256x16 kernel by 5.9% (2008 vs 1896 cycles). The equivalent `q4_0` and
+  `q8_0` block loops compile the same with or without it.
 
 ## Reusable AIE2 techniques
 
@@ -242,7 +236,7 @@ programming guide, `third_party/aie_api/include/aie_api/aie.hpp`, and the
 - `aie::op_neg(v, bool)` may fold into a subsequent mul/mmul. It does not fold
   `q - 32` centering or a `-dmin*min` bias.
 
-### Loads, alignment, and record layout
+### Loads, alignment, and transport-tile layout
 
 - `load_v<Elems>` requires full vector alignment on XDNA2: 16 bytes for
   128-bit, 32 for 256-bit, 64 for 512-bit. Use
@@ -257,9 +251,15 @@ programming guide, `third_party/aie_api/include/aie_api/aie.hpp`, and the
   naturally aligned 64-byte nibble tile can be loaded directly as int4. For
   the current 32-byte tiles, `load_v<64>(const int4*)` is the equivalent
   256-bit load.
-- Put payloads first when a tile load needs a larger alignment than the record
-  header; pad the record so the next record keeps that alignment. Payload-first
-  layouts removed per-chunk padding and fixed the Q8_0/Q6_K alignment bugs.
+- Repack is defined on 256-row x 16-column transport tiles. Tiles are laid out
+  row-block-major then column-pair-major, and each tile is padded only to the
+  next 64-byte boundary. This keeps every tile contiguous and 64-byte aligned
+  for DMA.
+- Q6_K and Q6_K_int8 pool both records' payloads, scales, and `d` values at
+  tile level, sharing one 32-byte tail pad. Q8_0 keeps its payload-first
+  2176-byte records and groups two per tile. Q4_0 and Q4_0_hilo keep 288/320-byte
+  records with scales first and group eight per tile; their 32-byte payload
+  loads only need 32-byte alignment.
 - Host repack must stay plain bytes; host-compiled headers must not include
   `aie::vector`.
 - Device-only layout views are useful for static assertions, but hot-path
@@ -269,7 +269,9 @@ programming guide, `third_party/aie_api/include/aie_api/aie.hpp`, and the
 
 ### Two-column fusion
 
-The best fused structure found so far:
+The best fused structure found so far applies to Q4_0, Q4_0_hilo, Q8_0, and
+Q6_K_int8. Native Q6_K uses one column tile at a time and gets its ILP from
+decoding four row tiles together instead.
 
 - one `unpack_mmul<weights_rows, weights_cols>` implementation per format;
 - process two independent column tiles at a time;
@@ -301,6 +303,24 @@ What did not help:
 - `-O3` / `-Os` instead of the default optimization;
 - copying the input tile before both mmuls;
 - dequantizing all tiles before issuing mmuls.
+
+### Transport-tile grouping
+
+- Repack consumes 256-row x 16-column tiles. Records are laid out
+  row-block-major then column-pair-major inside the tile, and the tile is
+  padded only to the next 64-byte boundary.
+- Q6_K and Q6_K_int8 pool both records' payloads, scales, and `d` at the tile
+  level so they share one 32-byte tail pad; this saved 64 bytes per tile versus
+  padding each record independently.
+- Native Q6_K decodes four adjacent 8x8 tiles (32 rows) together, sharing one
+  64-byte high-plane load between them. A 64-row chunk then needs exactly six
+  64-byte payload loads instead of eight.
+- Q4_0 and Q4_0_hilo group eight 64-row records per tile. Their per-record
+  scales-first layout is slightly faster than pooling payloads tile-wide, and
+  their 32-byte payload loads remain valid because records stay 32-byte
+  aligned.
+- `record_count()` remains the legacy record count; `packed_bytes()` is now
+  `tile_count * kPackedTransportTileBytes`.
 
 ### Scale handling
 
@@ -357,10 +377,11 @@ What did not help:
 ### Profiling method
 
 Replace the dequantizer with a constant to separate mmul/loop overhead from
-decode/scale work. For example, Q6_K's mmul and loop alone are 3211 cycles
-(31%); payload load plus int8-to-bf16 reaches 4297 (42%); the exact scale split
-and three multiplies account for the remaining 6042 cycles (58%). Q8_0's
-constant-dequantizer profile is about 3786 cycles (46% of total).
+decode/scale work. On the pre-quad Q6_K body, for example, the mmul and loop
+alone were 3211 cycles (31%); payload load plus int8-to-bf16 reached 4297
+(42%); the exact scale split and three multiplies accounted for the remaining
+6042 cycles (58%). Q8_0's constant-dequantizer profile is about 3786 cycles
+(46% of total).
 
 ## Format-specific results
 
@@ -378,6 +399,8 @@ Two exact layouts are available.
 
 The host repack writes the exact bf16 `hi + lo` split of each fp16 scale.
 Scales come first, payloads second; every 32-byte tile is naturally aligned.
+Both Q4_0 variants group eight records into a 256x16 transport tile (2304
+bytes for `q4_0`, 2560 bytes for `q4_0_hilo`).
 
 `q4_0` (canonical-size) is 288 bytes (4.5 bits/weight): the same payload
 layout with raw fp16 scales, split on the device with `split_bf16_hi_lo()`.
@@ -386,106 +409,86 @@ Results at the measured 1.8 GHz H clock:
 
 | variant | shape | cycles | cycles/tile | weights/cycle | compute-implied 32-core GB/s |
 | :-- | --: | --: | --: | --: | --: |
-| q4_0 | 256x64 | 8752 | 273.500 | 1.872 | 60.7 |
-| q4_0_hilo | 256x64 | 7267 | 227.094 | 2.255 | 81.2 |
+| q4_0 | 256x64 | 8720 | 272.500 | 1.879 | 60.9 |
+| q4_0_hilo | 256x64 | 7268 | 227.125 | 2.254 | 81.1 |
 
 `q4_0` is compute-bound at 1.5 GHz (about 90B weights/s) and memory-bound at
 1.8 GHz (about 98B), while `q4_0_hilo` is memory-bound at the 55 GB/s target
-(88B). `q4_0` now wins at both target clocks, crossing over near 1.47 GHz.
-The previous 1.5 GHz long-K checks are not directly comparable and have not
-been re-run under the locked 1.8 GHz clock.
+(88B). `q4_0` wins at both target clocks, crossing over near 1.46 GHz.
 
-Standalone exact unpack: 5196 cycles for `q4_0`, 2891 cycles for
+Standalone exact unpack at 256x64: 5261 cycles for `q4_0`, 2916 cycles for
 `q4_0_hilo`. The fast single-bf16 mode measured 2119 cycles at 64 columns on
 the old layout but is not exact.
 
 ### Q6_K
 
-Canonical Q6_K is 6.5625 bits/weight. The `q6_k` variant preserves the native
-six-bit payload and the exact 1680-byte record size:
+Canonical Q6_K is 6.5625 bits/weight. Both repack variants target a 256x16
+transport tile and share one 32-byte tail pad between the two records.
+
+`q6_k` preserves the native six-bit payload. Its 3392-byte tile is 6.625
+bits/weight:
 
 ```text
-4 x (256-byte low-nibble plane + 128-byte high-two-bit plane)
-4 x 32 per-column int8 subgroup scales
-16 bytes  per-column fp16 d
+3072 bytes  2 records x 4 chunks x (256-byte low-nibble + 128-byte high plane)
+ 256 bytes  2 x 4 x 32 per-column int8 subgroup scales
+  32 bytes  2 x 16 per-column fp16 d
+  32 bytes  shared tile tail padding
 ```
 
-The device decoder keeps the low nibbles in `uint4` until the final combine
-and expands the two-bit high plane in `uint8` lanes, then follows the same
-bf16 scale path as the expanded variant. It is kept as a size/optimization
-baseline, not as the production path.
+The device decoder processes four adjacent 8x8 tiles (32 rows) at a time. Each
+group loads two 64-byte low-plane vectors and one 64-byte high-plane vector,
+shares the high-plane masks across all four tiles, and expands the planes in
+`uint4`/`uint8` lanes before applying the bf16 scale terms. A 64-row chunk now
+needs six 64-byte payload loads instead of eight.
 
-The `q6_k_int8` variant expands every 6-bit weight to signed int8 (`q - 32`)
-in the host repack. The per-16-row scale structure is unchanged, so the
-expansion is lossless. Device decode is a 64-byte load plus
-`to_float<bfloat16>`.
-
-Record layout: 256 rows x 8 columns, 2240 bytes (8.75 bits/weight).
+`q6_k_int8` expands every 6-bit weight to signed int8 (`q - 32`) in host
+repack. Its 4416-byte tile is 8.625 bits/weight:
 
 ```text
-2048 bytes  4 x 512-byte int8 payload chunks (8 x 64-byte 8x8 tiles each)
- 128 bytes  per-chunk int8 subgroup scales (4 chunks x 32 bytes)
-  16 bytes  per-column fp16 d
-  48 bytes  padding so every record is 64-byte aligned
+4096 bytes  2 records x 4 chunks x 512-byte int8 payloads
+ 256 bytes  2 x 4 x 32 per-column int8 subgroup scales
+  32 bytes  2 x 16 per-column fp16 d
+  32 bytes  shared tile tail padding
 ```
+
+Device decode is a 64-byte load plus `to_float<bfloat16>`. The per-16-row scale
+structure is unchanged, so the expansion is lossless.
 
 Results at the measured 1.8 GHz H clock:
 
 | shape | cycles | cycles/tile | weights/cycle | bytes/weight |
-| --: | --: | --: | --: | --: |
-| 256x64 q6_k native | 18967 | 592.719 | 0.864 | 0.8203 |
-| 256x64 q6_k native standalone unpack | 16434 | 513.562 | 0.997 | - |
-| 256x64 q6_k_int8 payload | 9055 | 282.969 | 1.809 | 1.09375 |
-| 256x128 q6_k_int8 payload | 18071 | 282.359 | 1.813 | 1.09375 |
-| 256x64 q6_k_int8 standalone unpack | 5364 | 167.625 | 3.054 | - |
-| 256x64 host scale terms | 8239 | 257.469 | 1.989 | 1.375 |
-| Q8_0 256x64 reference | 8245 | 257.656 | 1.987 | 1.0625 |
+| :-- | --: | --: | --: | --: |
+| 256x64 q6_k native | 13809 | 431.531 | 1.186 | 0.828125 |
+| 256x64 q6_k native standalone unpack | 9587 | 299.594 | 1.709 | - |
+| 256x64 q6_k_int8 payload | 9054 | 282.938 | 1.810 | 1.078125 |
+| 256x64 q6_k_int8 standalone unpack | 5619 | 175.594 | 2.916 | - |
+| Q8_0 256x64 reference | 8242 | 257.563 | 1.988 | 1.0625 |
 
-The native baseline is now compute-bound at about 41B weights/s at 1.5 GHz
-and 50B at 1.8 GHz, versus about 50B for `q6_k_int8` at 55 GB/s. At 1.8 GHz
-the smaller 6.5625-bit format matches the int8 payload while using about 25%
-less traffic; at 1.5 GHz the int8 payload still wins (50B vs 41B). The
-production choice therefore depends on the measured clock and bandwidth; the
-native format is competitive at the 1.8 GHz target. A padded
-1728-byte record was measured about 1.4% faster in the fused mmul and 5.5%
-faster in standalone unpack, but costs 2.9% more bytes and was not kept.
+At 1.5 GHz the native kernel is compute-bound at about 57B weights/s; at
+1.8 GHz it becomes memory-bound at about 66B. `q6_k_int8` is memory-bound at
+about 51B. The int8 payload still wins on cycles, but the native format uses
+about 23% less traffic (6.625 vs 8.625 bits/weight) and is competitive at the
+1.8 GHz target.
 
-The largest single win was decoding the two tiles in a 16-row subgroup together
-instead of one at a time. They share the scale vectors, so the independent
-vector chains fill the emulated-FP32 latency slots. The native `q6_k` kernel
-now uses the same paired decode, which halves the payload loads and shares the
-high-plane masks.
+The largest single win was grouping four row tiles per decode. Sharing the
+high-plane load and masks cuts the payload load count from eight to six per
+64-row chunk and gives the independent vector chains enough work to cover the
+emulated-FP32 latency. The exact scale path is unchanged: fp16 `d` is split
+into bf16 hi/lo terms once per record, each chunk's int8 scales are multiplied
+by `d` and split into hi/mid/lo terms once, and the three-term product is
+applied with bf16 multiplies. This remains exact for canonical scales up to
+127.
 
-The `q6_k_int8` variant picked up the exact bf16 scale product and per-tile
-scale expansion as well: 10191 -> 9055 cycles at 256x64, standalone unpack
-6708 -> 5364. It remains memory-bound at about 50B weights/s, so the native
-6.5625-bit format is the one that closes the gap at 1.8 GHz.
-
-The rest of the native improvement came from the scale path. The fp16 `d` is
-split into exact bf16 hi/lo terms once per record, and the `d * int8` product is
-formed with two bf16 multiplies in `accfloat` rather than an emulated f32
-multiply. This is exact, and it removes the int8-to-f32 conversion as well.
-The other changes were hoisting `d` out of the chunk loop and removing the
-redundant high-plane mask on the odd two-bit field. Keeping the mmul
-accumulator in registers across chunks was throughput-neutral in this build,
-but it removes the per-chunk output-tile read/write. Exact standalone unpack
-improved from 19922 to 16434 cycles, and the fused 256x64 kernel from 24453 to
-18967 cycles (2128 bytes of program memory, 13.0%).
-
-Instruction memory: the current `q6_k_int8` mmul uses 4752 of the 16384-byte
-AIE2P compute-tile program memory (29.0%) with the four-iteration chunk loop
-rolled. Before the scale-path and per-tile changes, fully unrolling the chunk
-loop grew the kernel to 12256 bytes (74.8%) without improving throughput, and
-rolling the subgroup loop as well cost about 15.5% more cycles. Those two
-variants have not been re-measured on the current body. For comparison,
-`q4_0_hilo`
-rolls nothing and uses 3616 bytes; rolling its block loop saves 32% of the
-code for a 7.6% cycle cost.
+Instruction memory: native `q6_k` uses 2576 of the 16384-byte AIE2P
+compute-tile program memory (15.7%), `q6_k_int8` uses 4752 bytes (29.0%) with
+its chunk loop rolled, `q4_0_hilo` uses 3632 bytes (22.2%), `q4_0` uses 2752
+bytes (16.8%), and `q8_0` uses 2624 bytes (16.0%).
 
 Rejected or alternate approaches:
 
-- host-precomputing all three bf16 scale terms: 8239 cycles on one core but
-  2816-byte records (1.375 bytes/weight), worse at the 32-core memory budget;
+- host-precomputing all three bf16 scale terms: 8239 cycles on one core on the
+  old record layout, but 2816-byte records (1.375 bytes/weight), worse at the
+  32-core memory budget;
 - applying the exact scale after the mmul: 14258 cycles and max abs error 5.0;
 - dropping the third scale term for native Q6_K: about 3% faster unpack and
   9% faster mmul, but not exact for canonical scales up to 127 (five random
@@ -495,16 +498,16 @@ Rejected or alternate approaches:
 - four column tiles: memory-bound, extra ILP does not help.
 
 Q8_K / Q8_0 comparison: canonical Q8_K without `bsums` is 260 bytes per 256
-weights (8.125 bits/weight, 1.016 bytes/weight), only about 7% smaller than
-the exact int8 Q6_K layout. It replaces per-16 scales with one fp32 scale per
-256 weights, so conversion is lossy. Q8_0 is already implemented, slightly
-smaller (1.0625 bytes/weight), and has finer per-32 scales. If a lossy path is
-acceptable, Q8_0 is the better target than Q8_K.
+weights (8.125 bits/weight, 1.016 bytes/weight), about 6% smaller than the
+exact int8 Q6_K layout (8.625 bits/weight). It replaces per-16 scales with one
+fp32 scale per 256 weights, so conversion is lossy. Q8_0 is already implemented,
+slightly smaller (1.0625 bytes/weight), and has finer per-32 scales. If a lossy
+path is acceptable, Q8_0 is the better target than Q8_K.
 
 ### Q8_0
 
 Canonical Q8_0 is 8.5 bits/weight. The internal record is 256 rows x 8 columns,
-2176 bytes:
+2176 bytes; two records form a 4352-byte 256x16 transport tile:
 
 ```text
 2048 bytes  int8 payloads (32 tiles of 64 bytes)
@@ -520,9 +523,8 @@ Results at the measured 1.8 GHz H clock:
 
 | shape | cycles | cycles/tile | weights/cycle | compute-implied 32-core GB/s |
 | --: | --: | --: | --: | --: |
-| 256x64 | 8245 | 257.656 | 1.987 | 121.6 |
-| 256x128 | 16453 | 257.078 | 1.992 | 121.8 |
-| standalone unpack 256x64 | 5098 | 159.313 | 3.214 | - |
+| 256x64 | 8242 | 257.563 | 1.988 | 121.6 |
+| standalone unpack 256x64 | 5139 | 160.594 | 3.188 | - |
 
 What helped: payload-first 64-byte alignment, signed int8 to bf16 without a
 centering bias, two-term `d`, `broadcast_vector` for scale expansion (about
@@ -558,8 +560,10 @@ output buffer; the fused kernel works at 64/128 columns. 256 columns need about
 ## Target model context
 
 `gemma-4-E2B_q4_0-it.gguf` is the first end-to-end target: 35 dense blocks,
-about 1.488 GB/token of active NPU weights with the canonical `q4_0` repack, or
-roughly 37.0 tok/s at 55 GB/s. With `q4_0_hilo` those rise to 1.604 GB and
-34.3 tok/s. The traffic figures are memory-bound and therefore clock-invariant.
-The breakdown and bring-up checklist live in `TODO.md`; the performance summary
-lives in `README.md`.
+about 1.482 GB/token of active NPU weights with the canonical `q4_0` repack
+and the 8.625-bit `q6_k_int8` output head, or roughly 37.1 tok/s at 55 GB/s.
+With `q4_0_hilo` those rise to 1.598 GB and 34.4 tok/s. Using the 6.625-bit
+native `q6_k` head instead would lower the total to about 1.381 GB
+(≈39.8 tok/s). The traffic figures are memory-bound and therefore
+clock-invariant. The breakdown and bring-up checklist live in `TODO.md`; the
+performance summary lives in `README.md`.

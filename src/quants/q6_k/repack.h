@@ -8,6 +8,19 @@
 
 namespace spiral::quants::q6_k {
 
+constexpr int64_t tile_count(int64_t weights_rows, int64_t weights_cols) {
+  if (weights_rows <= 0 || weights_cols <= 0) {
+    return 0;
+  }
+  if (weights_rows % kTransportTileRows != 0 ||
+      weights_cols % kTransportTileCols != 0) {
+    return 0;
+  }
+  return (weights_rows / kTransportTileRows) *
+         (weights_cols / kTransportTileCols);
+}
+
+// Number of 256-row x 8-column records (legacy count).
 constexpr int64_t record_count(int64_t weights_rows, int64_t weights_cols) {
   if (weights_rows <= 0 || weights_cols <= 0) {
     return 0;
@@ -19,21 +32,21 @@ constexpr int64_t record_count(int64_t weights_rows, int64_t weights_cols) {
 }
 
 constexpr int64_t packed_bytes(int64_t weights_rows, int64_t weights_cols) {
-  return record_count(weights_rows, weights_cols) * kPackedRecordBytes;
+  return tile_count(weights_rows, weights_cols) * kPackedTransportTileBytes;
 }
 
-// Repack canonical column-major Q6_K into whole 256-row x 8-column records,
-// preserving the native six-bit payload. The quantized values are split into
-// a low-nibble plane and a two-bit high plane inside each 64-row chunk.
+// Repack canonical column-major Q6_K into 256-row x 16-column transport tiles,
+// preserving the native six-bit payload. Values are reordered inside each tile
+// so both records' payloads, scales, and d values are contiguously aligned.
 inline int64_t repack_weights(const uint8_t* src,
                               int64_t src_col_stride_bytes,
                               uint8_t* dst,
                               int64_t dst_capacity,
                               int64_t weights_rows,
                               int64_t weights_cols) {
-  const int64_t records = record_count(weights_rows, weights_cols);
-  const int64_t bytes = records * kPackedRecordBytes;
-  if (records == 0 || bytes > dst_capacity || dst == nullptr ||
+  const int64_t tiles = tile_count(weights_rows, weights_cols);
+  const int64_t bytes = tiles * kPackedTransportTileBytes;
+  if (tiles == 0 || bytes > dst_capacity || dst == nullptr ||
       src == nullptr) {
     return 0;
   }
@@ -43,12 +56,17 @@ inline int64_t repack_weights(const uint8_t* src,
   }
 
   const int64_t cols_tiles = weights_cols / kTileCols;
+  const int64_t cols_pairs = weights_cols / kTransportTileCols;
+  memset(dst, 0, bytes);
   spiral::quants::detail::RepackWarnings warnings;
 
-  for (int64_t cols_tile = 0; cols_tile < cols_tiles; ++cols_tile) {
-    for (int64_t rows_record = 0; rows_record < blocks_per_col; ++rows_record) {
-      uint8_t* record =
-          dst + (cols_tile * blocks_per_col + rows_record) * kPackedRecordBytes;
+  for (int64_t rows_record = 0; rows_record < blocks_per_col; ++rows_record) {
+    for (int64_t cols_tile = 0; cols_tile < cols_tiles; ++cols_tile) {
+      const int64_t col_pair = cols_tile / 2;
+      const int local_col = static_cast<int>(cols_tile % 2);
+      uint8_t* tile =
+          dst + (rows_record * cols_pairs + col_pair) *
+                    kPackedTransportTileBytes;
       const uint8_t* ql[kTileCols];
       const uint8_t* qh[kTileCols];
       const uint8_t* col_scales[kTileCols];
@@ -66,17 +84,19 @@ inline int64_t repack_weights(const uint8_t* src,
           d_bits = 0;
           warnings.subnormal_scale = true;
         }
-        store_u16(record_scales(record) + col * kBlockScaleBytes, d_bits);
+        store_u16(record_scales(tile, local_col) + col * kBlockScaleBytes,
+                  d_bits);
       }
 
       for (int chunk_index = 0; chunk_index < kChunksPerRecord; ++chunk_index) {
         const int half = chunk_index / 2;
         const int pair = chunk_index % 2;
-        uint8_t* packed_payload = chunk(record, chunk_index);
+        uint8_t* packed_payload =
+            chunk(record_payloads(tile, local_col), chunk_index);
         uint8_t* packed_low = packed_payload;
         uint8_t* packed_high = packed_low + kPackedChunkLowBytes;
-        uint8_t* packed_scales = chunk_scales(record, chunk_index);
-        memset(packed_payload, 0, kPackedChunkPayloadBytes);
+        uint8_t* packed_scales =
+            chunk_scales(tile, local_col, chunk_index);
 
         for (int col = 0; col < kTileCols; ++col) {
           const uint8_t* ql_col = ql[col];

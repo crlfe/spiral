@@ -1,12 +1,26 @@
 #pragma once
 
 #include <stdint.h>
+#include <string.h>
 
 #include "quants/common/repack.h"
 #include "quants/q6_k_int8/layout.h"
 
 namespace spiral::quants::q6_k_int8 {
 
+constexpr int64_t tile_count(int64_t weights_rows, int64_t weights_cols) {
+  if (weights_rows <= 0 || weights_cols <= 0) {
+    return 0;
+  }
+  if (weights_rows % kTransportTileRows != 0 ||
+      weights_cols % kTransportTileCols != 0) {
+    return 0;
+  }
+  return (weights_rows / kTransportTileRows) *
+         (weights_cols / kTransportTileCols);
+}
+
+// Number of 256-row x 8-column records (legacy count).
 constexpr int64_t record_count(int64_t weights_rows, int64_t weights_cols) {
   if (weights_rows <= 0 || weights_cols <= 0) {
     return 0;
@@ -18,10 +32,10 @@ constexpr int64_t record_count(int64_t weights_rows, int64_t weights_cols) {
 }
 
 constexpr int64_t packed_bytes(int64_t weights_rows, int64_t weights_cols) {
-  return record_count(weights_rows, weights_cols) * kPackedRecordBytes;
+  return tile_count(weights_rows, weights_cols) * kPackedTransportTileBytes;
 }
 
-// Repack canonical column-major Q6_K into whole 256-row x 8-column records.
+// Repack canonical column-major Q6_K into 256-row x 16-column transport tiles.
 // Each 6-bit weight is expanded to a signed int8 (q - 32), so the device no
 // longer decodes low/high bit planes.
 inline int64_t repack_weights(const uint8_t* src,
@@ -30,9 +44,9 @@ inline int64_t repack_weights(const uint8_t* src,
                               int64_t dst_capacity,
                               int64_t weights_rows,
                               int64_t weights_cols) {
-  const int64_t records = record_count(weights_rows, weights_cols);
-  const int64_t bytes = records * kPackedRecordBytes;
-  if (records == 0 || bytes > dst_capacity || dst == nullptr ||
+  const int64_t tiles = tile_count(weights_rows, weights_cols);
+  const int64_t bytes = tiles * kPackedTransportTileBytes;
+  if (tiles == 0 || bytes > dst_capacity || dst == nullptr ||
       src == nullptr) {
     return 0;
   }
@@ -42,13 +56,18 @@ inline int64_t repack_weights(const uint8_t* src,
   }
 
   const int64_t cols_tiles = weights_cols / kTileCols;
+  const int64_t cols_pairs = weights_cols / kTransportTileCols;
+  memset(dst, 0, bytes);
   spiral::quants::detail::RepackWarnings warnings;
 
-  for (int64_t cols_tile = 0; cols_tile < cols_tiles; ++cols_tile) {
-    for (int64_t rows_record = 0; rows_record < blocks_per_col; ++rows_record) {
-      uint8_t* record =
-          dst + (cols_tile * blocks_per_col + rows_record) * kPackedRecordBytes;
-      uint8_t* record_d = record + kPackedScalesOffset + kPackedScalesBytes;
+  for (int64_t rows_record = 0; rows_record < blocks_per_col; ++rows_record) {
+    for (int64_t cols_tile = 0; cols_tile < cols_tiles; ++cols_tile) {
+      const int64_t col_pair = cols_tile / 2;
+      const int local_col = static_cast<int>(cols_tile % 2);
+      uint8_t* tile =
+          dst + (rows_record * cols_pairs + col_pair) *
+                    kPackedTransportTileBytes;
+      uint8_t* record_d = record_scales(tile, local_col);
 
       for (int col = 0; col < kTileCols; ++col) {
         const int64_t global_col = cols_tile * kTileCols + col;
@@ -69,10 +88,10 @@ inline int64_t repack_weights(const uint8_t* src,
              ++chunk_index) {
           const int half = chunk_index / 2;
           const int pair = chunk_index % 2;
-          uint8_t* packed_chunk = record + chunk_index * kPackedChunkBytes;
-          uint8_t* packed_payload = packed_chunk;
-          uint8_t* packed_scales = record + kPackedScalesOffset +
-                                   chunk_index * kPackedChunkScalesBytes;
+          uint8_t* packed_payload =
+              chunk(record_payloads(tile, local_col), chunk_index);
+          uint8_t* packed_scales =
+              chunk_scales(tile, local_col, chunk_index);
 
           for (int subgroup = 0; subgroup < 4; ++subgroup) {
             packed_scales[subgroup * kTileCols + col] =

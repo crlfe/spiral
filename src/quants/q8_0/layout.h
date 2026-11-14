@@ -35,6 +35,14 @@ constexpr int kPackedChunkBytes = kPayloadsBytes + kScalesBytes;
 constexpr int kPackedRecordBytes =
     kCommonScaleBytes + kChunksPerRecord * kPackedChunkBytes;
 
+// The repack and transport unit is 256 rows x 16 columns, i.e. two adjacent
+// records. Records stay payload-first and keep the same internal layout.
+constexpr int kTransportTileRows = 256;
+constexpr int kTransportTileCols = 16;
+constexpr int kRecordsPerTransportTile = kTransportTileCols / kTileCols;
+constexpr int kPackedTransportTileBytes =
+    kRecordsPerTransportTile * kPackedRecordBytes;
+
 static_assert(kTileCols == ::spiral::quants::kMmulWeightsCols,
               "Q8_0 tile columns must match the mmul tile width");
 static_assert(kTileRows == ::spiral::quants::kMmulWeightsRows,
@@ -53,6 +61,22 @@ static_assert(kBlockBytes == kBlockScaleBytes + kBlockQuantBytes,
               "Q8_0 canonical block size changed");
 static_assert(kPackedChunkBytes == 2176, "Q8_0 packed chunk size changed");
 static_assert(kPackedRecordBytes == 2176, "Q8_0 packed record size changed");
+static_assert(kTransportTileRows == kRecordRows,
+              "Q8_0 transport tile must hold one record depth");
+static_assert(kTransportTileCols == kRecordsPerTransportTile * kTileCols,
+              "Q8_0 transport tile must contain whole records");
+static_assert(kPackedTransportTileBytes == 4352,
+              "Q8_0 transport tile size changed");
+static_assert(kPackedTransportTileBytes % 64 == 0,
+              "Q8_0 transport tiles must be 64-byte aligned");
+
+inline const uint8_t* record_ptr(const uint8_t* tile, int local_col) {
+  return tile + local_col * kPackedRecordBytes;
+}
+
+inline uint8_t* record_ptr(uint8_t* tile, int local_col) {
+  return tile + local_col * kPackedRecordBytes;
+}
 
 inline const uint8_t* chunk(const uint8_t* record, int chunk_index) {
   return record + kCommonScaleBytes + chunk_index * kPackedChunkBytes;

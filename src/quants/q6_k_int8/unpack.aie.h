@@ -18,12 +18,13 @@ namespace detail {
 // two terms are not always enough to round to the same bf16 as an fp32
 // multiply.
 static inline __attribute__((always_inline)) void load_d16(
-    const uint8_t* record,
+    const uint8_t* tile,
+    int local_col,
     aie::vector<bfloat16, kPackedChunkScalesBytes>& d_hi32,
     aie::vector<bfloat16, kPackedChunkScalesBytes>& d_lo32) {
   aie::vector<bfloat16, 8> d_hi8;
   aie::vector<bfloat16, 8> d_lo8;
-  split_bf16_hi_lo(load_fp16x8(record_scales(record)), d_hi8, d_lo8);
+  split_bf16_hi_lo(load_fp16x8(record_scales(tile, local_col)), d_hi8, d_lo8);
   d_hi32 = aie::broadcast_vector<kTileCols, bfloat16, kPackedChunkScalesBytes>(
       d_hi8, 0);
   d_lo32 = aie::broadcast_vector<kTileCols, bfloat16, kPackedChunkScalesBytes>(
@@ -98,24 +99,34 @@ static inline
 
 }  // namespace detail
 
-inline void unpack_weights_chunk(const uint8_t* record,
-                                 const uint8_t* __restrict packed_chunk,
+inline void unpack_weights_chunk(const uint8_t* packed,
+                                 int weights_cols_tile,
+                                 int weights_rows_record,
+                                 int cols_pairs,
+                                 int chunk_index,
                                  bfloat16* __restrict weights_tile) {
   using OutputVec = aie::vector<bfloat16, kMmulWeightsElems>;
   auto output_tiles = reinterpret_cast<OutputVec*>(weights_tile);
   constexpr int kTilesPerChunk = kUnpackTileRows / kTileRows;
   constexpr int kTilesPerSubgroup = 16 / kTileRows;
 
+  const int col_pair = weights_cols_tile / 2;
+  const int local_col = weights_cols_tile % 2;
+  const uint8_t* tile =
+      packed + (weights_rows_record * cols_pairs + col_pair) *
+                   kPackedTransportTileBytes;
+  const uint8_t* packed_chunk =
+      chunk(record_payloads(tile, local_col), chunk_index);
+
   aie::vector<bfloat16, kPackedChunkScalesBytes> hi32;
   aie::vector<bfloat16, kPackedChunkScalesBytes> mid32;
   aie::vector<bfloat16, kPackedChunkScalesBytes> lo32;
-  const int chunk_index =
-      static_cast<int>((packed_chunk - record) / kPackedChunkBytes);
   aie::vector<bfloat16, kPackedChunkScalesBytes> d_hi32;
   aie::vector<bfloat16, kPackedChunkScalesBytes> d_lo32;
-  detail::load_d16(record, d_hi32, d_lo32);
-  detail::load_chunk_scales32(d_hi32, d_lo32, chunk_scales(record, chunk_index),
-                              hi32, mid32, lo32);
+  detail::load_d16(tile, local_col, d_hi32, d_lo32);
+  detail::load_chunk_scales32(d_hi32, d_lo32,
+                              chunk_scales(tile, local_col, chunk_index), hi32,
+                              mid32, lo32);
 
 #pragma unroll
   for (int subgroup = 0; subgroup < kTilesPerChunk / kTilesPerSubgroup;

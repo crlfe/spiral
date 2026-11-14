@@ -54,12 +54,22 @@ static inline
 }  // namespace detail
 
 // Unpack one 256-row x 8-column chunk into the canonical bf16 weights tile.
-inline void unpack_weights_chunk(const uint8_t* record,
-                                 const uint8_t* __restrict packed_chunk,
+inline void unpack_weights_chunk(const uint8_t* packed,
+                                 int weights_cols_tile,
+                                 int weights_rows_record,
+                                 int cols_pairs,
+                                 int chunk_index,
                                  bfloat16* __restrict weights_tile) {
   using OutputVec = aie::vector<bfloat16, kMmulWeightsElems>;
   auto output_tiles = reinterpret_cast<OutputVec*>(weights_tile);
-  (void)record;
+
+  const int col_pair = weights_cols_tile / 2;
+  const int local_col = weights_cols_tile % 2;
+  const uint8_t* tile =
+      packed + (weights_rows_record * cols_pairs + col_pair) *
+                   kPackedTransportTileBytes;
+  const uint8_t* record = record_ptr(tile, local_col);
+  const uint8_t* packed_chunk = chunk(record, chunk_index);
 
   for (int block = 0; block < kBlocksPerRecord; ++block) {
     aie::vector<bfloat16, kTileCols> hi8;
