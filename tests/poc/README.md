@@ -57,6 +57,24 @@ compute: 214.26 GFLOP/s
 verified against numpy
 ```
 
+## Quantized Byte Stream
+
+`stream/stream.py` streams weight tiles with mode-specific packed sizes
+through fixed DMA buffers, showing how different quantization formats
+can share one static NPU network without padding every tile to a
+common maximum.
+
+```
+# Ryzen AI 9 HX 475 Laptop, --reps 64 (best samples; these run noisy)
+
+q4_0:  52.8 GB/s
+q6_k:  54.6 GB/s   (about 96% of the 57 GB/s bulk ceiling)
+iq1_s: 33.5 GB/s
+```
+
+See [`stream/README.md`](stream/README.md) for the stream layout, kernel
+structure, buffer geometry, cache behavior, and tuning results.
+
 ## Call Overheads
 
 `invoke.py` reports the time required to call the NPU using different patterns,
