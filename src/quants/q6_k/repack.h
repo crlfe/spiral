@@ -46,8 +46,7 @@ inline int64_t repack_weights(const uint8_t* src,
                               int64_t weights_cols) {
   const int64_t tiles = tile_count(weights_rows, weights_cols);
   const int64_t bytes = tiles * kPackedTransportTileBytes;
-  if (tiles == 0 || bytes > dst_capacity || dst == nullptr ||
-      src == nullptr) {
+  if (tiles == 0 || bytes > dst_capacity || dst == nullptr || src == nullptr) {
     return 0;
   }
   const int64_t blocks_per_col = weights_rows / kBlockRows;
@@ -57,6 +56,11 @@ inline int64_t repack_weights(const uint8_t* src,
 
   const int64_t cols_tiles = weights_cols / kTileCols;
   const int64_t cols_pairs = weights_cols / kTransportTileCols;
+  constexpr int kSubgroupsPerHalf = 4;
+  constexpr int kScalesPerHalf = 8;
+  constexpr int kRowsPerGroup = 32;
+  constexpr int kQlHalfBytes = kBlockQlBytes / 2;
+  constexpr int kQhHalfBytes = kBlockQhBytes / 2;
   memset(dst, 0, bytes);
   spiral::quants::detail::RepackWarnings warnings;
 
@@ -64,9 +68,8 @@ inline int64_t repack_weights(const uint8_t* src,
     for (int64_t cols_tile = 0; cols_tile < cols_tiles; ++cols_tile) {
       const int64_t col_pair = cols_tile / 2;
       const int local_col = static_cast<int>(cols_tile % 2);
-      uint8_t* tile =
-          dst + (rows_record * cols_pairs + col_pair) *
-                    kPackedTransportTileBytes;
+      uint8_t* tile = dst + (rows_record * cols_pairs + col_pair) *
+                                kPackedTransportTileBytes;
       const uint8_t* ql[kTileCols];
       const uint8_t* qh[kTileCols];
       const uint8_t* col_scales[kTileCols];
@@ -88,34 +91,40 @@ inline int64_t repack_weights(const uint8_t* src,
                   d_bits);
       }
 
+      // Canonical ql is 128 bytes: two 64-byte halves. qh is 64 bytes: two
+      // 32-byte halves. Each ql nibble selects one 6-bit value, with its top
+      // two bits selected from the matching qh byte. The repack splits those
+      // values back into the low-nibble and high-two-bit planes.
       for (int chunk_index = 0; chunk_index < kChunksPerRecord; ++chunk_index) {
-        const int half = chunk_index / 2;
-        const int pair = chunk_index % 2;
+        const int ql_half = chunk_index / 2;
+        const int ql_nibble = chunk_index % 2;
         uint8_t* packed_payload =
             chunk(record_payloads(tile, local_col), chunk_index);
         uint8_t* packed_low = packed_payload;
         uint8_t* packed_high = packed_low + kPackedChunkLowBytes;
-        uint8_t* packed_scales =
-            chunk_scales(tile, local_col, chunk_index);
+        uint8_t* packed_scales = chunk_scales(tile, local_col, chunk_index);
 
         for (int col = 0; col < kTileCols; ++col) {
           const uint8_t* ql_col = ql[col];
           const uint8_t* qh_col = qh[col];
           const uint8_t* scales = col_scales[col];
 
-          for (int subgroup = 0; subgroup < 4; ++subgroup) {
+          for (int subgroup = 0; subgroup < kSubgroupsPerHalf; ++subgroup) {
             packed_scales[subgroup * kTileCols + col] =
-                scales[half * 8 + pair * 4 + subgroup];
+                scales[ql_half * kScalesPerHalf +
+                       ql_nibble * kSubgroupsPerHalf + subgroup];
           }
 
           for (int row = 0; row < kUnpackTileRows; ++row) {
-            const int group = row / 32;
-            const int local_row = row % 32;
-            const uint8_t ql_byte = ql_col[half * 64 + group * 32 + local_row];
+            const int group = row / kRowsPerGroup;
+            const int local_row = row % kRowsPerGroup;
+            const uint8_t ql_byte = ql_col[ql_half * kQlHalfBytes +
+                                           group * kRowsPerGroup + local_row];
             const uint8_t low_nibble =
-                pair == 0 ? (ql_byte & 0x0F) : ((ql_byte >> 4) & 0x0F);
+                ql_nibble == 0 ? (ql_byte & 0x0F) : ((ql_byte >> 4) & 0x0F);
             const uint8_t high_bits =
-                (qh_col[half * 32 + local_row] >> (4 * pair + 2 * group)) &
+                (qh_col[ql_half * kQhHalfBytes + local_row] >>
+                 (4 * ql_nibble + 2 * group)) &
                 0x03;
             const uint8_t value = low_nibble | (high_bits << 4);
             const int index = row * kTileCols + col;

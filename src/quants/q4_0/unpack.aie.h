@@ -18,7 +18,8 @@ static inline __attribute__((always_inline)) void load_block_scales64(
     int weights_rows_block,
     aie::vector<bfloat16, kMmulWeightsElems>& hi,
     aie::vector<bfloat16, kMmulWeightsElems>& lo) {
-  const auto block_scale_values = load_fp16x8(block_scales(scales, weights_rows_block));
+  const auto block_scale_values =
+      load_fp16x8(block_scales(scales, weights_rows_block));
   aie::vector<bfloat16, 8> hi8;
   aie::vector<bfloat16, 8> lo8;
   split_bf16_hi_lo(block_scale_values, hi8, lo8);
@@ -63,8 +64,7 @@ inline void unpack_weights_chunk(const uint8_t* packed,
   const int local_row = weights_rows_record % kRowsRecordsPerTile;
   const int rows_tile = weights_rows_record / kRowsRecordsPerTile;
   const uint8_t* tile =
-      packed + (rows_tile * cols_pairs + col_pair) *
-                   kPackedTransportTileBytes;
+      packed + (rows_tile * cols_pairs + col_pair) * kPackedTransportTileBytes;
   const uint8_t* payloads = record_payloads(tile, local_col, local_row);
   const uint8_t* scales = record_scales(tile, local_col, local_row);
 
@@ -79,11 +79,21 @@ inline void unpack_weights_chunk(const uint8_t* packed,
     for (int tile_index = 0; tile_index < kTilesPerBlock; ++tile_index) {
       const int weights_rows_tile =
           weights_rows_block * kTilesPerBlock + tile_index;
-      const auto values = detail::dequantize_tile(
-          payloads, weights_rows_block, tile_index, hi, lo);
+      const auto values = detail::dequantize_tile(payloads, weights_rows_block,
+                                                  tile_index, hi, lo);
       output_tiles[weights_rows_tile] = values;
     }
   }
+}
+
+// Unpack all chunks of one record.
+inline void unpack_record(const uint8_t* packed,
+                          int weights_cols_tile,
+                          int weights_rows_record,
+                          int cols_pairs,
+                          bfloat16* __restrict weights_tile) {
+  unpack_weights_chunk(packed, weights_cols_tile, weights_rows_record,
+                       cols_pairs, 0, weights_tile);
 }
 
 }  // namespace spiral::quants::q4_0

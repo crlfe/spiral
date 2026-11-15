@@ -74,14 +74,29 @@ static_assert(kPackedTransportTileBytes == 4416,
 static_assert(kPackedTransportTileBytes % 64 == 0,
               "Q6_K transport tiles must be 64-byte aligned");
 
+// Resolve a logical column tile / row record to its 256x16 transport tile.
+inline const uint8_t* transport_tile(const uint8_t* packed,
+                                     int weights_cols_tile,
+                                     int weights_rows_record,
+                                     int cols_pairs) {
+  return packed + (weights_rows_record * cols_pairs + weights_cols_tile / 2) *
+                      kPackedTransportTileBytes;
+}
+
+inline uint8_t* transport_tile(uint8_t* packed,
+                               int weights_cols_tile,
+                               int weights_rows_record,
+                               int cols_pairs) {
+  return packed + (weights_rows_record * cols_pairs + weights_cols_tile / 2) *
+                      kPackedTransportTileBytes;
+}
+
 inline const uint8_t* record_payloads(const uint8_t* tile, int local_col) {
-  return tile + kTilePayloadsOffset +
-         local_col * kPackedPayloadsPerRecordBytes;
+  return tile + kTilePayloadsOffset + local_col * kPackedPayloadsPerRecordBytes;
 }
 
 inline uint8_t* record_payloads(uint8_t* tile, int local_col) {
-  return tile + kTilePayloadsOffset +
-         local_col * kPackedPayloadsPerRecordBytes;
+  return tile + kTilePayloadsOffset + local_col * kPackedPayloadsPerRecordBytes;
 }
 
 inline const uint8_t* chunk(const uint8_t* payloads, int chunk_index) {
@@ -92,16 +107,15 @@ inline uint8_t* chunk(uint8_t* payloads, int chunk_index) {
   return payloads + chunk_index * kPackedChunkPayloadBytes;
 }
 
-inline const uint8_t* chunk_scales(const uint8_t* tile, int local_col,
+inline const uint8_t* chunk_scales(const uint8_t* tile,
+                                   int local_col,
                                    int chunk_index) {
-  return tile + kTileScalesOffset +
-         local_col * kPackedScalesPerRecordBytes +
+  return tile + kTileScalesOffset + local_col * kPackedScalesPerRecordBytes +
          chunk_index * kPackedChunkScalesBytes;
 }
 
 inline uint8_t* chunk_scales(uint8_t* tile, int local_col, int chunk_index) {
-  return tile + kTileScalesOffset +
-         local_col * kPackedScalesPerRecordBytes +
+  return tile + kTileScalesOffset + local_col * kPackedScalesPerRecordBytes +
          chunk_index * kPackedChunkScalesBytes;
 }
 

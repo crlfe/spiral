@@ -33,13 +33,9 @@ extern "C" void quants_unpack_all(const uint8_t* packed, bfloat16* out) {
          ++weights_rows_record) {
       const int32_t out_index =
           weights_cols_tile * rows_records + weights_rows_record;
-
-      for (int chunk_index = 0; chunk_index < kChunksPerRecord; ++chunk_index) {
-        bfloat16* tile =
-            out + (out_index * kChunksPerRecord + chunk_index) * chunk_elems;
-        unpack_weights_chunk(packed, weights_cols_tile, weights_rows_record,
-                             cols_pairs, chunk_index, tile);
-      }
+      bfloat16* record_out = out + out_index * kChunksPerRecord * chunk_elems;
+      unpack_record(packed, weights_cols_tile, weights_rows_record, cols_pairs,
+                    record_out);
     }
   }
   event1();

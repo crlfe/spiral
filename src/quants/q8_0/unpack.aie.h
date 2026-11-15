@@ -65,9 +65,8 @@ inline void unpack_weights_chunk(const uint8_t* packed,
 
   const int col_pair = weights_cols_tile / 2;
   const int local_col = weights_cols_tile % 2;
-  const uint8_t* tile =
-      packed + (weights_rows_record * cols_pairs + col_pair) *
-                   kPackedTransportTileBytes;
+  const uint8_t* tile = packed + (weights_rows_record * cols_pairs + col_pair) *
+                                     kPackedTransportTileBytes;
   const uint8_t* record = record_ptr(tile, local_col);
   const uint8_t* packed_chunk = chunk(record, chunk_index);
 
@@ -87,6 +86,16 @@ inline void unpack_weights_chunk(const uint8_t* packed,
           detail::dequantize_tile(packed_chunk, block, tile, hi, lo);
     }
   }
+}
+
+// Unpack all chunks of one record.
+inline void unpack_record(const uint8_t* packed,
+                          int weights_cols_tile,
+                          int weights_rows_record,
+                          int cols_pairs,
+                          bfloat16* __restrict weights_tile) {
+  unpack_weights_chunk(packed, weights_cols_tile, weights_rows_record,
+                       cols_pairs, 0, weights_tile);
 }
 
 }  // namespace spiral::quants::q8_0

@@ -1,10 +1,10 @@
 # NPU kernel notes
 
-Findings from optimizing the `src/quants` Q4_0, Q6_K, and Q8_0 kernels on
-XDNA2 / AIE2P using Peano and IRON. The material is organized as reusable AIE2
-techniques, shared kernel patterns, and then format-specific results. Current
-status and future plans live in `TODO.md`; the quick summary lives in
-`README.md`.
+Findings from optimizing the `src/quants` Q4_0, Q4_0_hilo, Q6_K, Q6_K_int8,
+and Q8_0 kernels on XDNA2 / AIE2P using Peano and IRON. The material is
+organized as reusable AIE2 techniques, shared kernel patterns, and then
+format-specific results. Current status and future plans live in `TODO.md`;
+the quick summary lives in `README.md`.
 
 ## Benchmarks and conventions
 
@@ -31,7 +31,9 @@ status and future plans live in `TODO.md`; the quick summary lives in
   clock and 1.8 GHz as the measured one; `README.md` tabulates both.
 - Cycle counts and weights/cycle are clock-independent, while weights/s and
   bytes/s scale linearly with clock. The per-format tables below carry the
-  1.8 GHz measurement; multiply those throughput figures by 0.833 for 1.5 GHz.
+  1.8 GHz measurement; their compute-implied GB/s columns should be multiplied
+  by 0.833 for 1.5 GHz. `README.md` reports est weights/s using the 1.5 GHz
+  compute cap and the fixed 55 GB/s memory cap.
 - 60 GB/s at 1.8 GHz requires about 1.67 weights/core-cycle at the 5.0-bit
   Q4_0 layout, or 1.85 at canonical 4.5 bits (scale by 1.2 for 1.5 GHz).
 - One AIE2 VLIW bundle is 16 bytes.
@@ -269,9 +271,10 @@ programming guide, `third_party/aie_api/include/aie_api/aie.hpp`, and the
 
 ### Two-column fusion
 
-The best fused structure found so far applies to Q4_0, Q4_0_hilo, Q8_0, and
-Q6_K_int8. Native Q6_K uses one column tile at a time and gets its ILP from
-decoding four row tiles together instead.
+The two-column fused structure is used by Q4_0, Q4_0_hilo, Q8_0, Q6_K_int8,
+and native Q6_K. Native Q6_K decodes both records into separate value sets and
+then issues both accumulators' mmuls, which is what made the two-record fusion
+worthwhile there.
 
 - one `unpack_mmul<weights_rows, weights_cols>` implementation per format;
 - process two independent column tiles at a time;
@@ -293,7 +296,8 @@ What helped:
 
 What did not help:
 
-- partial unrolling (`unroll_count(4)`) or removing the unroll pragma;
+- partial unrolling (`unroll_count(4)`) or changing unroll pragmas without
+  measuring the specific loop; per-loop effects vary;
 - `noinline` on `next()` or the mmul helper;
 - four columns processed concurrently;
 - hoisting accumulators across records for Q4_0 (it already scales well);
@@ -361,8 +365,9 @@ What did not help:
 - Per-column `noinline` helpers reduce pressure but lose too much ILP.
 - Struct-based record views regressed the fused Q4_0 kernel by about 4.6%;
   vector-pointer access is faster in the hot path.
-- The hot loop keeps two accumulators, two scale vectors, and two payload
-  streams live. Four columns remains too much register pressure.
+- The hot loop keeps two accumulators, two records' scale terms, and two
+  payload streams live. Native Q6_K also keeps two decoded value sets live for
+  the two-record fusion. Four columns remains too much register pressure.
 
 ### Mmul shape
 
@@ -439,7 +444,10 @@ The device decoder processes four adjacent 8x8 tiles (32 rows) at a time. Each
 group loads two 64-byte low-plane vectors and one 64-byte high-plane vector,
 shares the high-plane masks across all four tiles, and expands the planes in
 `uint4`/`uint8` lanes before applying the bf16 scale terms. A 64-row chunk now
-needs six 64-byte payload loads instead of eight.
+needs six 64-byte payload loads instead of eight. The standalone unpack
+processes a whole record per call, loading and splitting the per-column `d`
+once instead of once per 64-row chunk; this reduced 256x64 unpack from 9587
+to 8826 cycles without changing repack or the mmul path.
 
 `q6_k_int8` expands every 6-bit weight to signed int8 (`q - 32`) in host
 repack. Its 4416-byte tile is 8.625 bits/weight:
@@ -458,20 +466,23 @@ Results at the measured 1.8 GHz H clock:
 
 | shape | cycles | cycles/tile | weights/cycle | bytes/weight |
 | :-- | --: | --: | --: | --: |
-| 256x64 q6_k native | 13809 | 431.531 | 1.186 | 0.828125 |
-| 256x64 q6_k native standalone unpack | 9587 | 299.594 | 1.709 | - |
+| 256x64 q6_k native | 9929 | 310.281 | 1.650 | 0.828125 |
+| 256x64 q6_k native standalone unpack | 8826 | 275.812 | 1.856 | - |
 | 256x64 q6_k_int8 payload | 9054 | 282.938 | 1.810 | 1.078125 |
-| 256x64 q6_k_int8 standalone unpack | 5619 | 175.594 | 2.916 | - |
+| 256x64 q6_k_int8 standalone unpack | 4538 | 141.812 | 3.611 | - |
 | Q8_0 256x64 reference | 8242 | 257.563 | 1.988 | 1.0625 |
 
-At 1.5 GHz the native kernel is compute-bound at about 57B weights/s; at
-1.8 GHz it becomes memory-bound at about 66B. `q6_k_int8` is memory-bound at
-about 51B. The int8 payload still wins on cycles, but the native format uses
-about 23% less traffic (6.625 vs 8.625 bits/weight) and is competitive at the
-1.8 GHz target.
+At 1.5 GHz the native kernel is memory-bound at about 66B weights/s, with a
+compute ceiling of about 79B; at 1.8 GHz the compute ceiling rises to about
+95B but memory still binds at 66B. `q6_k_int8` is memory-bound at about 51B.
+The int8 payload is still slightly faster per cycle, but the native format
+uses about 23% less traffic (6.625 vs 8.625 bits/weight) and has a higher
+full-device throughput estimate.
 
-The largest single win was grouping four row tiles per decode. Sharing the
-high-plane load and masks cuts the payload load count from eight to six per
+The largest single win was processing both 8-column records of each transport
+tile together, sharing input vectors and exposing two independent mmul
+accumulators. The second win was grouping four row tiles per decode: sharing
+the high-plane load and masks cuts the payload load count from eight to six per
 64-row chunk and gives the independent vector chains enough work to cover the
 emulated-FP32 latency. The exact scale path is unchanged: fp16 `d` is split
 into bf16 hi/lo terms once per record, each chunk's int8 scales are multiplied
@@ -479,8 +490,8 @@ by `d` and split into hi/mid/lo terms once, and the three-term product is
 applied with bf16 multiplies. This remains exact for canonical scales up to
 127.
 
-Instruction memory: native `q6_k` uses 2576 of the 16384-byte AIE2P
-compute-tile program memory (15.7%), `q6_k_int8` uses 4752 bytes (29.0%) with
+Instruction memory: native `q6_k` uses 5232 of the 16384-byte AIE2P
+compute-tile program memory (31.9%), `q6_k_int8` uses 4752 bytes (29.0%) with
 its chunk loop rolled, `q4_0_hilo` uses 3632 bytes (22.2%), `q4_0` uses 2752
 bytes (16.8%), and `q8_0` uses 2624 bytes (16.0%).
 
@@ -560,10 +571,11 @@ output buffer; the fused kernel works at 64/128 columns. 256 columns need about
 ## Target model context
 
 `gemma-4-E2B_q4_0-it.gguf` is the first end-to-end target: 35 dense blocks,
-about 1.482 GB/token of active NPU weights with the canonical `q4_0` repack
-and the 8.625-bit `q6_k_int8` output head, or roughly 37.1 tok/s at 55 GB/s.
-With `q4_0_hilo` those rise to 1.598 GB and 34.4 tok/s. Using the 6.625-bit
-native `q6_k` head instead would lower the total to about 1.381 GB
-(≈39.8 tok/s). The traffic figures are memory-bound and therefore
-clock-invariant. The breakdown and bring-up checklist live in `TODO.md`; the
-performance summary lives in `README.md`.
+about 1.381 GB/token of active NPU weights with the canonical `q4_0` repack
+and the 6.625-bit native `q6_k` output head, or roughly 39.8 tok/s at 55 GB/s.
+With `q4_0_hilo` those rise to 1.497 GB and 36.7 tok/s. The 8.625-bit
+`q6_k_int8` head instead gives about 1.482 GB and 37.1 tok/s but is
+memory-bound at about 51B weights/s versus about 66B for native `q6_k`. The
+traffic figures are memory-bound and therefore clock-invariant. The breakdown
+and bring-up checklist live in `TODO.md`; the performance summary lives in
+`README.md`.

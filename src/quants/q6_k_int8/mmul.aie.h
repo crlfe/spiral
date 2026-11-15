@@ -35,16 +35,14 @@ inline void unpack_mmul(const uint8_t* packed,
 
   for (int weights_cols_tile = 0; weights_cols_tile < kColsTiles;
        weights_cols_tile += 2) {
-    const int col_pair = weights_cols_tile / 2;
     MMUL accumulator0;
     MMUL accumulator1;
 
 #pragma unroll
     for (int weights_rows_record = 0; weights_rows_record < kRowsRecords;
          ++weights_rows_record) {
-      const uint8_t* tile =
-          packed + (weights_rows_record * kColsPairs + col_pair) *
-                       kPackedTransportTileBytes;
+      const uint8_t* tile = transport_tile(packed, weights_cols_tile,
+                                           weights_rows_record, kColsPairs);
       aie::vector<bfloat16, kPackedChunkScalesBytes> d_hi32_0, d_lo32_0;
       aie::vector<bfloat16, kPackedChunkScalesBytes> d_hi32_1, d_lo32_1;
       detail::load_d16(tile, 0, d_hi32_0, d_lo32_0);

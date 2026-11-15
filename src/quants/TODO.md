@@ -10,7 +10,7 @@ technique and benchmark findings are in `NOTES.md`.
 | :-- | :-- | :-- | :-- | :-- | :-- | :-- | :-- |
 | Q4_0 | done | done | done | done | exact | 1.88 w/c | multi-core |
 | Q4_0_hilo | done | done | done | done | exact | 2.25 w/c | multi-core |
-| Q6_K | done | done | done | done | exact | 1.19 w/c | multi-core, optional wider decode |
+| Q6_K | done | done | done | done | exact | 1.65 w/c | multi-core |
 | Q6_K_int8 | done | done | done | done | exact | 1.81 w/c | multi-core, optional variants |
 | Q8_0 | done | done | done | done | exact | 1.99 w/c | multi-core |
 | Q4_K | not started | - | - | - | - | - | plan below |
@@ -64,7 +64,9 @@ Integration status:
      final driver.
 
 4. **Output-head decision**
-   - keep int8 Q6_K for the exact path;
+   - prefer native `q6_k` for the exact path: it is memory-bound at about 66B
+     weights/s versus about 51B for `q6_k_int8`, even though the int8 kernel is
+     slightly faster per cycle;
    - evaluate a lossy Q4_0 output head only after a model-quality check;
    - Q8_0 is not worth the extra conversion for a ~0.2 ms saving.
 
@@ -141,7 +143,8 @@ must not silently pass through the exact tolerances.
   transport tile.
 - Relaxed `fast` mode: a single host-precomputed bf16 scale, 288-byte records,
   lower precision and fewer device cycles.
-- Keep the exact non-template `unpack_weights_chunk()` as the default.
+- Keep the exact non-template `unpack_record()` / `unpack_weights_chunk()`
+  path as the default.
 - Add a named variant selector to the test shims; do not expose raw template
   arguments.
 - Report the variant name with cycle results.
@@ -201,19 +204,19 @@ Active per-token traffic:
 | component | canonical | our repack |
 | :-- | --: | --: |
 | Q4_0 block weights | 1.048 GB | 1.048 GB |
-| tied Q6_K `token_embd` output head | 0.330 GB | 0.434 GB |
+| tied Q6_K `token_embd` output head | 0.330 GB | 0.333 GB |
 | F16 `per_layer_model_proj` | 0.0275 GB | 0.0275 GB (CPU) |
-| **NPU total, excluding CPU F16** | **1.378 GB** | **1.482 GB** |
+| **NPU total, excluding CPU F16** | **1.378 GB** | **1.381 GB** |
 
-The table uses the canonical-size `q4_0` variant and the 8.625-bit
-`q6_k_int8` output head. Selecting `q4_0_hilo` raises the Q4_0 block traffic
-to 1.164 GB and the NPU total to 1.598 GB. At 55 GB/s the default repacks need
-26.9 ms/token, or about 37.1 tok/s; at 50 / 45 / 35 GB/s it is 29.6 / 32.9 /
-42.3 ms per token, or about 33.7 / 30.4 / 23.6 tok/s. The FFN is 84% of Q4_0
-block traffic. The tied output head is about 29% of total traffic; keeping
-int8 Q6_K is the exact choice, while a lossy Q4_0 head would save about 12% of
-token time. The 6.625-bit native `q6_k` head would reduce the total to about
-1.381 GB (≈39.8 tok/s at 55 GB/s).
+The table uses the canonical-size `q4_0` variant and the 6.625-bit native
+`q6_k` output head. Selecting `q4_0_hilo` raises the Q4_0 block traffic to
+1.164 GB and the NPU total to 1.497 GB. At 55 GB/s the default repacks need
+25.1 ms/token, or about 39.8 tok/s; at 50 / 45 / 35 GB/s it is 27.6 / 30.7 /
+39.5 ms per token, or about 36.2 / 32.6 / 25.3 tok/s. The FFN is 84% of Q4_0
+block traffic. The tied output head is about 24% of total traffic. The
+8.625-bit `q6_k_int8` head remains an option but is memory-bound at about 51B
+weights/s versus about 66B for native `q6_k`; a lossy Q4_0 head would save
+about 12% of token time.
 
 `gemma-4-26B-A4B-it-qat-q4_0.gguf` is not a good first target: it is MoE with
 128 experts and 8 active.
@@ -324,6 +327,12 @@ supports views with padding. Invalid dimensions or insufficient capacity return
 ### Unpack API
 
 ```cpp
+void unpack_record(const uint8_t* packed,
+                   int weights_cols_tile,
+                   int weights_rows_record,
+                   int cols_pairs,
+                   bfloat16* weights_tile);
+
 void unpack_weights_chunk(const uint8_t* packed,
                           int weights_cols_tile,
                           int weights_rows_record,
@@ -332,9 +341,11 @@ void unpack_weights_chunk(const uint8_t* packed,
                           bfloat16* weights_tile);
 ```
 
-The shim passes the packed base and the logical column-tile/row-record index;
-each format resolves the transport tile and its local record. The function
-writes the canonical bf16 weights tile directly.
+`unpack_record()` is the preferred entry point: the shim passes the packed base
+and logical column-tile/row-record index, and the format resolves the transport
+tile, loads per-record metadata once, and writes all chunks. Q6_K and
+Q6_K_int8 hoist `d` at this level. `unpack_weights_chunk()` remains the
+per-chunk compatibility entry point.
 
 ### Fused API
 
@@ -347,9 +358,10 @@ inline void unpack_mmul(const uint8_t* packed,
                         float* outputs);
 ```
 
-The caller must zero `outputs` and select `conv_even` rounding. Q4_0,
-Q4_0_hilo, Q8_0, and Q6_K_int8 process two column tiles together. Native Q6_K
-processes one column tile at a time and decodes four row tiles per group.
+The caller must zero `outputs` and select `conv_even` rounding. All five
+formats process the two column tiles of a transport tile together. Native Q6_K
+additionally decodes both records into separate value sets before issuing the
+two accumulators' mmuls.
 
 ## Format constants
 
@@ -406,7 +418,7 @@ The host repack expands each 6-bit weight to signed int8, so device decode is a
 eight 64-byte 8x8 tiles in a chunk are naturally aligned.
 
 The `q6_k_int8` mmul keeps its four-iteration chunk loop rolled (4752 bytes,
-29.0% of program memory). Native `q6_k` uses 2576 bytes (15.7%).
+29.0% of program memory). Native `q6_k` uses 5232 bytes (31.9%).
 
 ### Q8_0
 
@@ -431,6 +443,7 @@ src/quants/
   common/
     tile.h                    mmul tile shape constants
     scale.aie.h               fp16x8 load; device bf16 split helper
+    q6_scale.aie.h            shared Q6_K exact scale path
     mmul.aie.h                mmul tile helper
   q4_0/
     layout.h, repack.h, unpack.aie.h, mmul.aie.h
@@ -468,6 +481,9 @@ kernels share one implementation.
 - `common/scale.aie.h` provides `load_fp16x8()`. `q4_0` uses it with
   `split_bf16_hi_lo()` on the device; `q4_0_hilo` performs the split in host
   repack. The same device split path is reused by both Q6_K variants.
+- `common/q6_scale.aie.h` holds the shared Q6_K scale path: `d` split, exact
+  three-term chunk scales, subgroup broadcast, and scale application. Both
+  `q6_k` and `q6_k_int8` wrap their format-specific record accessors around it.
 - `common/mmul.aie.h` provides the vector mmul tile helper.
 - `q4_0/unpack.aie.h` provides `load_block_scales64()` and
   `dequantize_tile()` used by both the reference unpack and fused mmul.
@@ -511,9 +527,9 @@ kernels share one implementation.
 
 ## Definition of done
 
-- [x] Q6_K exact int8-payload unpack and mmul pass on a device.
-- [x] Q6_K int8 payload is much faster than the native bit-plane baseline;
-      native decode remains the optimization target.
+- [x] Q6_K exact native and int8-payload unpack and mmul pass on a device.
+- [x] Two-record Q6_K fusion makes native the preferred exact output head:
+      memory-bound at about 66B weights/s versus about 51B for int8.
 - [x] Q8_0 unpack and mmul pass on a device.
 - [ ] Q4_K and Q5_K host repacks and dequantization match the host reference.
 - [ ] Q4_K and Q5_K NPU unpack and mmul pass on a device.

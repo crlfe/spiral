@@ -15,7 +15,7 @@ tiles; each tile is padded to a 64-byte boundary.
 | :-- | --: | --: | --: | :-- |
 | Q4_0 | 4.5 | 16.8% | 90B | compute at 1.5, memory 98B at 1.8 GHz |
 | Q4_0_hilo | 5.0 | 22.2% | 88B | memory, +11% size |
-| Q6_K | 6.625 | 15.7% | 57B | compute at 1.5, memory 66B at 1.8 GHz |
+| Q6_K | 6.625 | 31.9% | 66B | memory-bound, 66B |
 | Q6_K_int8 | 8.625 | 29.0% | 51B | memory, +31% size |
 | Q8_0 | 8.5 | 16.0% | 52B | memory |
 
