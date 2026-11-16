@@ -57,6 +57,211 @@ the quick summary lives in `README.md`.
   256x16 kernel by 5.9% (2008 vs 1896 cycles). The equivalent `q4_0` and
   `q8_0` block loops compile the same with or without it.
 
+## Loop optimization and Peano idioms
+
+This is the general optimization playbook for Peano/AIE2P kernels in this
+package. It applies to every quant format, including Q4_0, Q4_0_hilo, Q6_K,
+Q6_K_int8, Q8_0, the K-quants, and the IQ formats. The measured examples below
+come from a standalone 64-byte copy microbenchmark and a fixed-shape Q4_0
+experiment; the scratch sources were not kept, but the results are retained
+here. The conclusions are about Peano code generation, not about one quant
+layout.
+
+### General playbook
+
+1. **Classify the bottleneck before changing code.** Address arithmetic,
+   scale decode, the mmul recurrence, code size, and memory traffic need
+   different fixes. Measure the current kernel and inspect the disassembly
+   first.
+2. **Write pointer-increment loops.** Prefer `ptr += stride` over indexing.
+   This lets Peano use post-increment addressing and often discovers a
+   single-register load/store rotation. It is the biggest single win on
+   address-bound loops.
+3. **Sweep unroll pragmas on the actual loop.** Try `unroll(disable)`,
+   `unroll(enable)`, `unroll_count(N)`, and `unroll(full)`. Check cycles,
+   `.text`, and the compiler warning output. `unroll(full)` can fail with
+   "loop not unrolled" on large bodies; treat that as no change, not success.
+4. **Keep two-column (or two-channel) fusion** where it exists. It shares
+   input loads and exposes independent mmul accumulators. Do not split it
+   without measuring; the lost ILP is usually worse than the extra registers.
+5. **Use backend flags only after the disassembly identifies a problem.**
+   The common `aie-*` unroll, pipeliner, and register flags had no effect on
+   the copy kernels, and the register-rewrite variants were slower on q4_0
+   (9168/9104 cycles vs 8720 for aggressive-realloc/swpaware). The neutral
+   list is below.
+6. **Prefer host precomputation when the repack contract allows it.** Moving
+   fp16 decode, hi/lo splitting, or 6-bit scale/min expansion into host repack
+   removes device work. This is the main reason Q4_0_hilo is faster than Q4_0.
+   It is a format/bytes trade, not a scheduling trick.
+7. **Only hand-write assembly when the compiler cannot express the schedule.**
+   The copy benchmark shows the compiler matching a hand-written 8-deep load
+   pipeline when the source shape is right. Hand assembly is justified by a
+   measured compiler limitation, not by the hope of beating the compiler.
+
+### Pointer increments and the copy microbenchmark
+
+Write the loop so the compiler can see pointer increments:
+
+```cpp
+const uint8_t* src = in;
+uint8_t* dst = out;
+for (int i = 0; i < n; ++i) {
+  const auto v = aie::load_v<64>(src);
+  aie::store_v(dst, v);
+  src += 64;
+  dst += 64;
+}
+```
+
+This generates `vldb x2, [p0], #0x40` / `vst x2, [p1], #0x40`. Indexed forms
+generate `movs dj0, r0; add r0, r0, r1` and cannot use post-increment
+addressing. The compiler also discovers a **single-register rotation**: a
+one-bundle ZOL body with `vldb x2; vst x2`, a seven-load prologue, a seven-store
+epilogue, and a loop count of `n - 7`. The in-order writeback makes the store
+read the value loaded seven cycles earlier.
+
+Measured on a 16 KiB copy (256 x 64 B):
+
+| C++ form / hand asm | cycles | bytes/cycle | kernel `.text` | program `.text` |
+| :-- | --: | --: | --: | --: |
+| indexed, rolled | 2313 | 7.1 | 176 B | 512 B |
+| indexed, `unroll(enable)` | 516 | 31.8 | 272 B | 608 B |
+| indexed, `unroll_count(16)` | 441 | 37.2 | 320 B | 656 B |
+| indexed, `unroll(full)` | 263 | 62.3 | 1568 B | 1904 B |
+| **pointer, no pragma** | **266** | **61.6** | **208 B** | **544 B** |
+| pointer, `unroll_count(8)` | 263 | 62.3 | 272 B | 560 B |
+| indexed, manual 8x | 670 | 24.5 | 576 B | 912 B |
+| hand asm, 8-deep | 271 | 60.5 | 436 B | 800 B |
+
+`unroll(enable)` is a real 4.5x win on the indexed loop, but pointer increments
+alone match it with half the code. `unroll(full)` is fastest but costs ~1.9 KiB
+of program memory. Hand-written assembly is competitive but not faster than the
+compiler's pointer loop, and uses more text. For simple load/store loops, try
+the pointer form first.
+
+### Bottleneck-to-action guide
+
+| symptom | first action | notes |
+| :-- | :-- | :-- |
+| Lots of `movs`/`add` index arithmetic | pointer increments | biggest copy-loop win |
+| `vldb` followed by five nops | pointer rotation or more unrolling | load result latency is 7 |
+| Scale decode dominates; repack can change | host-precompute/hi-lo layout | Q4_0_hilo vs Q4_0 is the model |
+| Scale decode dominates; repack fixed | accept it or use a named relaxed mode | device fp16 decode is already near best |
+| mmul accumulator chain serializes | two-column fusion, static unroll, two accumulators | more accumulators often spill worse |
+| Compiler says "loop not unrolled" | manual unroll or a smaller body | `unroll(full)` can silently fail |
+| Code size is the constraint | roll outer loops, partial unroll | full unroll is a bandwidth/latency trade |
+| Memory-bound (bytes/weight) | change repack precision or host layout | scheduling will not help |
+| Relaxed accuracy allowed | single-bf16 scale or bfp16-emulated mmul | must be a named variant |
+
+For Q6_K/Q6_K_int8/Q8_0, the same actions apply to the `payloads`, `scales`,
+and `d` pointers. For IQ4_NL/IQ4_XS, keep codebook/LUT data in the lookup
+memory and use pointer increments for the index streams. For Q4_K/Q5_K,
+host-expand the 6-bit scale/min metadata first, then apply the loop rules.
+
+### Counterexample: pointer increments in the q4_0 mmul
+
+Pointer increments are not universally faster. A q4_0 experiment kept the
+exact two-column fusion and changed only which addresses advance:
+
+| variant (256x16 / 256x64) | 256x16 cycles | 256x64 cycles |
+| :-- | --: | --: |
+| q4_0 baseline (indexed records, payloads, inputs) | **2204** | **8720** |
+| payload pointer only | 2204 | 8720 |
+| input pointer only | 2280 | 8934 |
+| record/scale/payload pointers, indexed input | 2293 | 9061 |
+| all structural pointers + input pointer | 2298 | 9100 |
+
+Advancing the payload pointer is neutral (the compiler already turns
+`payloads[block][tile]` into the same loads). Advancing the input or record
+pointers regresses by 2-4%: the q4_0 loop is recurrence-bound, and the pointer
+form adds loop-carried pointer state and live ranges that disturb the
+compiler's existing schedule. The indexed form lets the compiler keep the
+input tile address independent of the loop-carried accumulator chain.
+
+Use pointer increments when address arithmetic is the bottleneck, as in the
+copy loop. For a dequant+mmul recurrence, measure both forms; indexed code can
+be better even when the same rule wins elsewhere.
+
+### Backend flags are usually not the lever
+
+On the copy kernels, these left cycles and code size unchanged:
+
+- `-O3`
+- `-mllvm -aie-unroll-max-count=1/2/4/8/16`
+- `-mllvm -aie-unroll-only-pragma-loops=false`
+- `-mllvm -aie-prefer-swp-over-unroll=1/4/9`
+- `-mllvm -aie-pipeliner-track-regpressure=false`
+- `-mllvm -aie-pipeliner-max-stagecount=8`
+- `-mllvm -aie-postpipeliner-target-ii=4`
+- `-mllvm -aie-postpipeliner-force-stagecount=2`
+- `-mllvm -aie-aggressive-realloc=true`
+- `-mllvm -aie-reg-rewrite-mode=swpaware`
+- `-mllvm -aie-stack-minimize=false`
+- `-mllvm -aie-merge-congruent-ivs=true`
+- `-mllvm -aie-loop-idiom-unrolling-threshold=350/1000`
+- `-mllvm -aie-unroll-max-cost=50/500`
+
+Prefer source shape and explicit pragmas; use backend flags only after the
+disassembly shows a specific problem.
+
+### Compiler diagnostics and loop inspection
+
+- Set `QUANTS_KERNEL_FLAGS` to append Peano flags to test builds.
+- Add `-Werror=pass-failed` to make failed `#pragma unroll` transformations
+  fatal. Without it, a failed `unroll(full)` is only a warning and the loop
+  stays rolled.
+- Use `llc -pass-remarks-output=...` on the kernel IR to see pipeliner II/NS,
+  ZOL conversion, register spills, and bundle counts.
+- Use `llvm-objdump -d --no-show-raw-insn` to compare the actual bundle/issue
+  schedule before and after a change.
+- `-Rpass-analysis=aie-hardware-loops` and the pipeliner remarks are useful,
+  but many diagnostics are emitted by `llc`, not by the clang driver.
+
+### ZOL and hand-written assembly facts
+
+- A ZOL is written with `add.nc lc, rN, #adj`, `movxm ls, #.Lbody`, and
+  `movxm le, #.Lend`.
+- **`le` must name a full 16-byte bundle.** A 14-byte final bundle silently
+  turns the ZOL into a fall-through loop that executes once.
+- The loop setup must be at least ~112 bytes (7 bundles) from `le`. A shorter
+  body does not loop; pad before `.Lbody` or put the prologue after the
+  `ls`/`le` setup, as the compiler does.
+- The `event #0` / `event #1` mnemonics are rejected by the AIE2P asm parser
+  even though `llc` prints them. The raw encodings are
+  `event #0 = .4byte 0x10100018`, `event #1 = .4byte 0x12100018`.
+- `ExternalFunction` compiles one C/C++ source; a separate `.s` file is not
+  linked automatically. Embed hand-written assembly with a global
+  `__asm__("...")` block, or link a prebuilt object explicitly.
+
+### Where to look for the machine model
+
+- VLIW slots and bundle forms: `AIE2Slots.td`, `AIE2MultiSlotPseudoInstrInfo.td`.
+- Latencies, bypasses, and resource hazards: `AIE2Schedule.td`
+  (`InstrItinData` / `InstrStage`). Key values: `vldb` result 7, `vlda` 7,
+  `vmul`/`vmac` to accumulator 5, `vadd`/`vsub`/`vextbcst`/`vshuffle` 2,
+  `vconv` 2, `vups` 3, `vsrs` 4, `vst` completion 5, ALU 1.
+- Assembly tests and bundle validation: `llvm/test/MC/AIE/`.
+- Compiler loop guidance: `~/Projects/llvm-aie/PERF_OPT_GUIDE.md`.
+
+### Reference results and scope
+
+The copy benchmark is a "can the compiler already do this?" test. The q4_0
+dequant+mmul recurrence is different: the pre-RA pipeliner cannot schedule it
+and the post-RA pipeliner reports `II=63, NS=1`, so static unrolling remains
+the only effective ILP tool there. Do not generalize "the compiler is always
+good enough" from the copy result, and do not generalize "hand asm is always
+faster" either. The order is: pointer-increment C++, pragma sweep, measure,
+inspect the disassembly, then hand-write only the part the compiler cannot
+reach.
+
+A fixed-shape 256x16 Q4_0 experiment is a useful counterexample: pointer
+increments, removing the outer column loop, shift-based fp16 decode, and manual
+record unrolling reached 2316 cycles, but the existing `q4_0` schedule is 2204.
+The loop is recurrence-bound, not address-bound, so the copy-loop win does not
+transfer. `q4_0_hilo` (1896 cycles) and a relaxed single-bf16 scale variant
+(2168 cycles, 2.14 max abs error) are the only faster options, and both change
+the exactness/repack contract.
+
 ## Reusable AIE2 techniques
 
 These are the API and code-generation findings worth carrying into future

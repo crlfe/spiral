@@ -39,3 +39,7 @@ tests/                  host repack shims, NPU harnesses, NumPy references
 
 Format names are canonical GGUF types; suffixes denote packed variants
 (`q4_0_hilo`, `q6_k_int8`).
+
+Loop and compiler-optimization findings, including the pointer-increment and
+unroll-pragma results, are in `NOTES.md` under "Loop optimization and Peano
+idioms".

@@ -75,6 +75,49 @@ iq1_s: 33.5 GB/s
 See [`stream/README.md`](stream/README.md) for the stream layout, kernel
 structure, buffer geometry, cache behavior, and tuning results.
 
+## Iter args and held ObjectFifos
+
+`iter_args.py` is a device-level regression for carrying an acquired
+ObjectFifo buffer through `scf.for` iter args and conditionally replacing it
+with a result-producing `scf.if`:
+
+```python
+block = cons.acquire(1)
+for i, current, _result in range_(
+    NUM_OBJECTS, iter_args=[block], insert_yield=False
+):
+    ...
+    branch = IfOp(take_next, [current.type], has_else=True)
+    with InsertionPoint(branch.then_block):
+        cons.release(1)
+        next_block = cons.acquire(1)
+        scf_yield([next_block])
+    with InsertionPoint(branch.else_block):
+        scf_yield([current])
+    iron_yield([branch.results[0]])
+cons.release(1)
+```
+
+The worker sums the first word of four input objects (1+2+3+4) and writes the
+sum plus the last value and a call count to an output object:
+
+```bash
+~/Projects/mlir-aie/ironenv/bin/python tests/poc/iter_args.py
+```
+
+Expected:
+
+```text
+iter_args carried block: sum 10, last 4, count 4 (expected 10, 4, 4)
+ok
+```
+
+This is the pattern needed to hold a weight block across row boundaries
+without row-aligning the weight stream.  If the inline kernels are edited,
+clear the stale kernel objects in the JIT cache (for example, remove the
+`~/.npu/cache/*` directories containing `iter_args_*.cc`) because
+`compile_external_kernels` skips existing object files.
+
 ## Call Overheads
 
 `invoke.py` reports the time required to call the NPU using different patterns,
