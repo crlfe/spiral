@@ -10,16 +10,20 @@ than it should be. So we're going to fix it.
 
 I have hacked together enough of a llama.cpp GGML backend that I believe the
 NPU can be used as an accelerator, starting with offloading large matrix ops.
-The eventual code will build in a fork of the llama.cpp tree, but for now this
-repository will be for proving capabilities and benchmarking.
+The backend lives in [`integrations/llama.cpp`](integrations/llama.cpp); it is
+attached to a local llama.cpp checkout with a symlink and a small hook patch,
+so this repository stays the place for proving capabilities and benchmarking.
+The eventual code may build as a proper backend in the llama.cpp tree.
 
 My current focus is bringing up a basic set of dequantization routines, which
 take the highly-compressed weights typical of consumer models and expand them
 on the NPU to the bf16 blocks that its hardware can efficiently multiply.
 Optimizing those well enough to run at full bandwidth will be a challenge,
 so I have added a framework for fast unit testing and cycle counting. The first
-real model test will be Gemma 4 26B-A4B IT QAT Q4_0, where I aim to match the
-iGPU's tps when running on the NPU and double my throughput when running both.
+real model test will be Gemma 4 26B-A4B IT QAT Q4_0. The objective is
+productive, quiet inference: the NPU is used for efficiency, and an NPU+iGPU
+split is parked until the NPU path is closer to competitive, ideally on a much
+larger model.
 
 ## Development Hardware
 
@@ -48,6 +52,25 @@ The dense Qwen 3.8 27B model used roughly `16.4 GB/tok * 4 tok/s = 65.6 GB/s`.
 If the same memory bandwidth were saturated by Qwen 35B-A3B Q4, we would double
 the basic decode rate to 36 tps. Adding speculative decoding like MTP or DFlash
 could then easily get us over 50 tps when writing code.
+
+## Gemma 4 E2B: engine comparison
+
+3000-token greedy generations on this laptop, same model class.  The iGPU SCLK
+is capped at 2400 MHz and the NPU runs pmode `turbo`.  The three llama.cpp rows
+share the same Q4_0 GGUF with its native Q6_K head; FastFlowLM uses its own
+quantisation and packing, so that row is a comparison of engines rather than of
+identical weights.
+
+| engine | model | decode |
+| :-- | :-- | --: |
+| llama.cpp ROCm (gfx1150 iGPU) | Gemma 4 E2B Q4_0, Q6_K head | 52.4 t/s |
+| FastFlowLM | `gemma4-it:e2b` | 25.8 t/s |
+| llama.cpp CPU (12 threads) | Gemma 4 E2B Q4_0, Q6_K head | 22.2 t/s |
+| Spiral NPU backend | Gemma 4 E2B Q4_0, Q6_K head | 16.2 t/s |
+
+Temperature, fan and clock behaviour for these runs, including the NPU's
+per-fan comparison with FastFlowLM, are in
+[`src/program/NOTES.md`](src/program/NOTES.md) under "Efficiency acceptance".
 
 # License and Warranty Disclaimer
 

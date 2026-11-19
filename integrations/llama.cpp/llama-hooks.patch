@@ -1,0 +1,82 @@
+# llama.cpp seam for the Spiral NPU backend.
+# Generated against llama.cpp 9048bad8 ("cuda: use the implicit GEMM conv2d
+# path for F32 kernels", #32482).
+# Apply with: git apply llama-hooks.patch
+#
+diff --git a/ggml/CMakeLists.txt b/ggml/CMakeLists.txt
+index 03bdb03..de41dce 100644
+--- a/ggml/CMakeLists.txt
++++ b/ggml/CMakeLists.txt
+@@ -264,6 +264,7 @@ set   (GGML_SYCL_DEVICE_ARCH "" CACHE STRING
+ option(GGML_OPENVINO                        "ggml: use OPENVINO"                              OFF)
+ option(GGML_ET                              "ggml: use ET backend"                            OFF)
+ option(GGML_ET_SYSEMU                       "ggml: use ET backend via sysemu"                 OFF)
++option(GGML_SPIRAL                          "ggml: use Spiral NPU backend"                    OFF)
+ 
+ option(GGML_OPENCL                          "ggml: use OpenCL"                                OFF)
+ option(GGML_OPENCL_PROFILING                "ggml: use OpenCL profiling (increases overhead)" OFF)
+diff --git a/ggml/include/ggml-spiral.h b/ggml/include/ggml-spiral.h
+new file mode 100644
+index 0000000..60591d6
+--- /dev/null
++++ b/ggml/include/ggml-spiral.h
+@@ -0,0 +1,22 @@
++#pragma once
++
++#include "ggml.h"
++#include "ggml-backend.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// Spiral NPU backend (AMD XDNA2 / AIE2P).
++GGML_BACKEND_API ggml_backend_t ggml_backend_spiral_init(int index);
++
++GGML_BACKEND_API bool ggml_backend_is_spiral(ggml_backend_t backend);
++
++// Repacked native-quant weight buffer type (one prepared stream per tensor).
++GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_spiral_weights_buffer_type(void);
++
++GGML_BACKEND_API ggml_backend_reg_t ggml_backend_spiral_reg(void);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/ggml/src/CMakeLists.txt b/ggml/src/CMakeLists.txt
+index 5ff78f2..433d787 100644
+--- a/ggml/src/CMakeLists.txt
++++ b/ggml/src/CMakeLists.txt
+@@ -613,6 +613,7 @@ ggml_add_backend(OpenCL)
+ ggml_add_backend(Hexagon)
+ ggml_add_backend(ZenDNN)
+ ggml_add_backend(OPENVINO)
++ggml_add_backend(SPIRAL)
+ 
+ foreach (target ggml-base ggml)
+     target_include_directories(${target} PUBLIC    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include> $<INSTALL_INTERFACE:include>)
+diff --git a/ggml/src/ggml-backend-reg.cpp b/ggml/src/ggml-backend-reg.cpp
+index c3bc926..d272546 100644
+--- a/ggml/src/ggml-backend-reg.cpp
++++ b/ggml/src/ggml-backend-reg.cpp
+@@ -90,6 +90,10 @@
+ #include "ggml-et.h"
+ #endif
+ 
++#ifdef GGML_USE_SPIRAL
++#include "ggml-spiral.h"
++#endif
++
+ namespace fs = std::filesystem;
+ 
+ static std::string path_str(const fs::path & path) {
+@@ -168,6 +172,9 @@ struct ggml_backend_registry {
+ #ifdef GGML_USE_ET
+         register_backend(ggml_backend_et_reg());
+ #endif
++#ifdef GGML_USE_SPIRAL
++        register_backend(ggml_backend_spiral_reg());
++#endif
+ #ifdef GGML_USE_CPU
+         register_backend(ggml_backend_cpu_reg());
+ #endif

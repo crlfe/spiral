@@ -10,8 +10,8 @@ technique and benchmark findings are in `NOTES.md`.
 | :-- | :-- | :-- | :-- | :-- | :-- | :-- | :-- |
 | Q4_0 | done | done | done | done | exact | 2.08 w/c | multi-core |
 | Q4_0_hilo | done | done | done | done | exact | 2.25 w/c | multi-core |
-| Q6_K | done | done | done | done | exact | 1.65 w/c | multi-core |
-| Q6_K_int8 | done | done | done | done | exact | 1.81 w/c | multi-core, optional variants |
+| Q6_K | done | done | done | done | exact | 1.61 w/c | multi-core |
+| Q6_K_int8 | done | done | done | done | exact | 1.80 w/c | multi-core, optional variants |
 | Q8_0 | done | done | done | done | exact | 2.13 w/c | multi-core |
 | Q4_K | not started | - | - | - | - | - | plan below |
 | Q5_K | not started | - | - | - | - | - | share Q4_K scale/min |
@@ -54,9 +54,11 @@ Integration status:
    - start with a short context to keep attention/KV work small;
    - verify single-token decode with the M=4 mmul zero-padded to four rows.
 
-3. **Q4_0 scale-layout decision**
-   - three variants are available: exact canonical `q4_0`, near-exact
+3. **Q4_0 scale layout (decided: exact canonical `q4_0`)**
+   - three variants exist: exact canonical `q4_0`, near-exact
      `q4_0_packed16`, and exact host-expanded `q4_0_hilo`;
+   - the unprefixed `q4_0` is the production layout; the other two remain
+     named variants and are not candidates for the production path;
    - fused 256x64: `q4_0` 7883, `q4_0_packed16` 7397, `q4_0_hilo` 7268;
    - standalone unpack: 6579 / 5459 / 2916 (diagnostic only, not a selection
      criterion);
@@ -80,16 +82,19 @@ Integration status:
    - add full-shape streaming tests once the multi-core harness exists;
    - add real-model slices from the target tensor set;
    - done: real `token_embd` Q6_K head slice compared against the CPU dequant
-     reference through `ggml-spiral`; max_abs 0.026 on max_cpu 10.07, and the
+     reference through the `ggml-spiral` backend (`integrations/llama.cpp`); max_abs 0.026 on max_cpu 10.07, and the
      Q4_0 Gemma model output matches CPU;
    - keep the no-NPU and invalid-shape tests;
-   - adopt the unprefixed exactness rule (canonical tile size plus bit-exact
-     dequantization for every finite fp16 scale) and gate it: exact-only
-     `verify()` for `q4_0`/`q6_k`/`q8_0`, an exhaustive 65536-pattern scale
-     split probe on the device, and a host check that repack stores canonical
-     scale bytes; non-finite scales stay out of scope.
-   - cover subnormal scales across Q4_0, q4_0_packed16, Q4_0_hilo, and Q8_0;
-     the synthetic goldens now mix normal, subnormal, and signed edge patterns.
+   - [x] Adopt the unprefixed exactness rule: canonical tile size plus
+     bit-exact dequantization for every finite fp16 scale; non-finite scales
+     stay out of scope.  `verify()` is exact-only for `q4_0`/`q6_k`/`q8_0`.
+   - [ ] Remaining gate for that rule: an exhaustive 65536-pattern scale-split
+     probe on the device, and a host check that repack stores canonical scale
+     bytes.
+   - cover subnormal scales across Q4_0, Q4_0_hilo, and Q8_0 (formats with fp16
+     scale slots); the synthetic goldens now mix normal, subnormal, and signed
+     edge patterns.  `q4_0_packed16` has no fp16 scale slot: the host packs a
+     9-bit code, normalizes subnormals on the host, and rejects inf/nan.
    - cover q4_0_packed16's rejection of inf/nan scales, plus a Q8_0 block
      containing `-128`.
 
@@ -381,7 +386,7 @@ inline void unpack_mmul(const uint8_t* packed,
                         float* outputs);
 ```
 
-The caller must zero `outputs` and select `conv_even` rounding. All five
+The caller must zero `outputs` and select `conv_even` rounding. All six
 formats process the two column tiles of a transport tile together. Native Q6_K
 additionally decodes both records into separate value sets before issuing the
 two accumulators' mmuls.
@@ -505,17 +510,21 @@ kernels share one implementation.
 ## Shared implementation work
 
 - `common/tile.h` holds the `aie::mmul<4,8,8>` shape constants.
-- `common/scale.aie.h` provides the exact `split_fp16x16_exact()` /
-  `split_fp16x32_exact()` exponent-add helpers. Q4_0 and Q8_0 decode canonical
-  fp16 scales with them; `q4_0_hilo` performs the split in host repack; Q6_K
-  loads host-precomputed bf16 hi/lo `d` terms directly.
+- `common/scale.aie.h` provides the exact exponent-add helpers
+  `split_fp16_exact<N>()`, `split_fp16x16_exact()`, and `split_fp16x32_exact()`.
+  Q4_0 uses the 16-lane helper in standalone unpack and the 32-lane one in
+  `mmul`; Q8_0 uses `split_fp16_exact<kScaleLanes>`; `q4_0_hilo` performs the
+  split in host repack; Q6_K loads host-precomputed bf16 hi/lo `d` terms
+  directly.
 - `common/q6_scale.aie.h` holds the shared Q6_K scale path: bf16 hi/lo `d`
   load, exact three-term chunk scales, subgroup broadcast, and scale
   application. Both `q6_k` and `q6_k_int8` wrap their format-specific record
   accessors around it.
 - `common/mmul.aie.h` provides the vector mmul tile helper.
-- `q4_0/unpack.aie.h` provides `load_block_scales64()` and
-  `dequantize_tile()` used by both the reference unpack and fused mmul.
+- `q4_0/unpack.aie.h` provides `dequantize_tile()` plus the reference
+  `unpack_weights_chunk()` / `unpack_record()`; `q4_0_hilo/unpack.aie.h`
+  provides `load_block_scales64()`.  The fused mmul paths reuse their format's
+  `dequantize_tile()`.
 - Each `layout.h` exposes tile-local `record_payloads()`, `record_scales()`,
   `block_payloads()`, `block_scales()`, and `chunk()` helpers for the device
   paths; keep these pointer computations out of the hot loops where possible.

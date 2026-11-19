@@ -28,32 +28,32 @@ the minimum of the compute limit (`weights/cycle * 1.5 GHz * 32`) and
 the memory limit (`55 GB/s / bytes-per-weight`). The fused mmul is the
 production path; standalone unpack cycle counts are diagnostic only.
 
-Measured 2026-11-18 on Linux 7.3.5 with the current compiler: Q8_0 7707
-cycles/tile (240.8 cycles/tile, 2.126 weights/cycle, exact canonical fp16
-scales); Q4_0 7883 cycles/tile (246.3, 2.078 weights/cycle, max abs error
-1.53e-4); Q4_0_packed16 7397 cycles/tile (231.16, 2.215 weights/cycle, max abs
-error 1.8125 under its named 5%-of-column policy).  The two Q4_0 variants use
-9216 packed bytes for the 256x64 case, so the 11.2% cycle reduction is the
-only kernel-level win.
+Measured 2026-11-18 on Linux 7.3.5 with the current compiler, 256x64 shape
+(fused totals, then per tile): Q8_0 7707 cycles (240.8 cycles/tile, 2.126
+weights/cycle, exact canonical fp16 scales); Q4_0 7883 cycles (246.3, 2.078
+weights/cycle, max abs error 1.53e-4); Q4_0_packed16 7397 cycles (231.16,
+2.215 weights/cycle, max abs error 1.8125 under its named 5%-of-column
+policy).  The exact and packed16 Q4_0 variants use the same 9216 packed bytes
+for this shape, so the only possible win is cycles: currently 6.2% (7397
+against 7883).
 
-The program variant was removed: with the exact path at 7883 cycles the
-kernel gap is 6.2%, and packed16 is near-exact rather than bit-exact.  The
-format and its tests stay in `src/quants`.  Details in
-`src/program/NOTES.md`.
+The program variant was removed and the format stays in `src/quants` with its
+tests; packed16 is near-exact rather than bit-exact, so it cannot serve as the
+unprefixed Q4_0.  Details in `src/program/NOTES.md`.
 
 ## Package layout
 
 ```text
 <format>/layout.h       packed transport-tile constants and pointer helpers
 <format>/repack.h       host-side canonical-to-tile conversion
-<format>/unpack.aie.h   device-side exact dequantization
+<format>/unpack.aie.h   device-side dequantization (exact except q4_0_packed16)
 <format>/mmul.aie.h     device-side fused dequantization and matrix multiplication
 common/                 shared tile shape, scale, repack, and mmul helpers
 tests/                  host repack shims, NPU harnesses, NumPy references
 ```
 
 Format names are canonical GGUF types; suffixes denote packed variants
-(`q4_0_hilo`, `q6_k_int8`).
+(`q4_0_packed16`, `q4_0_hilo`, `q6_k_int8`).
 
 Loop and compiler-optimization findings, including the pointer-increment and
 unroll-pragma results, are in `NOTES.md` under "Loop optimization and Peano

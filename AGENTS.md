@@ -2,7 +2,11 @@
 
 This repository builds and benchmarks AMD XDNA2 / AIE2P NPU kernels for
 quantized model inference. Correctness and measured cycles matter more than
-source-level cleverness.
+source-level cleverness. The point of the NPU path is productive inference
+without the machine's fans ramping up: it is chosen for efficiency, not peak
+throughput. Do not reject a design only because it is slower than the CPU or
+iGPU, and report temperature and fan context.  The measurement harness does
+not measure power; Tctl and fan RPM are the proxy.
 
 ## Documentation map
 
@@ -15,7 +19,12 @@ Read these before changing a kernel or its loop structure:
 - `src/program/NOTES.md` — fixed-program design, data flow, performance
   history, and rejected experiments.
 - `tests/bench/README.md` — standalone experiment staging area and how to run
-  probes on the NPU.
+  probes on the NPU; `tests/bench/soak/` holds the power/fan soak harnesses and
+  the measurement-configuration check.
+- `integrations/llama.cpp/README.md` — the experimental llama.cpp GGML backend
+  and how it is attached to a llama.cpp checkout (symlink plus a hook patch).
+  `integrations/llama.cpp/TODO.md` holds its design notes, measurements and
+  build recipes.
 - `~/Projects/llvm-aie/PERF_OPT_GUIDE.md` — Peano/clang loop and optimization
   guide.
 - `~/Projects/llvm-aie/llvm/lib/Target/AIE/AIE2Schedule.td`,

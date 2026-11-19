@@ -651,6 +651,10 @@ int main(int argc, char** argv) {
                   "upload", "txn", "input", "kernel", "unpack", "total");
       return run_head_timing(program, "q6_k_head", 10) ? 0 : 1;
     }
+    if (argc > 2 && std::string(argv[1]) == "--head-soak") {
+      // NPU-only soak: repeated head passes, one submission thread.
+      return run_head_timing(program, "q6_k_head", std::stoi(argv[2])) ? 0 : 1;
+    }
     if (argc > 1 && std::string(argv[1]) == "--cold-timing") {
       std::printf("%-22s %7s %7s %7s %7s %7s %7s %7s\n", "case", "prepare",
                   "upload", "txn", "input", "kernel", "unpack", "total");

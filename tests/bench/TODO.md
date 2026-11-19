@@ -20,19 +20,20 @@
   still apply one eight-column group at a time. The next step is a full
   4-subgroup apply that consumes the 32-lane terms, if the Q4_0/Q6_K work needs
   it.
-- **Decide between the Q4_0 scale paths using the fused path only.** Exact
-  exponent-add: fused 8328, 4160 B program. Packed16: fused 7397, 3808 B
-  program, but near-exact (~0.78% weight error, ~3.9% worst-case mmul error).
-  Standalone unpack numbers are diagnostic and no longer part of the decision.
-  Packed16 is close to `q4_0_hilo` at 288 bytes; it has a named 5%-of-column
-  mmul verification policy but still needs the Gemma model check before it can
-  replace the exact path.
+- **Packed16 is a format experiment, not a program variant.** The fused
+  comparison (exact exponent-add 8328 cycles / 4160 B against packed16 7397 /
+  3808 B, near-exact with ~0.78% weight error) was settled in favour of the
+  exact path: it improved to 7883 cycles, leaving packed16 a 6.2% kernel gap
+  with no frequency win. The program variant was removed; the format stays in
+  `src/quants` as an optional representation with its own named verification
+  policy. Do not add it back to `src/program` without a new reason.
 - **Phase out the `_x8` / `_x16` probes once no consumer needs them.** The
   default probe names are now the 32-wide batches. The narrow variants remain
   for history and for format-shaped cases such as a Q4_0 block's eight column
   scales. Audit consumers after the Q4_0 decision; if nothing needs them,
   remove the narrow probes rather than keeping them as permanent benchmarks.
-- **Keep clocks locked for cross-boot comparisons.** The latest two-term run
-  was on a rebooted kernel with unlocked clocks. Absolute cycles were stable
-  against the earlier run, but future comparisons should still be made within
-  one boot or with locked clocks.
+- **Compare within one boot.** Clocks are not locked: the measurement policy
+  deliberately avoids pmode/clock pins except the iGPU SCLK cap. The latest
+  two-term run was on a rebooted kernel and its absolute cycles matched the
+  earlier run, so cross-boot numbers are usable, but prefer per-value ratios
+  measured in one session.

@@ -1,7 +1,7 @@
 # NPU kernel notes
 
-Findings from optimizing the `src/quants` Q4_0, Q4_0_hilo, Q6_K, Q6_K_int8,
-and Q8_0 kernels on XDNA2 / AIE2P using Peano and IRON. The material is
+Findings from optimizing the `src/quants` Q4_0, Q4_0_packed16, Q4_0_hilo,
+Q6_K, Q6_K_int8, and Q8_0 kernels on XDNA2 / AIE2P using Peano and IRON. The material is
 organized as reusable AIE2 techniques, shared kernel patterns, and then
 format-specific results. Current status and future plans live in `TODO.md`;
 the quick summary lives in `README.md`.
@@ -61,8 +61,8 @@ the quick summary lives in `README.md`.
 ## Loop optimization and Peano idioms
 
 This is the general optimization playbook for Peano/AIE2P kernels in this
-package. It applies to every quant format, including Q4_0, Q4_0_hilo, Q6_K,
-Q6_K_int8, Q8_0, the K-quants, and the IQ formats. The measured examples below
+package. It applies to every quant format, including Q4_0, Q4_0_packed16, Q4_0_hilo,
+Q6_K, Q6_K_int8, Q8_0, the K-quants, and the IQ formats. The measured examples below
 come from a standalone 64-byte copy microbenchmark and a fixed-shape Q4_0
 experiment; the scratch sources were not kept, but the results are retained
 here. The conclusions are about Peano code generation, not about one quant
@@ -259,16 +259,16 @@ A fixed-shape 256x16 Q4_0 experiment is a useful counterexample: pointer
 increments, removing the outer column loop, shift-based fp16 decode, and manual
 record unrolling reached 2316 cycles, but the existing `q4_0` schedule is 2204.
 The loop is recurrence-bound, not address-bound, so the copy-loop win does not
-transfer. `q4_0_hilo` (1896 cycles) and a relaxed single-bf16 scale variant
-(2168 cycles, 2.14 max abs error) are the only faster options, and both change
-the exactness/repack contract.
+transfer. `q4_0_hilo` (1896 cycles) is faster and still exact, but it changes
+the repack/size contract; a relaxed single-bf16 scale variant (2168 cycles,
+2.14 max abs error) is faster still and gives up exactness.
 
 ## Reusable AIE2 techniques
 
 These are the API and code-generation findings worth carrying into future
 quantized operations. They were checked against the mlir-aie docs, the
-programming guide, `third_party/aie_api/include/aie_api/aie.hpp`, and the
-`aie_api` examples.
+programming guide, the `aie_api` headers shipped with mlir-aie
+(`include/aie_api/aie.hpp`), and its examples.
 
 ### int4 vectors and conversions
 
@@ -444,8 +444,8 @@ programming guide, `third_party/aie_api/include/aie_api/aie.hpp`, and the
   `fetch` accepts at most 32 indices per call and returns at most 32 8/16-bit
   values (16 for 32-bit values), so a 64-lane tile needs two fetches.
 - 8-bit values are stored as 16-bit LUT entries. The `aie::lut<4, OffsetType,
-  SlopeType>` wrapper hides the required 4-way interleaved layout; see
-  `third_party/aie_api/examples/lookup_table.cpp`. Construct the
+  SlopeType>` wrapper hides the required 4-way interleaved layout; see the
+  `lookup_table` example shipped with `aie_api`. Construct the
   `parallel_lookup` object once, outside the loop. Out-of-range policy is
   `saturate` by default, `truncate` optional.
 - Store the codebook in the LUT output type. For IQ4_NL, storing the small
@@ -596,7 +596,8 @@ What did not help:
   exact exponent-add split, including subnormals, so the `|d| < 64` pre-bias
   limit and its repack failure path are gone. This is exact over the whole
   finite fp16 scale range and also faster than the pre-biased 8-wide path:
-  8242 -> 7707 cycles for 256x64, 1.988 -> 2.126 weights/cycle. It costs
+  8242 -> 7707 cycles for 256x64 (7792 after the intermediate step),
+  1.988 -> 2.126 weights/cycle. It costs
   program memory (2624 -> 7168 B) and stack (1216 -> 2816 B) because the exact
   split is inlined. The pre-bias helpers (`fp16_prebias_scale`,
   `load_fp16x8_biased`) and the then-unused `split_bf16_hi_lo` were removed;
@@ -606,7 +607,7 @@ What did not help:
 - The real Gemma 4 E2B Q6_K `token_embd` output head contains subnormal fp16
   scales. The host hi/lo `d` split above makes those values exact; the synthetic
   Q6_K golden now mixes normal and subnormal `d`, and its verification checks
-  relative error so a flushed block cannot pass. The `ggml-spiral` backend now
+  relative error so a flushed block cannot pass. The `ggml-spiral` backend (`integrations/llama.cpp`) now
   re-enables native Q6_K after regenerating packed weights; its real-head slice
   check passes (max_abs 0.026 on max_cpu 10.07) and the Q4_0 Gemma model
   output matches CPU.
@@ -617,8 +618,8 @@ What did not help:
   split, which handles subnormals without the old `|d| < 64` pre-bias limit.
 - The exact exponent-add Q4_0 path decodes both column records' 16 scales into
   one 32-lane batch in the fused kernel. It measures 7883 cycles for 256x64
-  against 8720 for the previous pre-biased path, with program memory growing
-  from 2752 to 4048 bytes and the stack frame to 2496 bytes. Standalone unpack
+  against 8720 for the previous pre-biased path (8328 after the first tuning
+  step described below), with program memory growing from 2752 to 4048 bytes and the stack frame to 2496 bytes. Standalone unpack
   regressed from 5261 to 6579 cycles, but that path is now a diagnostic
   correctness reference and does not drive the production decision.
 - The shared split now computes `E << 7` once and reuses it for both terms,
@@ -699,7 +700,8 @@ exponent-add split. `q4_0_packed16` also uses 288 bytes but stores a
 host-packed 16-bit scale code; it is near-exact and has its own verification
 policy.
 
-Results at the measured 1.8 GHz H clock:
+Results at the measured 1.8 GHz H clock (the host-interface clock of the
+AIE array; per-kernel cycles come from `event0`/`event1`):
 
 | variant | shape | cycles | cycles/tile | weights/cycle | compute-implied 32-core GB/s |
 | :-- | --: | --: | --: | --: | --: |
@@ -710,7 +712,8 @@ Results at the measured 1.8 GHz H clock:
 At 288 bytes, `q4_0` and `q4_0_packed16` retain the bandwidth advantage over
 the 320-byte `q4_0_hilo` (about 98B weights/s at 1.8 GHz versus 88B). The exact
 path is compute-bound at 1.5 GHz (about 94B); packed16 raises the compute
-ceiling but still needs the model check before it can replace the exact path.
+ceiling, but it was trialled in the program and dropped (the exact path left a
+6.2% gap), so it stays a named quants-format experiment.
 
 Standalone unpack at 256x64: 6579 cycles for the canonical exact `q4_0`,
 5459 for `q4_0_packed16`, and 2916 for `q4_0_hilo`. Unrolling the packed16
@@ -723,8 +726,8 @@ near-exact rather than bit-exact: the Q4_0 reference reports about 0.78% maximum
 relative weight error, and the fused mmul check has about 3.9% maximum relative
 output error (0.18% mean) because cancellation amplifies the scale error. It
 therefore uses a named near-exact mmul policy (5% of the per-column output
-scale) and still needs the Gemma model check; it does not pass the exact
-tolerance used by the other Q4_0 variants.
+scale) and does not pass the exact tolerance used by the unprefixed Q4_0, which
+is why it cannot be the production path.
 
 The fast single-bf16 mode measured 2119 cycles at 64 columns on the old layout
 but is not exact.
@@ -795,9 +798,9 @@ multiplies. This remains exact for canonical scales up to 127.
 
 Instruction memory: native `q6_k` uses 4992 of the 16384-byte AIE2P
 compute-tile program memory (30.5%), `q6_k_int8` uses 4368 bytes (26.7%) with
-its chunk loop rolled, `q4_0_hilo` uses 3632 bytes (22.2%), `q4_0` uses 4160
-bytes (25.4%), `q4_0_packed16` uses 3808 bytes (23.2%), and `q8_0` uses 2624
-bytes (16.0%).
+its chunk loop rolled, `q4_0_hilo` uses 3632 bytes (22.2%), `q4_0` uses 4048
+bytes (24.7%), `q4_0_packed16` uses 3808 bytes (23.2%), and `q8_0` uses 7168
+bytes (43.8%).
 
 Rejected or alternate approaches:
 

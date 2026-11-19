@@ -65,12 +65,15 @@ over peak bandwidth.
 - [x] Combined column matmuls: `Program::prepare(shape, WeightSegment[],
       count)` concatenates segments along `weights_cols`; `--combined-timing`
       benchmarks gate+up and Q+K+V and now verifies every segment.
-- [x] `./test --cold-timing` alternates two resident BOs to measure the real
-      per-layer streaming cost instead of the warm-cache number.
-- [x] The llama.cpp `ggml-spiral` backend now chains consecutive `MUL_MAT`s
-      with the same input data and K into one wide call (up to four
-      segments).  Gate+up is the beneficiary in Gemma; pp8 improved from
-      106.1 to 122.2 t/s and tg1 from 16.2 to 17.5 t/s.  Chaining across
+- [x] `./test --cold-timing` alternates several resident BOs
+      (`SPIRAL_COLD_BOS`) to measure the real per-layer streaming cost instead
+      of the warm-cache number.
+- [x] The `ggml-spiral` backend (`integrations/llama.cpp`) now chains
+      consecutive `MUL_MAT`s with the same input data and K into one wide call
+      (up to four segments).  Gate+up is the beneficiary in Gemma; pp8
+      improved from 106.1 to 122.2 t/s and tg1 from 16.2 to 17.5 t/s in that
+      session, which predates the current pmode baseline, so those absolute
+      values are not comparable with `NOTES.md`'s throughput table.  Chaining across
       intervening ops is unsafe because the scheduler reuses compute buffers
       based on graph-order lifetimes.  Combined handles duplicate the paired
       weights in NPU BOs and cost ~1 s to prepare on the first graph.
@@ -108,9 +111,9 @@ over peak bandwidth.
       a 300-token generation 15.2-15.3 vs 16.8-17.3 t/s (-10% on).  Default
       off because decode dominates.
 - [x] Real-query baseline: Gemma E2B Q4_0, native Q6_K head, one CPU
-      fallback thread.  Spiral NPU: 17.71 t/s on a 300-token answer (56.5
-      ms/token), `tg16` 18.3, `pp8` 112.2.  CPU (`-ngl 0`, 12 threads):
-      34.32 t/s (29.1 ms/token), `tg16` 36.1, `pp8` 225.0.
+      fallback thread.  Spiral NPU: 17.78 t/s on a 300-token answer (56.2
+      ms/token), `tg16` 18.47, `pp8` 111.5.  CPU (`-ngl 0`, 12 threads):
+      35.78 t/s (28.0 ms/token), `tg16` 35.34, `pp8` 224.1.
 - [x] Wait stalls: resolved.  The 45-50 ms `wait_us` spikes were host CPU
       quota throttling (kernel tracing showed the submitting thread switched
       out while runnable, no device activity in the window).  With the quota
@@ -129,7 +132,12 @@ over peak bandwidth.
 
 ## Planned
 
-1. **Performance tuning** (only after correctness).  Priority order:
+1. **Productive, quiet operation** (only after correctness).  Peak t/s is not
+   the metric: prefer configurations that keep the machine cool and quiet,
+   then reduce host CPU work and heat.  Priority order:
+   - use the temperature/fan baseline (signals and procedure are in
+     `NOTES.md` under "Efficiency acceptance"); judge PM QoS and thread-count
+     choices with it, not with t/s alone;
    - use the production baseline in `NOTES.md`; the streaming path is now
      at the PoC throughput.  The remaining fixed cost is per-call
      launch/dispatch (~60-70 us), so the next lever is fewer calls or batching,
@@ -180,6 +188,10 @@ over peak bandwidth.
 8. **Remaining loop experiment:** `always_inline` on `unpack_mmul`; measure
    `.text`, stack, and cycles.  Do not pointer-rewrite the record/input loops
    (q4_0 counterexample shows a 2–4% regression).
+9. **NPU+iGPU split (parked).**  The first llama.cpp attempt places a 75/25
+   layer split correctly but fails on cross-device views; it is parked until
+   the NPU path is closer to competitive, ideally at a 50/50 split on a much
+   larger model.  The per-call, per-tensor interface is kept for that.
 
 ## Open risks
 

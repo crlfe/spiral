@@ -6,7 +6,8 @@ wrapper.  The C++ path generates runtime-sized fills and transfers only the
 live inputs and weight blocks; the Python runner keeps the simple fixed-max
 fill pattern for its test suite.  The first target is the Gemma 4 E2B matmul
 set plus its Q6_K output head; row lookups and the F16 per-layer CPU
-projection are out of scope.
+projection are out of scope.  The design targets productive, quiet inference:
+the NPU is used for efficiency, not to beat the CPU or iGPU on throughput.
 
 ```
 design.py           fixed geometry, buffer types, config layout
@@ -153,7 +154,9 @@ splits the output columns.  Segments must share `format` and `weights_rows`.
 
 ## Performance snapshot
 
-Production medians (device kernel time):
+Production medians (device kernel time).  This is a single-session
+snapshot; `NOTES.md` records its provenance, and it predates the current
+measurement baseline, so use it for kernel shapes, not as a live comparison:
 
 | case | kernel µs |
 | :-- | --: |
@@ -163,7 +166,8 @@ Production medians (device kernel time):
 | Q6_K 1536x6144 | ~234 |
 | Q6_K head, 11 chunks | ~8200 total |
 
-The per-call launch/fixed floor is ~60-70 us.  In the combined-column
+The per-call launch/fixed floor is ~80 us including fill (~60-70 us of host
+launch).  In the combined-column
 benchmark, gate+up plus Q+K+V saves about 5.4 ms/token, taking the
 launch-limited E2B estimate to ~19.8 tok/s (about 21 tok/s kernel-only).  The
 memory-bound estimate is ~40 tok/s; the remaining gap is call/launch overhead.

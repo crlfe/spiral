@@ -10,8 +10,16 @@ Active tasks and the current work plan live in `TODO.md`; usage lives in
 One loaded NPU program (one xclbin) executes Q4_0 and Q6_K matmuls at
 runtime-varying dimensions.  It is built from Python and called through a
 small C++ wrapper.  The first target is the Gemma 4 E2B Q4_0 matmul set plus
-its Q6_K output head.  Correctness and data-flow stability come before peak
-bandwidth.
+its Q6_K output head.
+
+The objective is productive inference on the NPU: correct output at usable
+interactive rates while the machine stays quiet and cool.  The NPU is chosen
+for efficiency, not peak throughput, so the CPU and iGPU figures in this file
+are comparison baselines rather than targets to beat.  Correctness and
+data-flow stability come before any throughput tuning.  A later phase may
+split work between the NPU and the iGPU in llama.cpp, but that is parked until
+the NPU path is closer to competitive; the fixed program keeps a per-call,
+per-tensor interface so a second backend can own a disjoint tensor set.
 
 Out of scope: the `per_layer_token_embd` and `token_embd` row lookups, and the
 F16 `per_layer_model_proj` CPU projection.  Only the `token_embd` output-head
@@ -302,21 +310,124 @@ build.
 
 Gemma 4 E2B Q4_0, native Q6_K head, 30-token prompt and a 300-token greedy
 answer (`llama-completion -no-cnv --ignore-eos --temp 0`, one CPU fallback
-thread; PM QoS is off, see below).
+thread; PM QoS off, iGPU SCLK capped at 2400 MHz, NPU pmode `turbo`).
 
 | device | pp8 | tg16 | 300-token generation | per token |
 | :-- | --: | --: | --: | --: |
-| Spiral NPU | 112.2 t/s | 18.3 t/s | 17.71 t/s | 56.5 ms |
-| CPU (`-ngl 0`, 12 threads) | 225.0 t/s | 36.1 t/s | 34.32 t/s | 29.1 ms |
+| iGPU (`ROCm0`, gfx1150) | 383.1 t/s | 55.30 t/s | 55.11 t/s | 18.1 ms |
+| CPU (`-ngl 0`, 12 threads) | 224.1 t/s | 35.34 t/s | 35.78 t/s | 28.0 ms |
+| Spiral NPU | 111.5 t/s | 18.47 t/s | 17.78 t/s | 56.2 ms |
 
-The NPU is about 2x slower than the CPU on this model.  Both are dominated by
-streaming the same ~1.4 GB/token of active weights, and the NPU path adds the
-~80 us per-call floor (see the cost model below) plus the PCIe hop.  Decode
-makes ~240 NPU calls/token, so ~19 ms/token is fixed launch/fill overhead.
+The NPU is the slowest of the three in throughput on this model and the iGPU
+the fastest; that is context, not the objective (see "Goal and scope").
+Temperature and fan behaviour are the acceptance criteria; the measurement
+recipe and acceptance bar are summarised under "Efficiency acceptance" below.
+
+All three paths stream the same ~1.4 GB/token of active weights; the NPU path
+adds the ~80 us per-call floor (see the cost model below) plus the PCIe hop.  Decode makes ~240 NPU calls/token, so ~19 ms/token
+is fixed launch/fill overhead.
 
 `SPIRAL_CPU_THREADS=1` is best for the NPU path (2/4/8 give 16.8/14.5/10.5
 t/s `tg16` and 106/95/68 t/s `pp8`); the CPU path peaks at 12 threads
 (36.1 t/s `tg16`, 225 t/s `pp8`).
+
+### Efficiency acceptance
+
+The program is judged on productive-but-quiet behaviour, not peak throughput.
+For every device comparison run record:
+
+| signal | source |
+| :-- | :-- |
+| CPU temperature | `k10temp` `temp1_input` (Tctl) |
+| iGPU temperature | `amdgpu` hwmon `temp1_input` |
+| fan speed | both `hp` fans (`fan1_input`, `fan2_input`) |
+| host CPU utilisation | `/proc/stat` busy delta |
+| NPU clocks | `DRM_IOCTL_AMDXDNA_GET_INFO` (MP-NPU and H) |
+| throughput | `pp8`, `tg16`, a 300-token generation |
+
+Power is not measured.  Package RAPL is root-only in the measurement container
+and socket power has to be integrated from a coarse sensor, so fan RPM and Tctl
+are the user-visible proxy with far fewer approximations.
+
+Procedure: cool to the idle baseline (fans off, Tctl below ~45 C), then run
+a long greedy generation per device (thousands of tokens) while sampling every
+0.5 s, and keep going until Tctl and fan RPM have been flat for
+20 s so the peaks are steady-state rather than an artifact of a short task.
+Report peak Tctl/fan and throughput, then let the device cool back to the idle
+baseline (fan 0, Tctl within 2 C) before starting the next device.  Proposed
+acceptance: the run stays at a usable rate with fan RPM within ~150 of idle and
+Tctl within ~10 C of the idle reading.
+
+No current path meets this bar (the quietest, FastFlowLM, still reaches 54 C
+and 2.8k RPM), so treat it as the target rather than a pass/fail gate.
+
+Measured on Gemma E2B with steady-state soaks: 3000 tokens per device, one
+submission thread, sampling at 0.5 s, peaks taken after the 20 s plateau
+window, then cool-back to the idle baseline (fan 0, Tctl within 2 C).  CPU and
+iGPU run through llama.cpp as the comparison harness; the NPU runs through
+this program with one CPU fallback thread; PM QoS off.
+
+Benchmark baseline: the machine's normal boot state, the iGPU SCLK capped at
+2400 MHz (`manual` DPM, OD bounds 600-2400 against a 600-3100 MHz hardware
+range), platform profile `balanced`, CPU governor `powersave`, PM QoS off, and
+NPU pmode `turbo`.  pmode is the one
+performance knob that matters: it is worth ~11% on NPU decode (16.4 vs
+14.7 t/s) at identical clocks and temperatures, and it does not survive a
+reboot, so a `spiral-npu-tune` systemd unit re-applies it.  fclk and socclk are
+left on DVFS; pinning them was measured to change nothing (14.64 and 14.65 t/s
+against 14.70).  `tests/bench/soak/hostconfig.py` checks the controlled settings
+and aborts on drift.
+
+| engine | tokens | t/s | peak Tctl | peak iGPU | fan1 | fan2 | plateau | cool-back |
+| :-- | --: | --: | --: | --: | --: | --: | --: | --: |
+| iGPU (`ROCm0`) | 3000 | 52.42 | 54.2 C | 54.0 C | 2793 | 2597 | none in 59 s | 123 s |
+| FastFlowLM (`gemma4-it:e2b`) | 3000 | 25.75 | 54.0 C | 48.0 C | 2818 | 2626 | none in 117 s | 194 s |
+| CPU (12 threads) | 3000 | 22.17 | 91.0 C | 56.0 C | 4845 | 4657 | none in 138 s | 126 s |
+| Spiral NPU | 3000 | 16.15 | 73.6 C | 56.0 C | 4834 | 4657 | 65 s | 121 s |
+
+FastFlowLM runs its own quantisation and packing, so that row is a model-class
+comparison; the other three share the same Q4_0 GGUF with the native Q6_K
+head.  Its 3000-token run was driven through its OpenAI-compatible endpoint
+with `tests/bench/soak/endpoint.py`.
+
+The short-run "no fan" result for the iGPU and CPU was an artifact of task
+length: both ramp the fans once the soak is long enough, so steady-state peaks
+are the numbers to use.  The CPU row varied between 19.6 and 22.8 t/s across
+runs at the same settings.
+
+Both fans are on the `hp` hwmon and always move together, roughly 150-200
+RPM apart, so neither belongs to a single sensor; they follow one EC curve.
+The curve has a knee just above 53 C: a FastFlowLM run that peaked at 53.1 C
+finished with both fans at zero, while the repeat at 54.0 C sat at 2.8k.  Above
+that the EC jumps to ~4.8k for CPU-heavy runs.
+
+That separates the two kinds of NPU heat.  FastFlowLM and the Spiral backend
+run the same NPU at the same MP (compute) and H (host-interface) clocks
+(1408/2112 MHz) and a similar decode
+shape, yet Spiral peaks at 73.6 C / 4.8k RPM against FastFlowLM's 54.0 C /
+2.8k RPM.  The NPU-only loop below shows the NPU alone lands at the lower
+level, so the rest is the ~9 ms/token CPU fallback and host submission:
+removing the softcap fallback should bring the Spiral path close to
+FastFlowLM's fan behaviour.
+
+The iGPU is the fastest path (52.4 t/s) and sits at 2.8k RPM.  The CPU is the
+hottest at 91.0 C and throttles.  The NPU path sustains 16.2 t/s but spins both
+fans to ~4.8k RPM because of its host-side work, not the NPU itself.
+
+That is a property of this workload - ~240 NPU calls/token plus ~9 ms/token of
+CPU fallback on a memory-bound model - not of NPU work in general; reducing
+calls and the softcap fallback should move fan behaviour as much as
+throughput.
+
+An NPU-only busy loop (`./test --head-soak 20000`: repeated 11-chunk head
+passes, one submitting thread) separates NPU heat from host work.  Over 152 s
+the CPU was 1% busy, yet the sensors read Tctl 60.6 C, iGPU 49.0 C and fans
+2818/2626 RPM.  So the NPU's heat appears in both the CPU control temperature
+and the iGPU/SoC sensor and spins the fans with no CPU activity.  The same loop
+runs ~4% faster under pmode `turbo` (152.3 s vs 155-159 s) at the same
+temperatures; the head loop is less sensitive than decode, so this is not
+the ~11% decode gain.  During real decode the fans are higher still (4.8k RPM)
+because that path also runs the CPU fallback and host submission.
 
 Kernel optimization levels were measured on the production build before the
 loop-idiom changes.  Peano compiles kernels with `-O2` by default; per-kernel
@@ -344,10 +455,14 @@ Loop-idiom changes (`program_zero`, carry copy):
   regresses (1536x512 ~138-142 us vs ~127-130, large shapes no better).
   Keep the rolled attempt loop.
 
-### Locked-clock baseline and head chunking
+### Production medians (historical)
 
-With clocks locked and no competing benchmarks, the production medians
-(5 runs) before the head/dynamic-zero changes were:
+This is a single-session snapshot (5 runs, no competing benchmarks) taken
+before the head/dynamic-zero changes and before the current measurement
+baseline existed.  Use it as a device-kernel reference, not as a live
+comparison; the current baseline and procedure are under "Efficiency
+acceptance".
+
 
 | case | kernel med (us) | range |
 | :-- | --: | --: |
@@ -452,7 +567,7 @@ QKV, taking the launch-limited estimate from 55.83 ms / 17.9 tok/s to about
 
 ### Cold weight streaming
 
-The llama.cpp backend sees each layer's weights once per token, so the warm
+The llama.cpp backend (`integrations/llama.cpp`) sees each layer's weights once per token, so the warm
 standalone benchmark understates the real per-call cost.  `./test
 --cold-timing` prepares several resident BOs for the same shape and cycles
 through them to defeat the last-level cache.  It reports min/p50/p95/max, and
@@ -526,7 +641,7 @@ runs each, alternating order):
 
 Prompt processing gains because it is host-submission heavy and avoids CPU
 idle-state exits; decode loses because holding every CPU out of deep idle
-raises package power and lowers boost clocks while the NPU is the bottleneck.
+raises CPU power draw and lowers boost clocks while the NPU is the bottleneck.
 That is why PM QoS is off by default; enable it for prompt-heavy workloads.
 
 **Idle gaps are expensive.**  Inserting a sleep between calls (NPU idle,

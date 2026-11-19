@@ -26,6 +26,15 @@ in `float16_bench.aie.h`. Every probe reports cycles, values per iteration, a
 correctness number against a NumPy reference, and the compiler diagnostic for
 anything that does not build.
 
+## Device and soak harnesses
+
+[`soak/`](soak/README.md) is separate from the kernel probes: it measures whole
+system behaviour (Tctl, iGPU temperature, both fan tachometers and NPU clocks)
+for the CPU, iGPU and NPU paths. Its harnesses verify the measurement
+configuration first — NPU power mode, iGPU DPM bounds, platform profile, CPU
+governor and PM QoS — and refuse to measure when it drifts, so runs stay
+comparable with the recorded tables.  Power is not measured.
+
 ## Running
 
 Activate the MLIR-AIE environment, then run from this directory:
