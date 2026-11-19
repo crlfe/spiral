@@ -349,26 +349,29 @@ struct Program::Impl {
     }
     busy.assign(static_cast<size_t>(depth), false);
 #if defined(__linux__)
-    if (std::getenv("SPIRAL_NO_DMA_LATENCY") == nullptr) {
+    // PM QoS is opt-in: keeping the CPU out of deep idle helps prompt
+    // submission but costs decode, so the default leaves the node alone.
+    const char* enable = std::getenv("SPIRAL_DMA_LATENCY");
+    if (enable != nullptr && *enable != '\0' &&
+        std::strcmp(enable, "0") != 0) {
       const char* latency_path = std::getenv("SPIRAL_DMA_LATENCY_PATH");
-      if (latency_path == nullptr) {
+      if (latency_path == nullptr || *latency_path == '\0') {
         latency_path = "/dev/cpu_dma_latency";
       }
       dma_latency_fd = ::open(latency_path, O_WRONLY);
       if (dma_latency_fd < 0) {
-        std::fprintf(stderr,
-                     "spiral: %s unavailable (%s); PM QoS unchanged\n",
-                     latency_path, std::strerror(errno));
-      } else {
-        const uint32_t zero = 0;
-        if (::write(dma_latency_fd, &zero, sizeof(zero)) !=
-            static_cast<ssize_t>(sizeof(zero))) {
-          std::fprintf(stderr,
-                       "spiral: cpu_dma_latency write failed (%s)\n",
-                       std::strerror(errno));
-          ::close(dma_latency_fd);
-          dma_latency_fd = -1;
-        }
+        throw std::runtime_error(
+            std::string("SPIRAL_DMA_LATENCY: cannot open ") + latency_path +
+            ": " + std::strerror(errno));
+      }
+      const uint32_t zero = 0;
+      if (::write(dma_latency_fd, &zero, sizeof(zero)) !=
+          static_cast<ssize_t>(sizeof(zero))) {
+        const std::string error = std::strerror(errno);
+        ::close(dma_latency_fd);
+        dma_latency_fd = -1;
+        throw std::runtime_error(std::string("SPIRAL_DMA_LATENCY: write ") +
+                                 latency_path + " failed: " + error);
       }
     }
 #endif

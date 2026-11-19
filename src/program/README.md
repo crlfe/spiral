@@ -80,7 +80,8 @@ idle gap between calls to measure the power-state penalty.  `--pipeline-timing`
 runs the head through the `submit`/`finish` queue; `SPIRAL_PIPELINE_SLOTS`
 sets the in-flight slot count (default 2).  `SPIRAL_LOOKAHEAD=1` enables the
 experimental cross-node look-ahead (off by default; neutral on Gemma).
-`SPIRAL_NO_DMA_LATENCY=1` disables holding `/dev/cpu_dma_latency` at 0;
+`SPIRAL_DMA_LATENCY=1` opts into holding `/dev/cpu_dma_latency` at 0 (default
+off; it helps prompt processing but costs decode), and
 `SPIRAL_DMA_LATENCY_PATH` overrides the node path.  `--all-timing` measures every
 golden case with prepared weights.
 
@@ -152,7 +153,7 @@ splits the output columns.  Segments must share `format` and `weights_rows`.
 
 ## Performance snapshot
 
-Locked-clock production medians:
+Production medians (device kernel time):
 
 | case | kernel µs |
 | :-- | --: |

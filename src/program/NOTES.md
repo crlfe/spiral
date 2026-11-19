@@ -301,37 +301,22 @@ build.
 ### Real-query throughput
 
 Gemma 4 E2B Q4_0, native Q6_K head, 30-token prompt and a 300-token greedy
-answer (`llama-completion -no-cnv --ignore-eos --temp 0`):
+answer (`llama-completion -no-cnv --ignore-eos --temp 0`, one CPU fallback
+thread; PM QoS is off, see below).
 
-| device | prompt eval | generation | per token |
-| :-- | --: | --: | --: |
-| Spiral NPU, PM QoS held | 114-121 t/s | 7.50-7.61 t/s | 131-133 ms |
-| Spiral NPU, PM QoS off | 109 t/s | 7.12 t/s | 140 ms |
-| CPU (`-ngl 0`) | 152 t/s | 9.93 t/s | 101 ms |
+| device | pp8 | tg16 | 300-token generation | per token |
+| :-- | --: | --: | --: | --: |
+| Spiral NPU | 112.2 t/s | 18.3 t/s | 17.71 t/s | 56.5 ms |
+| CPU (`-ngl 0`, 12 threads) | 225.0 t/s | 36.1 t/s | 34.32 t/s | 29.1 ms |
 
-After moving from Linux 7.0 / amdxdna 0.7.0 to Linux 7.3 / amdxdna 0.10.0
-(firmware `npu_7.sbin`), with clocks **unlocked** and PM QoS held:
+The NPU is about 2x slower than the CPU on this model.  Both are dominated by
+streaming the same ~1.4 GB/token of active weights, and the NPU path adds the
+~80 us per-call floor (see the cost model below) plus the PCIe hop.  Decode
+makes ~240 NPU calls/token, so ~19 ms/token is fixed launch/fill overhead.
 
-| run | prompt eval | generation |
-| :-- | --: | --: |
-| 300 tokens, PM QoS on | 133-155 t/s | 7.95-8.10 t/s |
-| 300 tokens, PM QoS off | 139 t/s | 7.56 t/s |
-| `tg16` benchmark | - | 8.82 t/s (off: 7.75) |
-| `pp8` benchmark | - | 62.1 t/s (off: 54.8) |
-
-The kernel update did not remove the wait stalls, but throughput improved and
-PM QoS became more valuable with unlocked clocks (~6-14%).
-
-The 7.0 128-token profile split 128 ms/token into ~52 ms clean NPU calls,
-~56 ms of the 50 ms wait stalls (1.1/token), and ~20 ms host/CPU.  On 7.3 the
-same split is ~54 ms clean, ~45 ms stalls, ~20 ms host, or 118-126 ms/token.
-The per-call budget is already close to the streaming limit; the stalls remain
-the largest single term.
-
-The entries above are historical and predate dynamic zero, 48-band head
-chunking, and the combined column calls.  Current locked-clock rates and the
-large-shape PoC comparison are in “Locked-clock baseline and head chunking”
-and “Streaming gap versus the PoC” below.
+`SPIRAL_CPU_THREADS=1` is best for the NPU path (2/4/8 give 16.8/14.5/10.5
+t/s `tg16` and 106/95/68 t/s `pp8`); the CPU path peaks at 12 threads
+(36.1 t/s `tg16`, 225 t/s `pp8`).
 
 Kernel optimization levels were measured on the production build before the
 loop-idiom changes.  Peano compiles kernels with `-O2` by default; per-kernel
@@ -497,8 +482,8 @@ So naive `bytes / total_time` understates the streaming rate badly:
 
 - 12288x1536 median: 10.6 MB / 300 us = 35 GB/s, but removing the 80 us
   launch gives ~48 GB/s.
-- Decode average over many calls is lower again because of sporadic stalls
-  (see below), which is where the earlier "24 GB/s" figure came from.
+- Decode averages lower per call because the fixed floor is amortised over
+  smaller transfers.
 - The PoC's 54-58 GB/s was streaming-only (`skip_mmul`, `skip_copy`) after
   subtracting a launch floor, so 48 GB/s incremental is only ~10-20% below it.
 
@@ -512,126 +497,43 @@ ended exactly at the last L2 block.  The device prefetches one block ahead
 while streaming, so the last group read past the mapping and raised AMD-Vi
 `IO_PAGE_FAULT`s (about 10 per 4-token run, visible in `dmesg`).  The BO now
 has one zeroed `kL2StreamBytes` guard block after the data; a 4-token run
-produces zero faults.  This is a stability fix, not the cause of the 50 ms
-stalls below.
+produces zero faults.  This is a stability fix, not a throughput item.
 
-**Sporadic stalls.**  The median is stable, but runs contain a `wait_us`
-spike of 46-62 ms.  With `RunTimings::start_us/wait_us/sync_us` split out, the
-spike is entirely in `wait_us` (`start` ~5 us, `sync` ~15 us), so the device
-or the wait is responsible, not host packing or output unpack.
+**Wait stalls.**  `wait_us` stays in the microsecond range: a 64-token run
+has no call above 15 ms, median wait ~95 us, and the device job lifecycle
+(`job pushed` -> `sent to device` -> `signaled fence`) is at most ~2.6 ms.
+Kernel tracing of an earlier run that did show 45-50 ms `wait_us` spikes found
+the submitting thread switched out while runnable and resumed ~47 ms later on
+an idle CPU, with no driver, PM or IOMMU activity in the window: the spikes
+were host CPU-quota throttling, not the NPU.  No stall workarounds are needed.
 
-A 127-token profiled generation (7.81 t/s, 128 ms/token) quantified them:
+**CPU DMA latency / PM QoS.**  PM QoS is opt-in.  When `SPIRAL_DMA_LATENCY`
+is set to a non-empty value other than `0`, `Program` opens
+`/dev/cpu_dma_latency` (or `SPIRAL_DMA_LATENCY_PATH`), writes `uint32_t(0)`,
+and holds the fd until the Program is destroyed, asking the kernel to keep the
+CPU out of deep idle states while it waits on the NPU.  If the request is
+enabled but the node cannot be opened or written, the Program throws instead
+of silently continuing without it.  The default leaves the node alone.
 
-| metric | value |
-| :-- | --: |
-| stalls > 15 ms | 141 (1.10/token) |
-| stall size | 45.9 / 50.6 / 61.7 ms (min/median/max) |
-| tokens with 0 / 1 / 2 stalls | 7 / 101 / 20 |
-| stall cost | 56.1 ms/token |
-| clean NPU calls | 51.6 ms/token |
+The effect is workload-dependent (Gemma E2B, one CPU fallback thread, three
+runs each, alternating order):
 
-They land at random positions in the token, with a mild bias toward the first
-matmul after the inter-token CPU gap.  At ~1.1 per 128 ms token that is about
-8-9 stalls per second of wall time.
-
-Ruled out: 5000 standalone iterations stayed under 4.4 ms max (p95 ~305 us),
-256 resident BOs did not reproduce it, host CPU/memory stress had little
-effect, idle gaps up to 50 ms only reached ~1 ms, the AMD-Vi over-read was
-fixed (fault count is flat), and PM QoS/clock changes did not change the
-frequency or size.  The pattern looks like a fixed ~50 ms preemption or
-firmware event.  With the stalls removed the same run would be about
-`128 - 56 = 72 ms/token`, or ~14 tok/s.  The next test is an idle machine
-with no other `/dev/accel0` users; `pmode` remains permission-locked here.
-
-On Linux 7.3 / amdxdna 0.10.0 the stalls remain: a 127-token run had 124
-stalls (0.97/token), median 46.9 ms, costing 45.4 ms/token, with clean calls
-at 53.5 ms/token.  There were no `IO_PAGE_FAULT`s.  Linux 7.3.5-custom with
-the same driver/firmware produced the same result over 256 tokens
-(1.00 stall/token, median 47.7 ms, 47.8 ms/token, clean 55.2).  So neither the
-7.3 point release nor the driver update eliminated the fixed ~47 ms wait
-event.
-
-**Where the wait happens.**  `strace -f -tt -T` on a model run shows the
-stall is a single `ioctl` on the NPU DRM fd:
-
-    ioctl(3, _IOC(_IOC_READ|_IOC_WRITE, 0x64, 0x46, 0x38), ...) = 0 <0.045-0.052>
-
-`0x64/0x46` is `DRM_AMDXDNA_EXEC_CMD` (`DRM_COMMAND_BASE + 6`, size
-`struct amdxdna_drm_exec_cmd`) - the command-submit ioctl.  The paired
-`DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT` calls are microseconds, so the host wait is
-not the stall.  In the 45-52 ms windows there are no mmap/munmap/madvise or
-futex calls from any thread, and sampling `/proc/<pid>/task/<tid>/wchan` shows
-the submitting thread in state R (wchan 0), not sleeping.
-
-The driver path is `amdxdna_drm_submit_cmd_ioctl` ->
-`aie2_cmd_submit` (`aie2_ctx.c`), which does `down(job_sem)` (4 credits),
-GEM reservation locks, optional HMM populate, runtime-PM resume, and
-`drm_sched_entity_push_job`.  Which of those blocks is not visible without
-kernel tracing (`/sys/kernel/tracing` and the `amdxdna` module parameters are
-root-only here; `perf` has no 7.3.5 build).
-
-A pure NPU loop does not reproduce it: `--pipeline-timing` (220 head calls)
-had zero long ioctls, and cycling 96 large resident BOs for 800 iterations
-stayed at p50 282 us / max 2.8 ms.  It needs the model's interleaving of NPU
-calls with CPU fallback, even though no user memory activity appears in the
-stall window.
-
-With clocks locked, pmode turbo, and PCI power/control=on, the stalls remain
-(0.92/token, median 49.5 ms) while clean calls improve to 47.9 ms/token; `tg16`
-9.03, `pp8` 67.1, and a 128-token run 8.76 t/s.
-
-A reloaded amdxdna module with a changed timeout (and a new readable
-`poll_interval_us = 50` parameter) did not change this: 128 tokens gave
-0.95 stalls/token, median 49.7 ms, 47.4 ms/token, clean 49.4, 8.49 t/s;
-`tg16` 9.42, `pp8` 66.1.  `strace` still shows the same 43-50 ms
-`DRM_AMDXDNA_EXEC_CMD` blocks.
-
-Restoring `poll_interval_us` to its default 20000 gave the same picture:
-two 128-token runs at 8.83 / 9.01 t/s with 0.91 / 0.87 stalls/token, median
-47.5 / 48.1 ms, 43.0 / 41.5 ms/token; `tg16` 9.37, `pp8` 63.4.  The
-parameter only moves the stall cost by a few ms, within run variance.
-
-`force_cmdlist=Y` (with `poll_interval_us=50`, `tdr_timeout_ms=2000`) also
-keeps the stalls: two 128-token runs at 8.11 / 7.92 t/s, 1.02 / 1.08
-stalls/token, median 47.6 / 48.0 ms, 48.9 / 52.1 ms/token, clean 54.4 / 55.7;
-`tg16` 8.57.  `strace` still shows 41-49 ms `DRM_AMDXDNA_EXEC_CMD` blocks (and
-one 48 ms `SYNCOBJ_TIMELINE_WAIT`), so the command-list submit path does not
-avoid the stall.  This configuration is slightly worse than the defaults.
-
-**CPU DMA latency / PM QoS.**  `Program` opens `/dev/cpu_dma_latency` at
-construction, writes `uint32_t(0)`, and holds the fd until the Program is
-destroyed, asking the kernel to keep the CPU out of deep idle states while it
-waits on the NPU.  `SPIRAL_DMA_LATENCY_PATH` overrides the path (useful for
-testing the fd lifecycle with a regular file) and `SPIRAL_NO_DMA_LATENCY`
-disables it.  The node must be writable by the process.  It was initially
-`0600 nobody:nogroup` in the bwrap sandbox, where the open fails with `EACCES`
-and a one-line warning and timing is unchanged.  After the node was made
-writable, a real 300-token Gemma generation improved consistently:
-
-| PM QoS | generation | per token |
+| metric | PM QoS on | PM QoS off |
 | :-- | --: | --: |
-| held at 0 | 7.50 / 7.61 / 7.59 t/s | 131-133 ms |
-| disabled | 7.12 t/s | 140 ms |
+| `pp8` | 118.1 t/s | 111.4 t/s (+6% on) |
+| `tg16` | 16.84 t/s | 18.11 t/s (-7% on) |
+| 300-token generation | 15.2-15.3 t/s | 16.8-17.3 t/s (-10% on) |
 
-That is a ~4-6% improvement with clocks locked.  With clocks unlocked on
-Linux 7.3 it is larger: `tg16` 8.82 vs 7.75 t/s, `pp8` 62.1 vs 54.8 t/s, and
-a 300-token run 7.95-8.10 vs 7.56 t/s.  It does **not** remove the ~47 ms wait
-stalls described above; it only improves the clean calls and the idle-gap
-penalty.
+Prompt processing gains because it is host-submission heavy and avoids CPU
+idle-state exits; decode loses because holding every CPU out of deep idle
+raises package power and lowers boost clocks while the NPU is the bottleneck.
+That is why PM QoS is off by default; enable it for prompt-heavy workloads.
 
-**Idle gaps are expensive.**  Inserting `SPIRAL_COLD_GAP_US` between calls
-(sleep, NPU idle, CPU awake) slows the next call even without any contention:
-
-| gap | p50 | p95 | max |
-| --: | --: | --: | --: |
-| 0 | 111 us | 133 us | 163 us |
-| 2 ms | 121 us | 141 us | 186 us |
-| 5 ms | 149 us | 241 us | 576 us |
-
-The model interleaves CPU fallback between NPU calls, so this is part of the
-model-versus-standalone difference: a 5 ms idle gap costs ~34% on the next
-call.  Keeping the NPU busy (look-ahead submission or overlapping CPU work)
-is therefore worth more than raw bandwidth.
+**Idle gaps are expensive.**  Inserting a sleep between calls (NPU idle,
+CPU awake) slows the next call, and the penalty grows with the gap, so the
+model's interleaving of NPU calls with CPU fallback costs more than a
+back-to-back loop would.  Keeping the NPU busy (look-ahead submission or
+overlapping CPU work) is worth more than raw bandwidth.
 
 Experiments that did **not** help:
 
@@ -643,9 +545,6 @@ Experiments that did **not** help:
   compile.
 - Depth 3 also made no difference to the 2048x1536 case, so the small-shape
   cost is not L2 buffering.
-- Host CPU or memory stress (`stress-ng --cpu 2`, `--vm 2`) changed the cold
-  kernel by only a few percent, so CPU cache pressure does not explain the
-  differences either.
 
 The next device experiment should target outstanding weight DMA rather than
 cache flags or FIFO depth, and should be judged with `--cold-timing`.
@@ -654,25 +553,13 @@ cache flags or FIFO depth, and should be judged with `--cold-timing`.
 
 `src/quants` still provides `q4_0_packed16`, a near-exact 288-byte Q4_0
 variant (host-packed 16-bit scale codes, 9-bit fraction, named 5%-of-column
-verification policy).  It was integrated as a build-time alternative block —
-the two blocks cannot be linked together, the pair overflows program memory by
-224 B — and measured end to end:
-
-| metric | Q4_0 | Q4_0_packed16 |
-| :-- | --: | --: |
-| kernel 256x64 | 8328 | 7397 |
-| `pp8` | 54.9 t/s | 57.7 t/s |
-| `tg16` | 8.01 t/s | 8.17 t/s |
-| 300-token generation | 7.48-7.55 t/s | 7.64-7.71 t/s |
-
-The program variant was then removed (`program_q4_packed16_block.aie.cc`,
-`SPIRAL_Q4_VARIANT`, and the host repack switch).  Two reasons:
-
-- the exact Q4_0 path improved to 7883 cycles with the shared exponent-add
-  split, so the kernel gap fell from 11.2% to 6.2%; the model-level gap is
-  about 2% because decode is memory-bound and dominated by fixed costs;
-- packed16 is near-exact, not bit-exact, so it needs its own quality policy
-  and a wider sweep before it could replace the canonical path.
+verification policy).  It was integrated as a build-time alternative block
+(the two blocks cannot be linked together; the pair overflows program memory
+by 224 B) and removed again after the exact Q4_0 kernel improved to 7883
+cycles (against 7397 for packed16, a 6.2% gap) with the shared exponent-add
+split.  packed16 is
+near-exact rather than bit-exact, so it would need its own quality policy and
+a wider sweep before replacing the canonical path.
 
 The format and its `src/quants` tests remain for future work.  `src/program`
 builds one Q4_0 block kernel again.
@@ -709,23 +596,21 @@ old single-run path paid on every call.
 `Program::max_outstanding()` is the high-water mark of submitted-but-not-
 finished calls (printed as `max_slots=` by `SPIRAL_PROFILE`).  A 64-token run
 with `SPIRAL_PIPELINE_SLOTS=1/2/4` gives `max_slots=1/2/4`, so the backend
-never has more than the configured number in flight.  The ~50 ms
-`DRM_AMDXDNA_EXEC_CMD` stalls are unchanged across the sweep (0.91 / 0.98 /
-0.89 per token, median 50.1 / 48.6 / 47.4 ms), so the driver's four-deep
-hardware-context queue is **not** being saturated by our `xrt::run`
-submissions; even one outstanding job stalls.
+never has more than the configured number in flight, confirming the
+submissions stay within the configured depth.
 
 In llama.cpp the backend pipelines every multi-chunk node.  The head is the
 main decode beneficiary; prompt processing also gains because nodes with
-`rows > 4` split into row chunks.  With clocks fixed at the time of writing:
+`rows > 4` split into row chunks:
 
 | slots | pp8 | tg16 |
 | --: | --: | --: |
-| 1 | ~42-43 t/s | ~7.5 t/s |
-| 2 | ~49-52 t/s | ~7.5 t/s |
+| 1 | 95.3 t/s | 18.0 t/s |
+| 2 | 112.5 t/s | 18.3 t/s |
+| 4 | 111.6 t/s | 16.4 t/s |
 
-Prompt gains ~15-20%; decode is unchanged because only the head is
-multi-chunk at `rows=1` and the ~50 ms stalls dominate it.
+Prompt gains ~18%; decode is unchanged because only the head is multi-chunk
+at `rows=1`.
 
 A second experiment submits a later same-input matmul (for example K or V
 while the host runs Q's norm/RoPE) and defers only its host unpack, so the NPU

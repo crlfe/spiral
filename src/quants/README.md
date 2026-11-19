@@ -36,12 +36,10 @@ error 1.8125 under its named 5%-of-column policy).  The two Q4_0 variants use
 9216 packed bytes for the 256x64 case, so the 11.2% cycle reduction is the
 only kernel-level win.
 
-Model A/B (Gemma 4 E2B Q4_0, `src/program` with the matching build): packed16
-was ~2% faster on decode and ~5% on `pp8`, and 64-token and 300-token greedy
-outputs were byte-identical to Q4_0.  The program variant has since been
-removed: with the exact path at 7883 cycles the kernel gap is 6.2%, and
-packed16 is near-exact rather than bit-exact.  The format and its tests stay
-in `src/quants`.  Details in `src/program/NOTES.md`.
+The program variant was removed: with the exact path at 7883 cycles the
+kernel gap is 6.2%, and packed16 is near-exact rather than bit-exact.  The
+format and its tests stay in `src/quants`.  Details in
+`src/program/NOTES.md`.
 
 ## Package layout
 

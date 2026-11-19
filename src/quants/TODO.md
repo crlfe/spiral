@@ -64,12 +64,10 @@ Integration status:
      `q4_0_hilo` at 1.8 GHz;
    - `q4_0_packed16` is near-exact (about 0.78% weight error, 3.9% worst-case
      mmul error) and uses a named 5%-of-column mmul policy;
-   - [x] Gemma E2B model check for both variants: 64-token and 300-token
-     greedy outputs are byte-identical; packed16 is ~2% faster on decode and
-     ~5% faster on `pp8`.  The program trialled it as a build-time block
-     choice and then dropped it: the exact path improved to 7883 cycles
-     (6.2% kernel gap) and packed16 is near-exact rather than bit-exact, so
-     the format stays a `src/quants` variant only.
+   - [x] The program trialled packed16 as a build-time block choice and then
+     dropped it: the exact path improved to 7883 cycles (6.2% kernel gap) and
+     packed16 is near-exact rather than bit-exact, so the format stays a
+     `src/quants` variant only.
 
 4. **Output-head decision**
    - prefer native `q6_k` for the exact path: it is memory-bound at about 66B

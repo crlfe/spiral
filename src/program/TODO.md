@@ -70,53 +70,52 @@ over peak bandwidth.
 - [x] The llama.cpp `ggml-spiral` backend now chains consecutive `MUL_MAT`s
       with the same input data and K into one wide call (up to four
       segments).  Gate+up is the beneficiary in Gemma; pp8 improved from
-      ~45.4 to ~51.3 t/s and tg1 from ~7.7 to ~9.2 t/s.  Chaining across
+      106.1 to 122.2 t/s and tg1 from 16.2 to 17.5 t/s.  Chaining across
       intervening ops is unsafe because the scheduler reuses compute buffers
       based on graph-order lifetimes.  Combined handles duplicate the paired
       weights in NPU BOs and cost ~1 s to prepare on the first graph.
 - [x] Investigated the large-matmul streaming path.  Per-call kernel time fits
       `~80 us + bytes / 48 GB/s`; host stages are <20 us.  Naive bytes/time is
-      misleading because the fixed launch floor and sporadic stalls dominate
-      small calls and averages.  `xrt::bo` cacheable/normal flags are unusable,
-      `weights_l2` FIFO depth 3 is neutral, and host CPU/memory stress only
-      moves the kernel by a few percent.  Reduced call count, not more
+      misleading because the fixed launch floor dominates small calls and
+      averages.  `xrt::bo` cacheable/normal flags are unusable and
+      `weights_l2` FIFO depth 3 is neutral.  Reduced call count, not more
       bandwidth, is the actionable lever.
 - [x] `./test --cold-timing` reports min/p50/p95/max over alternating BOs
       (`SPIRAL_COLD_BOS`, `SPIRAL_COLD_ITERS`).
 - [x] Fix the weight over-read: one `kL2StreamBytes` guard block after the
       compact weights BO removes the AMD-Vi IO_PAGE_FAULTs (10/run -> 0).
-- [x] Split `kernel_us` into `start_us` / `wait_us` / `sync_us`; stalls are
-      entirely in `wait_us`.
-- [x] `SPIRAL_COLD_GAP_US` shows a 5 ms NPU-idle gap costs ~34% on the next
-      call, so keeping the NPU busy matters.
+- [x] Split `kernel_us` into `start_us` / `wait_us` / `sync_us`.
+- [x] `SPIRAL_COLD_GAP_US` shows an NPU-idle gap slows the next call, so
+      keeping the NPU busy matters.
 - [x] Pipelined submissions: `Program::submit`/`finish` with a configurable
       slot pool (`SPIRAL_PIPELINE_SLOTS`, default 2).  Q6_K head pass drops
-      by ~16% wall; two slots capture almost all of it.  `pp8` ~42 -> ~50
-      t/s; `tg16` unchanged because decode is stall-bound.
+      by ~16% wall; two slots capture almost all of it.  `pp8` 95.3 -> 112.5
+      t/s; `tg16` unchanged (18.0 -> 18.3) because only the head is
+      multi-chunk at `rows=1`.
 - [x] Cross-node look-ahead: submit the next same-input matmul early and
       defer only its host unpack.  Correct, but within noise on Gemma; kept
       behind `SPIRAL_LOOKAHEAD=1` (off by default).
 - [x] Trial `q4_0_packed16` as a build-time Q4 block choice.  It was 11.2%
-      faster in the kernel (8328 -> 7397) and ~2% faster on the model, but the
-      exact Q4_0 path then improved to 7883 cycles with the shared split, and
-      packed16 is near-exact rather than bit-exact.  Removed from `src/program`;
-      the `src/quants` format and its tests remain.
-- [x] Hold `/dev/cpu_dma_latency` at 0 for the Program lifetime (PM QoS);
-      `SPIRAL_NO_DMA_LATENCY` disables it, `SPIRAL_DMA_LATENCY_PATH` overrides
-      the node.  With a writable node and locked clocks it improved a 300-token
-      generation from 7.12 to 7.50-7.61 t/s; on Linux 7.3 with unlocked clocks
-      `tg16` is 8.82 vs 7.75 t/s and `pp8` 62.1 vs 54.8 t/s.
-- [x] Real-query baseline: Gemma E2B Q4_0, 300-token greedy answer, 7.5-7.6
-      t/s generation and 114-121 t/s prompt on Linux 7.0 (CPU: 9.9 / 152).
-      Linux 7.3 / amdxdna 0.10.0, unlocked clocks: 7.95-8.10 t/s and 133-155
-      t/s prompt, `tg16` 8.82 t/s.
-- [x] Characterise the wait stalls over 127 tokens: 1.10/token, 46-62 ms
-      (median 50.6), 56.1 ms/token, clean calls 51.6 ms/token.  Removing them
-      would give ~14 t/s.  Ruled out BO count, idle gaps, CPU/memory stress,
-      IOMMU faults, PM QoS, and clock state.  Linux 7.3 / amdxdna 0.10.0 still
-      shows them (0.97/token, median 46.9 ms) and produces no IO_PAGE_FAULTs.
-- [ ] Test the ~50 ms stalls on a machine with no other `/dev/accel0` users.
-      `pmode` is permission-locked in this sandbox.
+      faster in the kernel (8328 -> 7397), but the exact Q4_0 path then
+      improved to 7883 cycles with the shared split (6.2% gap) and packed16 is
+      near-exact rather than bit-exact.  Removed from `src/program`; the
+      `src/quants` format and its tests remain.
+- [x] Hold `/dev/cpu_dma_latency` at 0 for the Program lifetime (PM QoS).
+      It is now opt-in: `SPIRAL_DMA_LATENCY=1` enables it,
+      `SPIRAL_DMA_LATENCY_PATH` overrides the node, and enabling it with an
+      inaccessible node throws.  Measured effect is workload-dependent:
+      `pp8` 118.1 vs 111.4 t/s (+6% on), `tg16` 16.84 vs 18.11 (-7% on), and
+      a 300-token generation 15.2-15.3 vs 16.8-17.3 t/s (-10% on).  Default
+      off because decode dominates.
+- [x] Real-query baseline: Gemma E2B Q4_0, native Q6_K head, one CPU
+      fallback thread.  Spiral NPU: 17.71 t/s on a 300-token answer (56.5
+      ms/token), `tg16` 18.3, `pp8` 112.2.  CPU (`-ngl 0`, 12 threads):
+      34.32 t/s (29.1 ms/token), `tg16` 36.1, `pp8` 225.0.
+- [x] Wait stalls: resolved.  The 45-50 ms `wait_us` spikes were host CPU
+      quota throttling (kernel tracing showed the submitting thread switched
+      out while runnable, no device activity in the window).  With the quota
+      removed a 64-token run has zero calls above 15 ms and median wait
+      ~95 us; the device job lifecycle is at most ~2.6 ms.
 - [x] `tests/poc/iter_args.py` device regression for carried memrefs and
       conditional acquire/release.
 
@@ -125,13 +124,13 @@ over peak bandwidth.
 - [ ] Keep `README.md`, `NOTES.md`, and this file in sync with the code.
 - [ ] Re-run the full golden set, Python suite, and `--head` after any worker
       or stream change.
-- [ ] Use the locked-clock baseline in `NOTES.md` for comparisons: isolated
+- [ ] Use the production baseline in `NOTES.md` for comparisons: isolated
       cases, warm-up run, then median/min over repeated runs.
 
 ## Planned
 
 1. **Performance tuning** (only after correctness).  Priority order:
-   - use the locked-clock baseline in `NOTES.md`; the streaming path is now
+   - use the production baseline in `NOTES.md`; the streaming path is now
      at the PoC throughput.  The remaining fixed cost is per-call
      launch/dispatch (~60-70 us), so the next lever is fewer calls or batching,
      not weight-fill reshaping;
