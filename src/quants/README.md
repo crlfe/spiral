@@ -13,18 +13,35 @@ tiles; each tile is padded to a 64-byte boundary.
 
 | format | bits/w | % PM [1] | est w/s [2] | limit |
 | :-- | --: | --: | --: | :-- |
-| Q4_0 | 4.5 | 16.8% | 90B | compute at 1.5, memory 98B at 1.8 GHz |
+| Q4_0 | 4.5 | 24.7% | 94B | compute at 1.5, memory 98B at 1.8 GHz |
+| Q4_0_packed16 | 4.5 | 23.2% | 98B | near-exact, memory-bound at 1.8 GHz |
 | Q4_0_hilo | 5.0 | 22.2% | 88B | memory, +11% size |
-| Q6_K | 6.625 | 31.9% | 66B | memory-bound, 66B |
-| Q6_K_int8 | 8.625 | 29.0% | 51B | memory, +31% size |
-| Q8_0 | 8.5 | 16.0% | 52B | memory |
+| Q6_K | 6.625 | 30.5% | 66B | memory-bound, 66B |
+| Q6_K_int8 | 8.625 | 26.7% | 51B | memory, +31% size |
+| Q8_0 | 8.5 | 43.8% | 52B | memory |
 
 [1]: Kernel static instruction size, as a percentage of
 the 16 KiB AIE2P Compute Tile program memory.
 
 [2]: Theoretical Billions of weights/second processed by the full NPU:
 the minimum of the compute limit (`weights/cycle * 1.5 GHz * 32`) and
-the memory limit (`55 GB/s / bytes-per-weight`).
+the memory limit (`55 GB/s / bytes-per-weight`). The fused mmul is the
+production path; standalone unpack cycle counts are diagnostic only.
+
+Measured 2026-11-18 on Linux 7.3.5 with the current compiler: Q8_0 7707
+cycles/tile (240.8 cycles/tile, 2.126 weights/cycle, exact canonical fp16
+scales); Q4_0 7883 cycles/tile (246.3, 2.078 weights/cycle, max abs error
+1.53e-4); Q4_0_packed16 7397 cycles/tile (231.16, 2.215 weights/cycle, max abs
+error 1.8125 under its named 5%-of-column policy).  The two Q4_0 variants use
+9216 packed bytes for the 256x64 case, so the 11.2% cycle reduction is the
+only kernel-level win.
+
+Model A/B (Gemma 4 E2B Q4_0, `src/program` with the matching build): packed16
+was ~2% faster on decode and ~5% on `pp8`, and 64-token and 300-token greedy
+outputs were byte-identical to Q4_0.  The program variant has since been
+removed: with the exact path at 7883 cycles the kernel gap is 6.2%, and
+packed16 is near-exact rather than bit-exact.  The format and its tests stay
+in `src/quants`.  Details in `src/program/NOTES.md`.
 
 ## Package layout
 

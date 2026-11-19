@@ -19,8 +19,9 @@ the quick summary lives in `README.md`.
 - Report logical weights/cycle for one core:
   `weights/cycle = weights_rows * weights_cols / cycles`.
 - Use the physical packed size, not the canonical format size, for bandwidth:
-  - Q4_0: 4.5 bits/weight (`q4_0`, 0.5625 bytes/weight) or 5.0 bits/weight
-    (`q4_0_hilo`, 0.625 bytes/weight)
+  - Q4_0: 4.5 bits/weight (`q4_0`, 0.5625 bytes/weight), 4.5 bits/weight
+    (`q4_0_packed16`, near-exact), or 5.0 bits/weight (`q4_0_hilo`, 0.625
+    bytes/weight)
   - Q6_K: 6.625 bits/weight (`q6_k`, 0.828125 bytes/weight) or 8.625
     bits/weight (`q6_k_int8`, 1.078125 bytes/weight)
   - Q8_0: 8.5 bits/weight (1.0625 bytes/weight)
@@ -299,22 +300,25 @@ programming guide, `third_party/aie_api/include/aie_api/aie.hpp`, and the
 
 - XDNA2 is AIE2P / arch 21. The AIE API defines `float16` only for arch 22
   (AIE-MLv2); on XDNA2 it is a placeholder. The capability probe in
-  `tests/bench/fp16_ops.*` confirms:
+  `tests/bench/float16_support.*` confirms:
   - `sizeof(float16) == 1`, so it cannot hold a 16-bit value;
   - `aie::vector<float16, N>` fails its `static_assert` constraints;
   - there is no fp16 load/store, int8/f32/accfloat conversion, add, mul, or
     `mmul`;
   - `to_v16float16` / `to_v32float16` exist only in the `aie2ps` intrinsics,
     not in `aie2p`.
-- Treat fp16 as a storage and scale format only. Canonical fp16 `d` values must
-  be decoded from raw bits to f32 (`load_fp16x8`) and split into bf16 hi/lo
-  terms, as Q4_0/Q6_K/Q8_0 already do. Do not build a kernel around fp16
+- Treat fp16 as a storage and scale format only. Canonical fp16 `d` values
+  must be decoded exactly on the device with the exponent-add split (Q4_0 and
+  Q8_0), pre-split on the host as Q6_K and Q4_0_hilo do, or replaced by a named
+  host-side encoding (`q4_0_packed16`). Do not build a kernel around fp16
   arithmetic.
 - Prefer the shift-based decode when fp16 decoding is hot: zero-extend the
   pattern, `(u << 17) >> 4` to form `(h & 0x7fff) << 13`, OR in the sign, and
-  add `0x38000000` for the f32 exponent bias. With the same zero/subnormal
-  flush it is exact and measures 33.2 vs 37.3 cycles per eight scales; with the
-  bf16 hi/lo split it is 43.2 vs 47.3.
+  add `0x38000000` for the f32 exponent bias. The original probe measured 33.2
+  vs 37.3 cycles per eight scales with zero/subnormal flush, and 43.2 vs 47.3
+  with the bf16 hi/lo split. No format uses this f32 decode today: Q4_0 and
+  Q8_0 consume canonical fp16 scales and decode them with the exact
+  exponent-add split below.
 - One-core probe timings, cycles per iteration over 32 iterations:
 
   | operation per iteration | cycles |
@@ -325,11 +329,49 @@ programming guide, `third_party/aie_api/include/aie_api/aie.hpp`, and the
   | 8 fp16 -> bf16 hi/lo, mask/rebias | 47.3 |
   | 8 fp16 -> f32, shift | 33.2 |
   | 8 fp16 -> bf16 hi/lo, shift | 43.2 |
+  | 8 pre-biased fp16 -> bf16 hi/lo, shift | 43.2 |
+  | 16 host-packed fp16 -> bf16 hi/lo | 28.2 (14.1/8) |
+  | 16 fp16 -> bf16 hi/lo, exp add, denorm flush | 43.3 (21.6/8) |
+  | 16 fp16 -> bf16 hi/lo, exp add, denorm exact | 60.3 (30.2/8) |
   | 64 int8 -> bf16, one bf16 scale | 27.1 |
   | 64 int8 -> f32, one f32 scale (emulated) | 109.2 |
 
   The emulated f32 scale path is 4x the bf16 path, consistent with the
   element-wise float emulation noted above.
+- Host-side re-biasing alone does not reduce the device f32 expansion. Storing
+  `d * 2^10` and decoding with the +102 bias measures the same 43.2 cycles as
+  the canonical +112 shift decode with a subnormal flush. The re-bias removes
+  the subnormal case but zero still needs an exponent select, and the f32 field
+  placement still needs two shifts/masks plus the bias add. `cast_to<float>`
+  and the accfloat construction are bit-level moves, so building the value
+  directly in an accfloat accumulator does not remove any instructions.
+- A 16-value host-packed encoding keeps the two bf16 terms in the same 32
+  bytes as the canonical fp16 scales without decoding fp16 on the device. The
+  host normalizes each value to a bf16 exponent and a 9-bit significand
+  fraction, then packs `sign | (exp8 - 102) << 9 | top7 << 2 | residual2`.
+  The residual code is `{0, 1.5, 2, 3}` in 1/512 units, so its exponent delta
+  and mantissa bit are already encoded and the device only does shifts, masks,
+  adds, and two selects. `hi + lo` reproduces the 9-bit fraction within 0.5
+  ulp (about 0.1% relative); zero is exact; normals and subnormals share one
+  path because the host normalizes both. The 16-value probe measures 28.2
+  cycles, i.e. about 14.1 per eight scales, versus 43.2 for the shift-based
+  fp16 decode plus bf16 split and 61.4 for the exact direct split. The cost is
+  one dropped mantissa bit (9-bit fraction instead of the full 11-bit fp16
+  significand) and no representation for inf/nan, which host repack must map.
+  This is a way to keep `d` at two bytes where a host-precomputed hi/lo pair
+  has no tail padding to spare; the exact pair remains preferable when it
+  fits.
+- For canonical fp16 bytes, the low byte can go through the native uint8 ->
+  bf16 conversion and then have `(E - 25) << 7` added to its exponent field;
+  the high byte supplies `hi` with bit ops. This avoids both the lookup table
+  and the bf16 multiply. The denorm-flush variant measures 43.3 cycles per 16,
+  or 21.6 per eight. Keeping denorms exact needs a second high-byte form,
+  `hi = top2 * 2^-16`, and a `-24` delta for `lo`; that costs 60.3 per 16, or
+  30.2 per eight, so denorm support adds about 8.5 cycles per eight here. The
+  host-packed 16-value format is still faster and handles denorms without a
+  special case at its usual 0.1% bound, so use the exponent-add path only when
+  the two canonical fp16 bytes must be preserved. Both exponent-add probes are
+  bit-exact against their host models; the flush model drops `E == 0`.
 - A small scalar packed immediately before an aligned tile load is unsafe. A
   probe that loaded int8 at `in + 2` silently read from `in` because
   `load_v<64>` requires 64-byte alignment. Reserve an aligned block for scales
@@ -361,7 +403,12 @@ programming guide, `third_party/aie_api/include/aie_api/aie.hpp`, and the
   `grow_replicate` path.
 - `vector::grow_replicate<ElemsOut>()` replicates the whole short vector. For
   a 128-bit source it lowers through `broadcast_elem_128`, then may expand to a
-  broadcast plus a two-register concat.
+  broadcast plus a two-register concat. A 64-lane bf16 value is two native
+  512-bit registers, so each 8-lane expansion needs about four 128-bit copies
+  per register (about 12 instructions) and four of them are live per block.
+  A `concat` ladder, processing one column record at a time to halve the live
+  set, and moving the split constants into `.rodata` were all measured on
+  q8_0 and all regressed `.text` (1016-1229 slots against 1008).
 - `aie::broadcast<T, Elems>({...})` accepts a small repeating array on Gen2
   when `type_bits * N <= 64` and N is a power of two. It packs the pattern into
   a scalar and broadcasts it; useful for repeating byte masks such as
@@ -462,11 +509,12 @@ programming guide, `third_party/aie_api/include/aie_api/aie.hpp`, and the
   row-block-major then column-pair-major, and each tile is padded only to the
   next 64-byte boundary. This keeps every tile contiguous and 64-byte aligned
   for DMA.
-- Q6_K and Q6_K_int8 pool both records' payloads, scales, and `d` values at
-  tile level, sharing one 32-byte tail pad. Q8_0 keeps its payload-first
-  2176-byte records and groups two per tile. Q4_0 and Q4_0_hilo keep 288/320-byte
-  records with scales first and group eight per tile; their 32-byte payload
-  loads only need 32-byte alignment.
+- Q6_K and Q6_K_int8 pool both records' payloads, scales, and bf16 hi/lo `d`
+  pairs at tile level; the `d` records occupy what used to be a shared 32-byte
+  tail pad. Q8_0 keeps its payload-first
+  2176-byte records and groups two per tile. Q4_0 and q4_0_packed16 keep
+  288-byte records, q4_0_hilo keeps 320-byte records; all group eight per tile
+  with scales first. Their 32-byte payload loads only need 32-byte alignment.
 - Host repack must stay plain bytes; host-compiled headers must not include
   `aie::vector`.
 - Device-only layout views are useful for static assertions, but hot-path
@@ -476,8 +524,8 @@ programming guide, `third_party/aie_api/include/aie_api/aie.hpp`, and the
 
 ### Two-column fusion
 
-The two-column fused structure is used by Q4_0, Q4_0_hilo, Q8_0, Q6_K_int8,
-and native Q6_K. Native Q6_K decodes both records into separate value sets and
+The two-column fused structure is used by Q4_0, q4_0_packed16, Q4_0_hilo,
+Q8_0, Q6_K_int8, and native Q6_K. Native Q6_K decodes both records into separate value sets and
 then issues both accumulators' mmuls, which is what made the two-record fusion
 worthwhile there.
 
@@ -518,16 +566,16 @@ What did not help:
 - Repack consumes 256-row x 16-column tiles. Records are laid out
   row-block-major then column-pair-major inside the tile, and the tile is
   padded only to the next 64-byte boundary.
-- Q6_K and Q6_K_int8 pool both records' payloads, scales, and `d` at the tile
-  level so they share one 32-byte tail pad; this saved 64 bytes per tile versus
-  padding each record independently.
+- Q6_K and Q6_K_int8 pool both records' payloads, scales, and bf16 hi/lo `d`
+  at the tile level. The two 32-byte `d` records occupy what was the shared
+  32-byte tail pad, so the tile size did not change.
 - Native Q6_K decodes four adjacent 8x8 tiles (32 rows) together, sharing one
   64-byte high-plane load between them. A 64-row chunk then needs exactly six
   64-byte payload loads instead of eight.
-- Q4_0 and Q4_0_hilo group eight 64-row records per tile. Their per-record
-  scales-first layout is slightly faster than pooling payloads tile-wide, and
-  their 32-byte payload loads remain valid because records stay 32-byte
-  aligned.
+- Q4_0, q4_0_packed16, and Q4_0_hilo group eight 64-row records per tile. Their
+  per-record scales-first layout is slightly faster than pooling payloads
+  tile-wide, and their 32-byte payload loads remain valid because records stay
+  32-byte aligned.
 - `record_count()` remains the legacy record count; `packed_bytes()` is now
   `tile_count * kPackedTransportTileBytes`.
 
@@ -537,22 +585,55 @@ What did not help:
   - fp16 `d` alone: two bf16 terms are exact (Q8_0).
   - fp16 `d * int8_scale`: up to 18 significand bits, so three bf16 terms are
     required (Q6_K).
-- Canonical Q4_0/Q6_K/Q8_0 scales are assumed to be normal fp16 values.
-  Host repack flushes subnormal scales to zero and emits one warning per
-  repack call; zero scales need no special case because the two-term split
-  cancels exactly. Q6_K and Q8_0 still convert fp16 on the device, so this is
-  the only place that can catch the subnormal case.
+- Q6_K stores the per-column canonical fp16 `d` as a host-precomputed exact
+  bf16 `hi + lo` pair. The pair is exact for normal and subnormal fp16 values,
+  so canonical subnormal scales no longer need flushing. The record grows from
+  16 to 32 bytes per 8 columns, but the 32-byte tile tail pad absorbs it:
+  native Q6_K remains 3392 bytes/tile and Q6_K_int8 remains 4416 bytes/tile.
+  The device loads the two bf16 planes directly and does not decode fp16.
+- Q8_0 keeps its canonical 2-byte fp16 scale slots and stores them unchanged.
+  The device decodes four 32-row blocks' scales into one 32-lane batch with the
+  exact exponent-add split, including subnormals, so the `|d| < 64` pre-bias
+  limit and its repack failure path are gone. This is exact over the whole
+  finite fp16 scale range and also faster than the pre-biased 8-wide path:
+  8242 -> 7707 cycles for 256x64, 1.988 -> 2.126 weights/cycle. It costs
+  program memory (2624 -> 7168 B) and stack (1216 -> 2816 B) because the exact
+  split is inlined. The pre-bias helpers (`fp16_prebias_scale`,
+  `load_fp16x8_biased`) and the then-unused `split_bf16_hi_lo` were removed;
+  Q4_0 and Q8_0 now share `split_fp16_exact()`. Every int8 value, including
+  `-128`, is exactly representable in bf16, so the old `-128` repack warning
+  and its `RepackWarnings` helper were removed too.
+- The real Gemma 4 E2B Q6_K `token_embd` output head contains subnormal fp16
+  scales. The host hi/lo `d` split above makes those values exact; the synthetic
+  Q6_K golden now mixes normal and subnormal `d`, and its verification checks
+  relative error so a flushed block cannot pass. The `ggml-spiral` backend now
+  re-enables native Q6_K after regenerating packed weights; its real-head slice
+  check passes (max_abs 0.026 on max_cpu 10.07) and the Q4_0 Gemma model
+  output matches CPU.
 - `q4_0_hilo` has the host repack the exact bf16 `hi + lo` pair of each fp16
   scale. The record grows from 288 to 320 bytes, but the device avoids the
-  fp16 decode and split. `q4_0` keeps the canonical 288-byte layout and splits
-  on the device.
+  fp16 decode and split. `q4_0` keeps the canonical 288-byte layout and now
+  stores canonical fp16 scales too; the device uses the exact exponent-add
+  split, which handles subnormals without the old `|d| < 64` pre-bias limit.
+- The exact exponent-add Q4_0 path decodes both column records' 16 scales into
+  one 32-lane batch in the fused kernel. It measures 7883 cycles for 256x64
+  against 8720 for the previous pre-biased path, with program memory growing
+  from 2752 to 4048 bytes and the stack frame to 2496 bytes. Standalone unpack
+  regressed from 5261 to 6579 cycles, but that path is now a diagnostic
+  correctness reference and does not drive the production decision.
+- The shared split now computes `E << 7` once and reuses it for both terms,
+  builds `hi` with one `(E | top) << 5` plus the bias add, and folds the
+  denormal `lo` exponent step into the same add. It stays exact and is the
+  cheapest formulation measured: Q4_0 8328 -> 7883 cycles and 4160 -> 4048 B,
+  Q8_0 7792 -> 7707 and 7248 -> 7168 B.
 - Expand the eight scale lanes to 64 once per block, not per tile.
   `broadcast_vector<8, bfloat16, 64>` is the preferred expansion.
 - The 64-lane active scale cache is the best balance found. 32-lane scales
   plus per-tile expansion, 8-lane scales plus per-tile expansion, and
   reload/split per tile were all slower.
-- Q6_K's `d` is hoisted to once per record; each chunk's 32 int8 scales are
-  expanded to 32 lanes, multiplied by `d`, and split into hi/mid/lo once.
+- Q6_K's `d` is hoisted to once per record as an exact bf16 hi/lo pair; each
+  chunk's 32 int8 scales are expanded to 32 lanes, multiplied by `d`, and split
+  into hi/mid/lo once.
 - Rejected scale approaches:
   - scale multiplication after the mmul: slower and outside exact tolerance;
   - two-term bf16 split for Q6_K: only ~3% faster and unsafe for canonical
@@ -597,7 +678,7 @@ alone were 3211 cycles (31%); payload load plus int8-to-bf16 reached 4297
 
 ### Q4_0
 
-Two exact layouts are available.
+Two exact layouts and one near-exact layout are available.
 
 `q4_0_hilo` (host-expanded) is one 64-row x 8-column record of 320 bytes
 (5.0 bits/weight):
@@ -609,31 +690,50 @@ Two exact layouts are available.
 
 The host repack writes the exact bf16 `hi + lo` split of each fp16 scale.
 Scales come first, payloads second; every 32-byte tile is naturally aligned.
-Both Q4_0 variants group eight records into a 256x16 transport tile (2304
-bytes for `q4_0`, 2560 bytes for `q4_0_hilo`).
+All Q4_0 variants group eight records into a 256x16 transport tile: 2304 bytes
+for `q4_0` and `q4_0_packed16`, 2560 bytes for `q4_0_hilo`.
 
-`q4_0` (canonical-size) is 288 bytes (4.5 bits/weight): the same payload
-layout with raw fp16 scales, split on the device with `split_bf16_hi_lo()`.
+`q4_0` (canonical exact) is 288 bytes (4.5 bits/weight): the same payload
+layout with canonical fp16 scales, decoded on the device with the exact
+exponent-add split. `q4_0_packed16` also uses 288 bytes but stores a
+host-packed 16-bit scale code; it is near-exact and has its own verification
+policy.
 
 Results at the measured 1.8 GHz H clock:
 
 | variant | shape | cycles | cycles/tile | weights/cycle | compute-implied 32-core GB/s |
 | :-- | --: | --: | --: | --: | --: |
-| q4_0 | 256x64 | 8720 | 272.500 | 1.879 | 60.9 |
+| q4_0 (canonical exact) | 256x64 | 7883 | 246.344 | 2.078 | 67.3 |
+| q4_0_packed16 | 256x64 | 7397 | 231.156 | 2.215 | 71.8 |
 | q4_0_hilo | 256x64 | 7268 | 227.125 | 2.254 | 81.1 |
 
-`q4_0` is compute-bound at 1.5 GHz (about 90B weights/s) and memory-bound at
-1.8 GHz (about 98B), while `q4_0_hilo` is memory-bound at the 55 GB/s target
-(88B). `q4_0` wins at both target clocks, crossing over near 1.46 GHz.
+At 288 bytes, `q4_0` and `q4_0_packed16` retain the bandwidth advantage over
+the 320-byte `q4_0_hilo` (about 98B weights/s at 1.8 GHz versus 88B). The exact
+path is compute-bound at 1.5 GHz (about 94B); packed16 raises the compute
+ceiling but still needs the model check before it can replace the exact path.
 
-Standalone exact unpack at 256x64: 5261 cycles for `q4_0`, 2916 cycles for
-`q4_0_hilo`. The fast single-bf16 mode measured 2119 cycles at 64 columns on
-the old layout but is not exact.
+Standalone unpack at 256x64: 6579 cycles for the canonical exact `q4_0`,
+5459 for `q4_0_packed16`, and 2916 for `q4_0_hilo`. Unrolling the packed16
+block loop is worth about 1.1k cycles here, unlike the exact path.
+
+`q4_0_packed16` keeps the 288-byte record and stores a host-packed 16-bit scale
+code with a 9-bit fraction. The fused kernel measures 7397 cycles, close to the
+320-byte `q4_0_hilo`, while standalone unpack is 5459 cycles. Its weights are
+near-exact rather than bit-exact: the Q4_0 reference reports about 0.78% maximum
+relative weight error, and the fused mmul check has about 3.9% maximum relative
+output error (0.18% mean) because cancellation amplifies the scale error. It
+therefore uses a named near-exact mmul policy (5% of the per-column output
+scale) and still needs the Gemma model check; it does not pass the exact
+tolerance used by the other Q4_0 variants.
+
+The fast single-bf16 mode measured 2119 cycles at 64 columns on the old layout
+but is not exact.
 
 ### Q6_K
 
 Canonical Q6_K is 6.5625 bits/weight. Both repack variants target a 256x16
-transport tile and share one 32-byte tail pad between the two records.
+transport tile. The former 32-byte tail pad now holds the exact bf16 hi/lo `d`
+pair, so neither variant grows in size.
 
 `q6_k` preserves the native six-bit payload. Its 3392-byte tile is 6.625
 bits/weight:
@@ -641,8 +741,7 @@ bits/weight:
 ```text
 3072 bytes  2 records x 4 chunks x (256-byte low-nibble + 128-byte high plane)
  256 bytes  2 x 4 x 32 per-column int8 subgroup scales
-  32 bytes  2 x 16 per-column fp16 d
-  32 bytes  shared tile tail padding
+  64 bytes  2 x 32 per-column bf16 d hi/lo pair
 ```
 
 The device decoder processes four adjacent 8x8 tiles (32 rows) at a time. Each
@@ -650,9 +749,9 @@ group loads two 64-byte low-plane vectors and one 64-byte high-plane vector,
 shares the high-plane masks across all four tiles, and expands the planes in
 `uint4`/`uint8` lanes before applying the bf16 scale terms. A 64-row chunk now
 needs six 64-byte payload loads instead of eight. The standalone unpack
-processes a whole record per call, loading and splitting the per-column `d`
-once instead of once per 64-row chunk; this reduced 256x64 unpack from 9587
-to 8826 cycles without changing repack or the mmul path.
+processes a whole record per call, loading the host-precomputed bf16 hi/lo `d`
+pair once instead of once per 64-row chunk. The host hi/lo pair also removes
+the device fp16 decode; 256x64 unpack now measures 8498 cycles.
 
 `q6_k_int8` expands every 6-bit weight to signed int8 (`q - 32`) in host
 repack. Its 4416-byte tile is 8.625 bits/weight:
@@ -660,8 +759,7 @@ repack. Its 4416-byte tile is 8.625 bits/weight:
 ```text
 4096 bytes  2 records x 4 chunks x 512-byte int8 payloads
  256 bytes  2 x 4 x 32 per-column int8 subgroup scales
-  32 bytes  2 x 16 per-column fp16 d
-  32 bytes  shared tile tail padding
+  64 bytes  2 x 32 per-column bf16 d hi/lo pair
 ```
 
 Device decode is a 64-byte load plus `to_float<bfloat16>`. The per-16-row scale
@@ -671,11 +769,11 @@ Results at the measured 1.8 GHz H clock:
 
 | shape | cycles | cycles/tile | weights/cycle | bytes/weight |
 | :-- | --: | --: | --: | --: |
-| 256x64 q6_k native | 9929 | 310.281 | 1.650 | 0.828125 |
-| 256x64 q6_k native standalone unpack | 8826 | 275.812 | 1.856 | - |
-| 256x64 q6_k_int8 payload | 9054 | 282.938 | 1.810 | 1.078125 |
-| 256x64 q6_k_int8 standalone unpack | 4538 | 141.812 | 3.611 | - |
-| Q8_0 256x64 reference | 8242 | 257.563 | 1.988 | 1.0625 |
+| 256x64 q6_k native | 10180 | 318.125 | 1.609 | 0.828125 |
+| 256x64 q6_k native standalone unpack | 8498 | 265.562 | 1.928 | - |
+| 256x64 q6_k_int8 payload | 9101 | 284.406 | 1.800 | 1.078125 |
+| 256x64 q6_k_int8 standalone unpack | 4210 | 131.562 | 3.892 | - |
+| Q8_0 256x64 reference | 7707 | 240.844 | 2.126 | 1.0625 |
 
 At 1.5 GHz the native kernel is memory-bound at about 66B weights/s, with a
 compute ceiling of about 79B; at 1.8 GHz the compute ceiling rises to about
@@ -689,16 +787,17 @@ tile together, sharing input vectors and exposing two independent mmul
 accumulators. The second win was grouping four row tiles per decode: sharing
 the high-plane load and masks cuts the payload load count from eight to six per
 64-row chunk and gives the independent vector chains enough work to cover the
-emulated-FP32 latency. The exact scale path is unchanged: fp16 `d` is split
-into bf16 hi/lo terms once per record, each chunk's int8 scales are multiplied
-by `d` and split into hi/mid/lo terms once, and the three-term product is
-applied with bf16 multiplies. This remains exact for canonical scales up to
-127.
+emulated-FP32 latency. The exact scale path is unchanged except that host
+repack now pre-splits `d` into an exact bf16 hi/lo pair (including canonical
+subnormals); each chunk's int8 scales are multiplied by `d` and split into
+hi/mid/lo terms once, and the three-term product is applied with bf16
+multiplies. This remains exact for canonical scales up to 127.
 
-Instruction memory: native `q6_k` uses 5232 of the 16384-byte AIE2P
-compute-tile program memory (31.9%), `q6_k_int8` uses 4752 bytes (29.0%) with
-its chunk loop rolled, `q4_0_hilo` uses 3632 bytes (22.2%), `q4_0` uses 2752
-bytes (16.8%), and `q8_0` uses 2624 bytes (16.0%).
+Instruction memory: native `q6_k` uses 4992 of the 16384-byte AIE2P
+compute-tile program memory (30.5%), `q6_k_int8` uses 4368 bytes (26.7%) with
+its chunk loop rolled, `q4_0_hilo` uses 3632 bytes (22.2%), `q4_0` uses 4160
+bytes (25.4%), `q4_0_packed16` uses 3808 bytes (23.2%), and `q8_0` uses 2624
+bytes (16.0%).
 
 Rejected or alternate approaches:
 
@@ -727,20 +826,22 @@ Canonical Q8_0 is 8.5 bits/weight. The internal record is 256 rows x 8 columns,
 
 ```text
 2048 bytes  int8 payloads (32 tiles of 64 bytes)
- 128 bytes  per-block fp16 d (8 blocks x 8 columns)
+ 128 bytes  per-block canonical fp16 d (8 blocks x 8 columns)
 ```
 
 Payloads come first so every 64-byte tile load is 64-byte aligned. Each tile
 is one 8x8 row-major matrix, so decode is `load 64 signed bytes -> int8 vector
 -> bf16 vector`, then `q * d`. An fp16 `d` needs only two bf16 terms; the
-`hi + lo` split is exact and accumulates to one bf16 rounding.
+exact exponent-add split produces `hi + lo` with no rounding, and the two-term
+accumulation is one bf16 rounding. Four blocks (32 columns) of canonical fp16
+scales are decoded per batch.
 
 Results at the measured 1.8 GHz H clock:
 
 | shape | cycles | cycles/tile | weights/cycle | compute-implied 32-core GB/s |
 | --: | --: | --: | --: | --: |
-| 256x64 | 8242 | 257.563 | 1.988 | 121.6 |
-| standalone unpack 256x64 | 5139 | 160.594 | 3.188 | - |
+| 256x64 | 7707 | 240.844 | 2.126 | 130.1 |
+| standalone unpack 256x64 | 2920 | 91.250 | 5.611 | - |
 
 What helped: payload-first 64-byte alignment, signed int8 to bf16 without a
 centering bias, two-term `d`, `broadcast_vector` for scale expansion (about
@@ -750,19 +851,39 @@ pressure.
 
 Q8_0 is the fastest format per packed byte; Q4_0 is faster per weight. Its
 constant-dequantizer profile is about 3786 cycles of mmul/loop overhead per
-256x64 (46%), so it is limited more by mmul/input scheduling than payload
-decode. The standalone unpack test is limited to 64 columns by the 64 KiB
+256x64, so it is limited more by mmul/input scheduling than payload decode. The standalone unpack test is limited to 64 columns by the 64 KiB
 output buffer; the fused kernel works at 64/128 columns. 256 columns need about
 68 KiB of packed weights and do not fit the current single-tile harness.
 
 ## Testing and exactness
 
+### Unprefixed exactness rule
+
+A quantization without a variant suffix (`q4_0`, `q6_k`, `q8_0`) must keep the
+canonical tile size and be exact over the canonical format's finite value
+range:
+
+- `tile_bytes == ceil64(4096 * canonical_bits_per_weight / 8)` for a 256x16
+  tile: Q4_0 2304, Q6_K 3360 -> 3392, Q8_0 4352;
+- unpacked bf16 weights equal the canonical dequantization bit-for-bit for
+  every quant code and every finite fp16 scale, including subnormals and zero.
+  Non-finite scales are out of scope. A format that grows the tile or relaxes
+  exactness takes a name (`q4_0_hilo`, `q6_k_int8`, `q4_0_packed16`).
+
+Current status: the size clause holds for all three. Exactness holds for Q4_0
+and Q6_K; Q8_0 was the exception until its pre-biased path was replaced by the
+exact exponent-add split. The size clause is only pinned by per-format
+`static_assert`s; nothing checks it against the canonical formula yet.
+
 - Keep a standalone exact unpack test as format/layout conformance. It catches
   scale, packing, and dequant errors that an end-to-end mmul tolerance test can
-  hide.
+  hide. The standalone loops are compiled only under
+  `QUANTS_BUILD_UNPACK_TEST`; their cycle counts are diagnostic and should not
+  drive format selection.
 - Keep the mmul test focused on end-to-end fused correctness.
 - Share scale/dequant helpers between the reference unpack and fused mmul so
-  the tests and production path cannot drift.
+  the tests and production path cannot drift; only the outer standalone loop
+  is test-only.
 - Q6_K `mmul.py --cols 256` exceeds the single-tile harness memory (about
   70 KiB of int8-packed weights plus inputs/outputs); use 64 or 128 columns
   until the stream is split.

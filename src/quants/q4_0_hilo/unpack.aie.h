@@ -47,6 +47,9 @@ static inline
 
 }  // namespace detail
 
+// Standalone unpack loops are test-only. The fused mmul path is the
+// production consumer and compiles only the detail helpers above.
+#if defined(QUANTS_BUILD_UNPACK_TEST)
 // Unpack one 64-row x 8-column chunk into the canonical bf16 weights tile.
 inline void unpack_weights_chunk(const uint8_t* packed,
                                  int weights_cols_tile,
@@ -96,5 +99,7 @@ inline void unpack_record(const uint8_t* packed,
   unpack_weights_chunk(packed, weights_cols_tile, weights_rows_record,
                        cols_pairs, 0, weights_tile);
 }
+
+#endif
 
 }  // namespace spiral::quants::q4_0_hilo

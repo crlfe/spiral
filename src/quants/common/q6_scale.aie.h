@@ -4,7 +4,6 @@
 
 #include <aie_api/aie.hpp>
 
-#include "quants/common/scale.aie.h"
 #include "quants/common/tile.h"
 
 // Shared exact scale path for the native and int8-expanded Q6_K variants.
@@ -12,16 +11,20 @@ namespace spiral::quants::q6_scale {
 
 constexpr int kScaleLanes = 32;
 constexpr int kScaleCols = 8;
+constexpr int kScaleBytes = kScaleCols * 2;
 
-// Split the per-column fp16 d values into exact bf16 hi/lo terms and expand
-// them to all subgroup scale lanes.
+// Load the host-precomputed exact bf16 hi/lo terms for the per-column d values
+// and expand them to all subgroup scale lanes. Canonical fp16 d values,
+// including subnormals, are split exactly on the host; the device never decodes
+// fp16 here.
 static inline __attribute__((always_inline)) void load_d16_terms(
-    const uint8_t* fp16_d,
+    const uint8_t* packed_d,
     aie::vector<bfloat16, kScaleLanes>& d_hi,
     aie::vector<bfloat16, kScaleLanes>& d_lo) {
-  aie::vector<bfloat16, 8> d_hi8;
-  aie::vector<bfloat16, 8> d_lo8;
-  split_bf16_hi_lo(load_fp16x8(fp16_d), d_hi8, d_lo8);
+  const auto d_hi8 =
+      aie::load_v<kScaleCols>(reinterpret_cast<const bfloat16*>(packed_d));
+  const auto d_lo8 = aie::load_v<kScaleCols>(
+      reinterpret_cast<const bfloat16*>(packed_d + kScaleBytes));
   d_hi = aie::broadcast_vector<kScaleCols, bfloat16, kScaleLanes>(d_hi8, 0);
   d_lo = aie::broadcast_vector<kScaleCols, bfloat16, kScaleLanes>(d_lo8, 0);
 }

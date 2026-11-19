@@ -8,11 +8,11 @@ technique and benchmark findings are in `NOTES.md`.
 
 | format | layout | host repack | exact unpack | fused mmul | tests | current best | next |
 | :-- | :-- | :-- | :-- | :-- | :-- | :-- | :-- |
-| Q4_0 | done | done | done | done | exact | 1.88 w/c | multi-core |
+| Q4_0 | done | done | done | done | exact | 2.08 w/c | multi-core |
 | Q4_0_hilo | done | done | done | done | exact | 2.25 w/c | multi-core |
 | Q6_K | done | done | done | done | exact | 1.65 w/c | multi-core |
 | Q6_K_int8 | done | done | done | done | exact | 1.81 w/c | multi-core, optional variants |
-| Q8_0 | done | done | done | done | exact | 1.99 w/c | multi-core |
+| Q8_0 | done | done | done | done | exact | 2.13 w/c | multi-core |
 | Q4_K | not started | - | - | - | - | - | plan below |
 | Q5_K | not started | - | - | - | - | - | share Q4_K scale/min |
 | BF16 / F16 | not started | - | - | - | - | - | pass-through controls |
@@ -55,13 +55,21 @@ Integration status:
    - verify single-token decode with the M=4 mmul zero-padded to four rows.
 
 3. **Q4_0 scale-layout decision**
-   - both `q4_0` (canonical-size fp16 scales) and `q4_0_hilo` (expanded bf16
-     hi/lo scales) are available;
-   - `q4_0` is compute-bound at 1.5 GHz (about 90B weights/s) and memory-bound
-     at 1.8 GHz (about 98B), while `q4_0_hilo` is memory-bound at 88B;
-   - `q4_0` wins at both target clocks, crossing over near 1.46 GHz;
-   - re-measure actual aggregate bandwidth before fixing the default for the
-     final driver.
+   - three variants are available: exact canonical `q4_0`, near-exact
+     `q4_0_packed16`, and exact host-expanded `q4_0_hilo`;
+   - fused 256x64: `q4_0` 7883, `q4_0_packed16` 7397, `q4_0_hilo` 7268;
+   - standalone unpack: 6579 / 5459 / 2916 (diagnostic only, not a selection
+     criterion);
+   - the 288-byte variants keep the bandwidth advantage over 320-byte
+     `q4_0_hilo` at 1.8 GHz;
+   - `q4_0_packed16` is near-exact (about 0.78% weight error, 3.9% worst-case
+     mmul error) and uses a named 5%-of-column mmul policy;
+   - [x] Gemma E2B model check for both variants: 64-token and 300-token
+     greedy outputs are byte-identical; packed16 is ~2% faster on decode and
+     ~5% faster on `pp8`.  The program trialled it as a build-time block
+     choice and then dropped it: the exact path improved to 7883 cycles
+     (6.2% kernel gap) and packed16 is near-exact rather than bit-exact, so
+     the format stays a `src/quants` variant only.
 
 4. **Output-head decision**
    - prefer native `q6_k` for the exact path: it is memory-bound at about 66B
@@ -73,9 +81,19 @@ Integration status:
 5. **Test coverage**
    - add full-shape streaming tests once the multi-core harness exists;
    - add real-model slices from the target tensor set;
+   - done: real `token_embd` Q6_K head slice compared against the CPU dequant
+     reference through `ggml-spiral`; max_abs 0.026 on max_cpu 10.07, and the
+     Q4_0 Gemma model output matches CPU;
    - keep the no-NPU and invalid-shape tests;
-   - cover host repack's subnormal-scale flush and the one-line warning, plus
-     a Q8_0 block containing `-128`.
+   - adopt the unprefixed exactness rule (canonical tile size plus bit-exact
+     dequantization for every finite fp16 scale) and gate it: exact-only
+     `verify()` for `q4_0`/`q6_k`/`q8_0`, an exhaustive 65536-pattern scale
+     split probe on the device, and a host check that repack stores canonical
+     scale bytes; non-finite scales stay out of scope.
+   - cover subnormal scales across Q4_0, q4_0_packed16, Q4_0_hilo, and Q8_0;
+     the synthetic goldens now mix normal, subnormal, and signed edge patterns.
+   - cover q4_0_packed16's rejection of inf/nan scales, plus a Q8_0 block
+     containing `-128`.
 
 ## Format bring-up plans
 
@@ -138,9 +156,10 @@ must not silently pass through the exact tolerances.
 
 ### Q4_0 relaxed single-bf16 mode
 
-- Exact variants: `q4_0` (raw fp16 scales, 288-byte records) and `q4_0_hilo`
-  (pre-split bf16 hi/lo scales, 320-byte records), packed eight per 256x16
-  transport tile.
+- Exact variants: `q4_0` (canonical fp16 scales, 288-byte records) and
+  `q4_0_hilo` (pre-split bf16 hi/lo scales, 320-byte records), packed eight per
+  256x16 transport tile. `q4_0_packed16` is a named near-exact 288-byte variant
+  with its own 5%-of-column mmul policy.
 - Relaxed `fast` mode: a single host-precomputed bf16 scale, 288-byte records,
   lower precision and fewer device cycles.
 - Keep the exact non-template `unpack_record()` / `unpack_weights_chunk()`
@@ -181,9 +200,10 @@ must not silently pass through the exact tolerances.
 - IQ formats: prototype the hardware LUT path before writing scalar gathers.
 - Re-measure code size after the host-scale and int8-payload changes if code
   size becomes relevant.
-- Keep `split_bf16_hi_lo()` as the shared device-side scale split; Q8_0 uses
-  it for its fp16 `d`. Q4_0 no longer calls it because host repack now
-  precomputes the pair.
+- Keep `split_fp16_exact()` as the one shared device-side scale split; Q4_0
+  and Q8_0 both batch 32 canonical fp16 scales through it. The pre-biased
+  `load_fp16x8_biased()` / `fp16_prebias_scale()` path and the then-unused
+  `split_bf16_hi_lo()` were removed when Q8_0 switched to the exact split.
 - Do not reintroduce cursor objects, per-column `noinline` helpers, or
   struct-based hot-path access unless they measurably beat the direct
   two-column path.
@@ -294,8 +314,8 @@ Repack and transport operate on 256-row x 16-column tiles:
 - Tiles are stored row-block-major then column-pair-major:
   `tile_index = rows_tile * (weights_cols / kTransportTileCols) + col_pair`.
 - Q8_0, Q6_K, and Q6_K_int8 have 256-row records, so one tile holds two records.
-- Q4_0 and Q4_0_hilo have 64-row records, so one tile holds eight records
-  (four row records x two columns).
+- Q4_0, q4_0_packed16, and Q4_0_hilo have 64-row records, so one tile holds
+  eight records (four row records x two columns).
 
 Each format defines tile-local pointer helpers in `layout.h`, typically
 `record_payloads()`, `record_scales()`, `block_payloads()`,
@@ -324,7 +344,11 @@ int64_t repack_weights(const uint8_t* src,
 supports views with padding. Invalid dimensions or insufficient capacity return
 `0`.
 
-### Unpack API
+### Unpack API (test-only)
+
+These loops are compiled only when the test shim defines
+`QUANTS_BUILD_UNPACK_TEST`; the fused mmul is the production consumer. Treat
+their cycle counts as diagnostic, not as a format-selection criterion.
 
 ```cpp
 void unpack_record(const uint8_t* packed,
@@ -341,11 +365,12 @@ void unpack_weights_chunk(const uint8_t* packed,
                           bfloat16* weights_tile);
 ```
 
-`unpack_record()` is the preferred entry point: the shim passes the packed base
-and logical column-tile/row-record index, and the format resolves the transport
+`unpack_record()` is the test entry point: the shim passes the packed base and
+logical column-tile/row-record index, and the format resolves the transport
 tile, loads per-record metadata once, and writes all chunks. Q6_K and
-Q6_K_int8 hoist `d` at this level. `unpack_weights_chunk()` remains the
-per-chunk compatibility entry point.
+Q6_K_int8 hoist `d` at this level. `unpack_weights_chunk()` is the per-chunk
+test entry point. Keep these loops simple and correct; do not tune them for
+cycles unless the fused path needs the same helper.
 
 ### Fused API
 
@@ -372,9 +397,13 @@ two accumulators' mmuls.
 ```text
 canonical block: 32 rows, 18 bytes
 payload: 8 x 16-byte signed-int4 4x8 payloads per 32-row block
-scales:  8 raw fp16 values per 32-row block, 16 bytes
+scales:  8 canonical fp16 values per 32-row block, 16 bytes
 record:  64 rows, 32 bytes of scales then 256 bytes of payloads
 ```
+
+`q4_0_packed16` uses the same 288-byte record and payload layout, but each
+scale slot stores the host-packed 16-bit code (9-bit fraction). It is
+near-exact and has a named 5%-of-column mmul verification policy.
 
 `q4_0_hilo` (host-expanded) uses 320-byte records (5.0 bits/weight):
 
@@ -383,10 +412,10 @@ scales:  8 pre-split bf16 hi/lo pairs per 32-row block, 32 bytes
 record:  64 rows, 64 bytes of scales then 256 bytes of payloads
 ```
 
-Both pack eight records into a 256x16 transport tile (2304 bytes for `q4_0`,
-2560 bytes for `q4_0_hilo`). Records are ordered by local column tile, then
-local row record. Every 32-byte payload tile is 32-byte aligned; `load_v<32>`
-is valid.
+All three pack eight records into a 256x16 transport tile (2304 bytes for
+`q4_0` and `q4_0_packed16`, 2560 bytes for `q4_0_hilo`). Records are ordered by
+local column tile, then local row record. Every 32-byte payload tile is
+32-byte aligned; `load_v<32>` is valid.
 
 ### Q6_K
 
@@ -396,8 +425,7 @@ is valid.
 ```text
 3072 bytes  2 x 4 x (256-byte low-nibble plane + 128-byte high plane)
  256 bytes  2 x 4 x 32 per-column int8 subgroup scales
-  32 bytes  2 x 16 per-column fp16 d
-  32 bytes  shared tile tail padding
+  64 bytes  2 x 32 per-column bf16 d hi/lo pair
 ```
 
 The device decodes four 8x8 row tiles at a time, sharing one 64-byte high-plane
@@ -409,16 +437,15 @@ load across the group. A 64-row chunk needs six 64-byte payload loads.
 ```text
 4096 bytes  2 x 4 x 512-byte int8 chunks (signed q - 32)
  256 bytes  2 x 4 x 32 per-column int8 subgroup scales
-  32 bytes  2 x 16 per-column fp16 d
-  32 bytes  shared tile tail padding
+  64 bytes  2 x 32 per-column bf16 d hi/lo pair
 ```
 
 The host repack expands each 6-bit weight to signed int8, so device decode is a
 64-byte load and `to_float<bfloat16>`. Every payload chunk is 512 bytes, so all
 eight 64-byte 8x8 tiles in a chunk are naturally aligned.
 
-The `q6_k_int8` mmul keeps its four-iteration chunk loop rolled (4752 bytes,
-29.0% of program memory). Native `q6_k` uses 5232 bytes (31.9%).
+The `q6_k_int8` mmul keeps its four-iteration chunk loop rolled (4368 bytes,
+26.7% of program memory). Native `q6_k` uses 4992 bytes (30.5%).
 
 ### Q8_0
 
@@ -442,12 +469,14 @@ src/quants/
   TODO.md                     this file
   common/
     tile.h                    mmul tile shape constants
-    scale.aie.h               fp16x8 load; device bf16 split helper
+    scale.aie.h               exact fp16 exponent-add split helpers
     q6_scale.aie.h            shared Q6_K exact scale path
     mmul.aie.h                mmul tile helper
   q4_0/
     layout.h, repack.h, unpack.aie.h, mmul.aie.h
   q4_0_hilo/
+    layout.h, repack.h, unpack.aie.h, mmul.aie.h
+  q4_0_packed16/
     layout.h, repack.h, unpack.aie.h, mmul.aie.h
   q6_k/
     layout.h, repack.h, unpack.aie.h, mmul.aie.h
@@ -459,7 +488,7 @@ src/quants/
     common.py, unpack.py, mmul.py
     unpack.aie.cc, mmul.aie.cc, repack.cc
     formats/
-      q4_0.py, q4_0_hilo.py, q6_k.py, q6_k_int8.py, q8_0.py
+      q4_0.py, q4_0_hilo.py, q4_0_packed16.py, q6_k.py, q6_k_int8.py, q8_0.py
 ```
 
 Planned additions:
@@ -478,12 +507,14 @@ kernels share one implementation.
 ## Shared implementation work
 
 - `common/tile.h` holds the `aie::mmul<4,8,8>` shape constants.
-- `common/scale.aie.h` provides `load_fp16x8()`. `q4_0` uses it with
-  `split_bf16_hi_lo()` on the device; `q4_0_hilo` performs the split in host
-  repack. The same device split path is reused by both Q6_K variants.
-- `common/q6_scale.aie.h` holds the shared Q6_K scale path: `d` split, exact
-  three-term chunk scales, subgroup broadcast, and scale application. Both
-  `q6_k` and `q6_k_int8` wrap their format-specific record accessors around it.
+- `common/scale.aie.h` provides the exact `split_fp16x16_exact()` /
+  `split_fp16x32_exact()` exponent-add helpers. Q4_0 and Q8_0 decode canonical
+  fp16 scales with them; `q4_0_hilo` performs the split in host repack; Q6_K
+  loads host-precomputed bf16 hi/lo `d` terms directly.
+- `common/q6_scale.aie.h` holds the shared Q6_K scale path: bf16 hi/lo `d`
+  load, exact three-term chunk scales, subgroup broadcast, and scale
+  application. Both `q6_k` and `q6_k_int8` wrap their format-specific record
+  accessors around it.
 - `common/mmul.aie.h` provides the vector mmul tile helper.
 - `q4_0/unpack.aie.h` provides `load_block_scales64()` and
   `dequantize_tile()` used by both the reference unpack and fused mmul.
@@ -534,7 +565,9 @@ kernels share one implementation.
 - [ ] Q4_K and Q5_K host repacks and dequantization match the host reference.
 - [ ] Q4_K and Q5_K NPU unpack and mmul pass on a device.
 - [x] Q4_0 fused two-column unpack + mmul passes exactly.
-- [x] Both Q4_0 variants (canonical fp16 scales and host hi/lo) pass on a device.
+- [x] q4_0_packed16 passes its named near-exact verification on a device.
+- [x] All Q4_0 variants (canonical exact, packed16 near-exact, host hi/lo) pass
+      on a device.
 - [x] All formats repack into contiguous, 64-byte-aligned 256x16 transport tiles.
 - [ ] Q4_0 fast single-bf16 scale mode is exposed through a named variant with
       per-variant verification.

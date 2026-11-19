@@ -37,7 +37,8 @@ constexpr int64_t packed_bytes(int64_t weights_rows, int64_t weights_cols) {
 
 // Repack canonical column-major Q4_0 tensor bytes into 256-row x 16-column
 // transport tiles. Values are reordered inside each tile so payloads and
-// scales are contiguous and 64-byte aligned.
+// scales are contiguous and 64-byte aligned. Scales are stored as canonical
+// fp16; the device decodes them exactly, including subnormals.
 inline int64_t repack_weights(const uint8_t* src,
                               int64_t src_col_stride_bytes,
                               uint8_t* dst,
@@ -46,8 +47,7 @@ inline int64_t repack_weights(const uint8_t* src,
                               int64_t weights_cols) {
   const int64_t tiles = tile_count(weights_rows, weights_cols);
   const int64_t bytes = tiles * kPackedTransportTileBytes;
-  if (tiles == 0 || bytes > dst_capacity || src == nullptr ||
-      dst == nullptr) {
+  if (tiles == 0 || bytes > dst_capacity || src == nullptr || dst == nullptr) {
     return 0;
   }
   if (src_col_stride_bytes < (weights_rows / kBlockRows) * kBlockBytes) {
@@ -59,7 +59,6 @@ inline int64_t repack_weights(const uint8_t* src,
   const int64_t rows_records = weights_rows / kRecordRows;
   const int64_t blocks_per_record = kRecordRows / kBlockRows;
   memset(dst, 0, bytes);
-  spiral::quants::detail::RepackWarnings warnings;
 
   for (int64_t weights_cols_tile = 0; weights_cols_tile < cols_tiles;
        ++weights_cols_tile) {
@@ -71,12 +70,10 @@ inline int64_t repack_weights(const uint8_t* src,
           static_cast<int>(weights_rows_record % kRowsRecordsPerTile);
       const int64_t rows_tile = weights_rows_record / kRowsRecordsPerTile;
       uint8_t* tile =
-          dst + (rows_tile * cols_pairs + col_pair) *
-                    kPackedTransportTileBytes;
+          dst + (rows_tile * cols_pairs + col_pair) * kPackedTransportTileBytes;
       uint8_t* record_payload_base =
           record_payloads(tile, local_col, local_row);
-      uint8_t* record_scale_base =
-          record_scales(tile, local_col, local_row);
+      uint8_t* record_scale_base = record_scales(tile, local_col, local_row);
 
       for (int weights_rows_block = 0; weights_rows_block < blocks_per_record;
            ++weights_rows_block) {
@@ -95,12 +92,7 @@ inline int64_t repack_weights(const uint8_t* src,
                                  weights_rows_block_index * kBlockBytes;
 
           uint8_t* scale = scales + weights_cols_in_tile * kBlockScaleBytes;
-          uint16_t scale_bits = load_u16(block);
-          if (fp16_is_subnormal(scale_bits)) {
-            scale_bits = 0;
-            warnings.subnormal_scale = true;
-          }
-          store_u16(scale, scale_bits);
+          store_u16(scale, load_u16(block));
 
           for (int payload_index = 0; payload_index < kPayloadsPerBlock;
                ++payload_index) {
@@ -129,7 +121,6 @@ inline int64_t repack_weights(const uint8_t* src,
     }
   }
 
-  warnings.warn("Q4_0");
   return bytes;
 }
 

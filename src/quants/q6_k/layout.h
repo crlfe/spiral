@@ -23,9 +23,9 @@ constexpr int kChunksPerRecord = 4;
 
 // The repack unit and transport unit is 256 rows x 16 columns, i.e. two
 // adjacent 8-column records. All payloads come first, then the per-chunk
-// scales, then the per-column fp16 d values, then 32 bytes of tail padding.
-// This keeps the payload planes and scale loads aligned while sharing a single
-// 64-byte tail between the two records.
+// scales, then the per-column bf16 hi/lo d pairs. The d region absorbs the
+// former 32-byte tail padding, so the tile still ends on a 64-byte boundary
+// while sharing its layout between the two records.
 constexpr int kTransportTileRows = 256;
 constexpr int kTransportTileCols = 16;
 constexpr int kRecordsPerTransportTile = kTransportTileCols / kTileCols;
@@ -39,7 +39,12 @@ constexpr int kPackedPayloadsPerRecordBytes =
     kChunksPerRecord * kPackedChunkPayloadBytes;
 constexpr int kPackedScalesPerRecordBytes =
     kChunksPerRecord * kPackedChunkScalesBytes;
-constexpr int kCommonScaleBytes = kTileCols * kBlockScaleBytes;
+// The per-column fp16 d value is pre-split on the host into an exact bf16
+// hi/lo pair, stored as two planes. This keeps subnormal canonical d values
+// exactly representable without any device-side fp16 decode.
+constexpr int kPackedScaleBytesPerCol = 4;
+constexpr int kCommonScalePlaneBytes = kTileCols * kBlockScaleBytes;
+constexpr int kCommonScaleBytes = kTileCols * kPackedScaleBytesPerCol;
 
 constexpr int kTransportTilePayloadsBytes =
     kRecordsPerTransportTile * kPackedPayloadsPerRecordBytes;
@@ -81,9 +86,13 @@ static_assert(kTileScalesOffset % 32 == 0,
               "Q6_K chunk scales must start 32-byte aligned");
 static_assert(kTileCommonScalesOffset % 16 == 0,
               "Q6_K d values must start 16-byte aligned");
+static_assert(kCommonScalePlaneBytes % 16 == 0,
+              "Q6_K d hi/lo planes must keep 16-byte alignment");
+static_assert(kCommonScaleBytes == 2 * kCommonScalePlaneBytes,
+              "Q6_K d record must hold one bf16 hi and lo plane");
 static_assert(kTransportTilePayloadsBytes % 64 == 0,
               "Q6_K payload region must keep 64-byte alignment");
-static_assert(kPackedTransportTileDataBytes == 3360,
+static_assert(kPackedTransportTileDataBytes == 3392,
               "Q6_K transport tile data size changed");
 static_assert(kPackedTransportTileBytes == 3392,
               "Q6_K transport tile size changed");

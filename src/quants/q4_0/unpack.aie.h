@@ -11,20 +11,15 @@ namespace spiral::quants::q4_0 {
 
 namespace detail {
 
-// Load, split, and expand one 32-row block's scales to one 64-lane vector per
-// bf16 component.
-static inline __attribute__((always_inline)) void load_block_scales64(
-    const uint8_t* scales,
-    int weights_rows_block,
-    aie::vector<bfloat16, kMmulWeightsElems>& hi,
-    aie::vector<bfloat16, kMmulWeightsElems>& lo) {
-  const auto block_scale_values =
-      load_fp16x8(block_scales(scales, weights_rows_block));
-  aie::vector<bfloat16, 8> hi8;
-  aie::vector<bfloat16, 8> lo8;
-  split_bf16_hi_lo(block_scale_values, hi8, lo8);
-  hi = aie::broadcast_vector<kTileCols, bfloat16, kMmulWeightsElems>(hi8, 0);
-  lo = aie::broadcast_vector<kTileCols, bfloat16, kMmulWeightsElems>(lo8, 0);
+// Expand one eight-column scale chunk to the 64-lane mmul vector.
+template <unsigned Elems>
+static inline __attribute__((always_inline)) void expand_scale64(
+    const aie::vector<bfloat16, Elems>& terms,
+    int chunk,
+    aie::vector<bfloat16, kMmulWeightsElems>& out) {
+  const auto short_terms = terms.template extract<kTileCols>(chunk);
+  out = aie::broadcast_vector<kTileCols, bfloat16, kMmulWeightsElems>(
+      short_terms, 0);
 }
 
 // Dequantize one 8x8 tile from the packed chunk.
@@ -47,6 +42,9 @@ static inline
 
 }  // namespace detail
 
+// Standalone unpack loops are test-only. The fused mmul path is the
+// production consumer and compiles only the detail helpers above.
+#if defined(QUANTS_BUILD_UNPACK_TEST)
 // Unpack one 64-row x 8-column chunk into the canonical bf16 weights tile.
 inline void unpack_weights_chunk(const uint8_t* packed,
                                  int weights_cols_tile,
@@ -68,12 +66,19 @@ inline void unpack_weights_chunk(const uint8_t* packed,
   const uint8_t* payloads = record_payloads(tile, local_col, local_row);
   const uint8_t* scales = record_scales(tile, local_col, local_row);
 
+  // One record carries two blocks of eight column scales, contiguous as 16
+  // canonical fp16 values. Decode them once, then expand a block at a time.
+  aie::vector<bfloat16, 16> hi16;
+  aie::vector<bfloat16, 16> lo16;
+  split_fp16x16_exact(scales, hi16, lo16);
+
   constexpr int kTilesPerBlock = kBlockRows / kMmulWeightsRows;
   for (int weights_rows_block = 0; weights_rows_block < kBlocksPerRecord;
        ++weights_rows_block) {
     aie::vector<bfloat16, kMmulWeightsElems> hi;
     aie::vector<bfloat16, kMmulWeightsElems> lo;
-    detail::load_block_scales64(scales, weights_rows_block, hi, lo);
+    detail::expand_scale64(hi16, weights_rows_block, hi);
+    detail::expand_scale64(lo16, weights_rows_block, lo);
 
 #pragma unroll
     for (int tile_index = 0; tile_index < kTilesPerBlock; ++tile_index) {
@@ -95,5 +100,7 @@ inline void unpack_record(const uint8_t* packed,
   unpack_weights_chunk(packed, weights_cols_tile, weights_rows_record,
                        cols_pairs, 0, weights_tile);
 }
+
+#endif
 
 }  // namespace spiral::quants::q4_0

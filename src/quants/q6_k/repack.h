@@ -37,7 +37,8 @@ constexpr int64_t packed_bytes(int64_t weights_rows, int64_t weights_cols) {
 
 // Repack canonical column-major Q6_K into 256-row x 16-column transport tiles,
 // preserving the native six-bit payload. Values are reordered inside each tile
-// so both records' payloads, scales, and d values are contiguously aligned.
+// so both records' payloads, scales, and exact bf16 hi/lo d pairs are
+// contiguously aligned.
 inline int64_t repack_weights(const uint8_t* src,
                               int64_t src_col_stride_bytes,
                               uint8_t* dst,
@@ -62,7 +63,6 @@ inline int64_t repack_weights(const uint8_t* src,
   constexpr int kQlHalfBytes = kBlockQlBytes / 2;
   constexpr int kQhHalfBytes = kBlockQhBytes / 2;
   memset(dst, 0, bytes);
-  spiral::quants::detail::RepackWarnings warnings;
 
   for (int64_t rows_record = 0; rows_record < blocks_per_col; ++rows_record) {
     for (int64_t cols_tile = 0; cols_tile < cols_tiles; ++cols_tile) {
@@ -82,13 +82,16 @@ inline int64_t repack_weights(const uint8_t* src,
         qh[col] = block + kBlockQlBytes;
         col_scales[col] = block + kBlockQlBytes + kBlockQhBytes;
 
-        uint16_t d_bits = load_u16(block + kBlockBytes - kBlockScaleBytes);
-        if (fp16_is_subnormal(d_bits)) {
-          d_bits = 0;
-          warnings.subnormal_scale = true;
-        }
-        store_u16(record_scales(tile, local_col) + col * kBlockScaleBytes,
-                  d_bits);
+        const uint16_t d_bits =
+            load_u16(block + kBlockBytes - kBlockScaleBytes);
+        const float d_f32 = spiral::quants::detail::fp16_to_f32(d_bits);
+        const uint16_t d_hi = spiral::quants::detail::f32_to_bf16(d_f32);
+        const uint16_t d_lo = spiral::quants::detail::f32_to_bf16(
+            d_f32 - spiral::quants::detail::bf16_to_f32(d_hi));
+        uint8_t* record_d = record_scales(tile, local_col);
+        store_u16(record_d + col * kBlockScaleBytes, d_hi);
+        store_u16(record_d + kCommonScalePlaneBytes + col * kBlockScaleBytes,
+                  d_lo);
       }
 
       // Canonical ql is 128 bytes: two 64-byte halves. qh is 64 bytes: two
@@ -139,7 +142,6 @@ inline int64_t repack_weights(const uint8_t* src,
     }
   }
 
-  warnings.warn("Q6_K");
   return bytes;
 }
 

@@ -55,32 +55,43 @@ inline void unpack_mmul(const uint8_t* packed,
       const InputVec* inputs_slice =
           input_tiles + weights_rows_record * kRecordRows / kTileRows;
 
-      for (int block = 0; block < kBlocksPerRecord; ++block) {
-        aie::vector<bfloat16, kTileCols> hi8_0, lo8_0;
-        aie::vector<bfloat16, kTileCols> hi8_1, lo8_1;
-        detail::load_block_scales(block_scales(packed_chunk0, block), hi8_0,
-                                  lo8_0);
-        detail::load_block_scales(block_scales(packed_chunk1, block), hi8_1,
-                                  lo8_1);
-
-        aie::vector<bfloat16, kMmulWeightsElems> hi0, lo0;
-        aie::vector<bfloat16, kMmulWeightsElems> hi1, lo1;
-        detail::expand_scales64(hi8_0, lo8_0, hi0, lo0);
-        detail::expand_scales64(hi8_1, lo8_1, hi1, lo1);
+      const uint8_t* scales0 = block_scales(packed_chunk0, 0);
+      const uint8_t* scales1 = block_scales(packed_chunk1, 0);
 
 #pragma unroll
-        for (int tile_index = 0; tile_index < kTilesPerBlock; ++tile_index) {
-          const int weights_rows_tile =
-              block * kTilesPerBlock + tile_index;
-          const InputVec& inputs_tile = inputs_slice[weights_rows_tile];
-          spiral::quants::mmul_weights_tile(
-              accumulator0, inputs_tile,
-              detail::dequantize_tile(packed_chunk0, block, tile_index, hi0,
-                                      lo0));
-          spiral::quants::mmul_weights_tile(
-              accumulator1, inputs_tile,
-              detail::dequantize_tile(packed_chunk1, block, tile_index, hi1,
-                                      lo1));
+      for (int batch = 0; batch < kBlocksPerRecord / kBlocksPerDecode;
+           ++batch) {
+        // Decode four blocks' canonical fp16 scales into one exact 32-lane
+        // batch for each column record.
+        aie::vector<bfloat16, kScaleLanes> hi32_0, lo32_0;
+        aie::vector<bfloat16, kScaleLanes> hi32_1, lo32_1;
+        detail::load_scales32(scales0 + batch * kScaleBytesPerDecode, hi32_0,
+                              lo32_0);
+        detail::load_scales32(scales1 + batch * kScaleBytesPerDecode, hi32_1,
+                              lo32_1);
+
+#pragma unroll
+        for (int block_in_batch = 0; block_in_batch < kBlocksPerDecode;
+             ++block_in_batch) {
+          const int block = batch * kBlocksPerDecode + block_in_batch;
+          aie::vector<bfloat16, kMmulWeightsElems> hi0, lo0;
+          aie::vector<bfloat16, kMmulWeightsElems> hi1, lo1;
+          detail::expand_scales64(hi32_0, lo32_0, block_in_batch, hi0, lo0);
+          detail::expand_scales64(hi32_1, lo32_1, block_in_batch, hi1, lo1);
+
+#pragma unroll
+          for (int tile_index = 0; tile_index < kTilesPerBlock; ++tile_index) {
+            const int weights_rows_tile = block * kTilesPerBlock + tile_index;
+            const InputVec& inputs_tile = inputs_slice[weights_rows_tile];
+            spiral::quants::mmul_weights_tile(
+                accumulator0, inputs_tile,
+                detail::dequantize_tile(packed_chunk0, block, tile_index, hi0,
+                                        lo0));
+            spiral::quants::mmul_weights_tile(
+                accumulator1, inputs_tile,
+                detail::dequantize_tile(packed_chunk1, block, tile_index, hi1,
+                                        lo1));
+          }
         }
       }
     }

@@ -117,8 +117,13 @@ def main():
         inputs_vecs, case.weights_cols
     )
     error = np.abs(actual_outputs - expected_outputs)
+    if hasattr(fmt, "output_tolerance"):
+        tolerance = fmt.output_tolerance(expected_outputs)
+    else:
+        column_scale = np.abs(expected_outputs).max(axis=0)
+        tolerance = np.maximum(1e-5, 1e-3 * column_scale)
 
-    if np.allclose(actual_outputs, expected_outputs, rtol=1e-3, atol=1e-3):
+    if np.all(error <= tolerance):
         print(f"verified mmul (max abs error {error.max():.6f})")
         return 0
 

@@ -13,11 +13,10 @@ namespace spiral::quants::q6_k_int8 {
 
 namespace detail {
 
-// Load the per-column fp16 `d` values once per record and split them into
-// exact bf16 hi/lo terms. The product of `d` and an 8-bit subgroup scale needs
-// up to 18 significand bits, so the product is split into three bf16 terms:
-// two terms are not always enough to round to the same bf16 as an fp32
-// multiply.
+// Load the per-column exact bf16 hi/lo `d` terms once per record. The product
+// of `d` and an 8-bit subgroup scale needs up to 18 significand bits, so the
+// product is split into three bf16 terms: two terms are not always enough to
+// round to the same bf16 as an fp32 multiply.
 static inline __attribute__((always_inline)) void load_d16(
     const uint8_t* tile,
     int local_col,
@@ -70,6 +69,9 @@ static inline
 
 }  // namespace detail
 
+// Standalone unpack loops are test-only. The fused mmul path is the
+// production consumer and compiles only the detail helpers above.
+#if defined(QUANTS_BUILD_UNPACK_TEST)
 // Unpack one chunk with the record's d terms already loaded.
 inline void unpack_chunk_with_d(
     const uint8_t* tile,
@@ -147,5 +149,7 @@ inline void unpack_record(const uint8_t* packed,
                         weights_tile + chunk_index * kChunkElems);
   }
 }
+
+#endif
 
 }  // namespace spiral::quants::q6_k_int8

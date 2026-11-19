@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <string.h>
 
 // Host-side repack helpers shared by every format. This header is also
 // included by callers that compile the repackers inline (tests and
@@ -26,39 +27,44 @@ static inline void store_u16(uint8_t* p, uint16_t value) {
   p[1] = static_cast<uint8_t>(value >> 8);
 }
 
-// Subnormal scales are flushed to zero in host repack. The device fp16
-// conversion treats exp == 0 as zero, so the repacked stream must not rely on
-// subnormal values.
-static inline bool fp16_is_subnormal(uint16_t h) {
-  return (h & 0x7c00u) == 0 && (h & 0x03ffu) != 0;
-}
-
 namespace detail {
 
-struct RepackWarnings {
-  bool subnormal_scale = false;
-  bool min_int8 = false;
-
-  // Emit at most one line per repack call, regardless of how many values
-  // triggered the warning.
-  void warn(const char* format) const {
-    (void)format;
-    if (!subnormal_scale && !min_int8) {
-      return;
-    }
-    if (subnormal_scale && min_int8) {
-      QUANTS_REPACK_WARN(
-          "quants: %s repack flushed subnormal fp16 scales to zero and found "
-          "-128 int8 weights\n",
-          format);
-    } else if (subnormal_scale) {
-      QUANTS_REPACK_WARN(
-          "quants: %s repack flushed subnormal fp16 scales to zero\n", format);
-    } else {
-      QUANTS_REPACK_WARN("quants: %s repack found -128 int8 weights\n", format);
-    }
+// Exact IEEE fp16 -> f32 conversion, including subnormals. Subnormal fp16 is
+// mantissa * 2^-24, which is exactly representable in f32.
+static inline float fp16_to_f32(uint16_t h) {
+  const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
+  const uint32_t exp = (h >> 10) & 0x1fu;
+  const uint32_t mant = h & 0x03ffu;
+  if (exp == 0) {
+    const float value = static_cast<float>(mant) * 0x1p-24f;
+    return (sign != 0) ? -value : value;
   }
-};
+  uint32_t bits;
+  if (exp == 0x1fu) {
+    bits = sign | 0x7f800000u | (mant << 13);
+  } else {
+    bits = sign | ((exp + 112u) << 23) | (mant << 13);
+  }
+  float out;
+  memcpy(&out, &bits, sizeof(out));
+  return out;
+}
+
+// Round f32 to bf16 with round-to-nearest-even.
+static inline uint16_t f32_to_bf16(float value) {
+  uint32_t bits;
+  memcpy(&bits, &value, sizeof(bits));
+  const uint32_t lsb = (bits >> 16) & 1u;
+  bits += 0x7fffu + lsb;
+  return static_cast<uint16_t>(bits >> 16);
+}
+
+static inline float bf16_to_f32(uint16_t h) {
+  const uint32_t bits = static_cast<uint32_t>(h) << 16;
+  float out;
+  memcpy(&out, &bits, sizeof(out));
+  return out;
+}
 
 }  // namespace detail
 

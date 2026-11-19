@@ -75,9 +75,11 @@ def main():
     actual_view = np.asarray(actual)
     top = common.top_level_intervals(intervals)
     cycles = common.total_cycles(top)
-    print(f"cycles: {cycles}")
-    print(f"cycles/tile: {cycles / case.tiles:.3f}")
-    print(f"weights/cycle: {case.expected_weights.size / cycles:.3f}")
+    # Standalone unpack is a correctness reference; these timings are only a
+    # diagnostic aid for the fused kernel path.
+    print(f"diagnostic cycles: {cycles}")
+    print(f"diagnostic cycles/tile: {cycles / case.tiles:.3f}")
+    print(f"diagnostic weights/cycle: {case.expected_weights.size / cycles:.3f}")
 
     ok, message = case.fmt.verify(actual_view, case.expected_weights)
     print(message if ok else f"FAILED: {message}")

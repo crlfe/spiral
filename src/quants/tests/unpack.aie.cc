@@ -15,6 +15,7 @@
 
 // clang-format off
 #include QUANTS_STRINGIFY(quants/QUANTS_FORMAT/layout.h)
+#define QUANTS_BUILD_UNPACK_TEST 1
 #include QUANTS_STRINGIFY(quants/QUANTS_FORMAT/unpack.aie.h)
 // clang-format on
 

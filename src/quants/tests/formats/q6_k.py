@@ -36,7 +36,21 @@ def make_raw(weights_rows, weights_cols, rng):
                 rng.integers(1, 33, SCALES_BYTES)
                 * rng.choice(np.array([-1, 1], dtype=np.int8), SCALES_BYTES)
             ).astype(np.int8)
-            d = np.array([rng.uniform(0.01, 0.1)], dtype=np.float16)
+            # Mix normal and subnormal d values. Subnormal bit patterns are
+            # written directly so the reference sees the exact canonical value
+            # without a float round-trip. The first block always covers the
+            # smallest and largest subnormal exponents; later blocks mix normal
+            # and edge-pattern subnormals.
+            edge_d = (0x0001, 0x03FF, 0x0200, 0x0300)
+            if _block == 0 and _col < len(edge_d):
+                d_bits = edge_d[_col]
+            elif rng.random() < 0.5:
+                d_bits = edge_d[(_col + _block) % len(edge_d)]
+            else:
+                d_bits = int(
+                    np.array([rng.uniform(0.01, 0.1)], dtype=np.float16)
+                    .view(np.uint16)[0]
+                )
             raw[offset : offset + QL_BYTES] = ql
             raw[offset + QL_BYTES : offset + QL_BYTES + QH_BYTES] = qh
             raw[
@@ -46,7 +60,7 @@ def make_raw(weights_rows, weights_cols, rng):
             raw[
                 offset + QL_BYTES + QH_BYTES + SCALES_BYTES :
                 offset + BLOCK_BYTES
-            ] = d.view(np.uint8)
+            ] = np.array([d_bits], dtype=np.uint16).view(np.uint8)
             offset += BLOCK_BYTES
 
     return raw
@@ -136,10 +150,25 @@ def verify(actual, expected):
         return False, f"shape mismatch: {actual.shape} != {expected.shape}"
 
     error = np.abs(actual.astype(np.float32) - expected.astype(np.float32))
-    expected_scale = np.abs(expected.astype(np.float32)).max()
+    expected_f = expected.astype(np.float32)
+    expected_scale = np.abs(expected_f).max()
     tolerance = max(0.02, 0.01 * float(expected_scale))
-    if error.max() <= tolerance:
+    if error.max() > tolerance:
+        return False, f"max abs error {error.max():.6f}"
+
+    # The absolute tolerance is dominated by the largest normal block, so it
+    # cannot see a flushed subnormal block. Nonzero values must also match
+    # within a bf16-relative tolerance.
+    nonzero = expected_f != 0
+    if np.any(nonzero):
+        relative = error[nonzero] / np.abs(expected_f[nonzero])
+        if relative.max() > 0.02:
+            return False, (
+                f"max relative error {relative.max():.6f} "
+                f"(max abs error {error.max():.6f})"
+            )
         return True, (
-            f"within Q6_K tolerance (max abs error {error.max():.6f})"
+            f"within Q6_K tolerance (max abs error {error.max():.6f}, "
+            f"max relative error {relative.max():.6f})"
         )
-    return False, f"max abs error {error.max():.6f}"
+    return True, f"within Q6_K tolerance (max abs error {error.max():.6f})"

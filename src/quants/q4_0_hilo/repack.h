@@ -1,6 +1,5 @@
 #pragma once
 
-#include <math.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -8,43 +7,6 @@
 #include "quants/q4_0_hilo/layout.h"
 
 namespace spiral::quants::q4_0_hilo {
-
-namespace detail {
-
-static inline float fp16_to_f32(uint16_t h) {
-  const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
-  const uint32_t exp = (h >> 10) & 0x1fu;
-  const uint32_t mant = h & 0x03ffu;
-  uint32_t bits;
-  if (exp == 0) {
-    const float value = ldexpf(static_cast<float>(mant), -24);
-    return (sign != 0) ? -value : value;
-  } else if (exp == 0x1f) {
-    bits = sign | 0x7f800000u | (mant << 13);
-  } else {
-    bits = sign | ((exp + 112u) << 23) | (mant << 13);
-  }
-  float out;
-  memcpy(&out, &bits, sizeof(out));
-  return out;
-}
-
-static inline uint16_t f32_to_bf16(float value) {
-  uint32_t bits;
-  memcpy(&bits, &value, sizeof(bits));
-  const uint32_t lsb = (bits >> 16) & 1u;
-  bits += 0x7fffu + lsb;
-  return static_cast<uint16_t>(bits >> 16);
-}
-
-static inline float bf16_to_f32(uint16_t h) {
-  const uint32_t bits = static_cast<uint32_t>(h) << 16;
-  float out;
-  memcpy(&out, &bits, sizeof(out));
-  return out;
-}
-
-}  // namespace detail
 
 constexpr int64_t tile_count(int64_t weights_rows, int64_t weights_cols) {
   if (weights_rows <= 0 || weights_cols <= 0) {
@@ -75,7 +37,8 @@ constexpr int64_t packed_bytes(int64_t weights_rows, int64_t weights_cols) {
 
 // Repack canonical column-major Q4_0 tensor bytes into 256-row x 16-column
 // transport tiles. Values are reordered inside each tile so payloads and
-// host-precomputed bf16 hi/lo scale pairs are contiguous.
+// host-precomputed bf16 hi/lo scale pairs are contiguous. The host split is
+// exact for normal and subnormal fp16 scales.
 inline int64_t repack_weights(const uint8_t* src,
                               int64_t src_col_stride_bytes,
                               uint8_t* dst,
@@ -97,7 +60,6 @@ inline int64_t repack_weights(const uint8_t* src,
   const int64_t rows_records = weights_rows / kRecordRows;
   const int64_t blocks_per_record = kRecordRows / kBlockRows;
   memset(dst, 0, bytes);
-  spiral::quants::detail::RepackWarnings warnings;
 
   for (int64_t weights_cols_tile = 0; weights_cols_tile < cols_tiles;
        ++weights_cols_tile) {
@@ -133,11 +95,7 @@ inline int64_t repack_weights(const uint8_t* src,
                                  weights_cols_index * src_col_stride_bytes +
                                  weights_rows_block_index * kBlockBytes;
 
-          uint16_t scale_bits = load_u16(block);
-          if (fp16_is_subnormal(scale_bits)) {
-            scale_bits = 0;
-            warnings.subnormal_scale = true;
-          }
+          const uint16_t scale_bits = load_u16(block);
           const float scale_f32 = detail::fp16_to_f32(scale_bits);
           const uint16_t hi = detail::f32_to_bf16(scale_f32);
           const uint16_t lo =
@@ -173,7 +131,6 @@ inline int64_t repack_weights(const uint8_t* src,
     }
   }
 
-  warnings.warn("Q4_0 hilo");
   return bytes;
 }
 

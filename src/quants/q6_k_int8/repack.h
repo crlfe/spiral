@@ -46,8 +46,7 @@ inline int64_t repack_weights(const uint8_t* src,
                               int64_t weights_cols) {
   const int64_t tiles = tile_count(weights_rows, weights_cols);
   const int64_t bytes = tiles * kPackedTransportTileBytes;
-  if (tiles == 0 || bytes > dst_capacity || dst == nullptr ||
-      src == nullptr) {
+  if (tiles == 0 || bytes > dst_capacity || dst == nullptr || src == nullptr) {
     return 0;
   }
   const int64_t blocks_per_col = weights_rows / kBlockRows;
@@ -58,15 +57,13 @@ inline int64_t repack_weights(const uint8_t* src,
   const int64_t cols_tiles = weights_cols / kTileCols;
   const int64_t cols_pairs = weights_cols / kTransportTileCols;
   memset(dst, 0, bytes);
-  spiral::quants::detail::RepackWarnings warnings;
 
   for (int64_t rows_record = 0; rows_record < blocks_per_col; ++rows_record) {
     for (int64_t cols_tile = 0; cols_tile < cols_tiles; ++cols_tile) {
       const int64_t col_pair = cols_tile / 2;
       const int local_col = static_cast<int>(cols_tile % 2);
-      uint8_t* tile =
-          dst + (rows_record * cols_pairs + col_pair) *
-                    kPackedTransportTileBytes;
+      uint8_t* tile = dst + (rows_record * cols_pairs + col_pair) *
+                                kPackedTransportTileBytes;
       uint8_t* record_d = record_scales(tile, local_col);
 
       for (int col = 0; col < kTileCols; ++col) {
@@ -77,12 +74,15 @@ inline int64_t repack_weights(const uint8_t* src,
         const uint8_t* qh = block + kBlockQlBytes;
         const uint8_t* scales = block + kBlockQlBytes + kBlockQhBytes;
 
-        uint16_t d_bits = load_u16(block + kBlockBytes - kBlockScaleBytes);
-        if (fp16_is_subnormal(d_bits)) {
-          d_bits = 0;
-          warnings.subnormal_scale = true;
-        }
-        store_u16(record_d + col * kBlockScaleBytes, d_bits);
+        const uint16_t d_bits =
+            load_u16(block + kBlockBytes - kBlockScaleBytes);
+        const float d_f32 = spiral::quants::detail::fp16_to_f32(d_bits);
+        const uint16_t d_hi = spiral::quants::detail::f32_to_bf16(d_f32);
+        const uint16_t d_lo = spiral::quants::detail::f32_to_bf16(
+            d_f32 - spiral::quants::detail::bf16_to_f32(d_hi));
+        store_u16(record_d + col * kBlockScaleBytes, d_hi);
+        store_u16(record_d + kCommonScalePlaneBytes + col * kBlockScaleBytes,
+                  d_lo);
 
         for (int chunk_index = 0; chunk_index < kChunksPerRecord;
              ++chunk_index) {
@@ -90,8 +90,7 @@ inline int64_t repack_weights(const uint8_t* src,
           const int pair = chunk_index % 2;
           uint8_t* packed_payload =
               chunk(record_payloads(tile, local_col), chunk_index);
-          uint8_t* packed_scales =
-              chunk_scales(tile, local_col, chunk_index);
+          uint8_t* packed_scales = chunk_scales(tile, local_col, chunk_index);
 
           for (int subgroup = 0; subgroup < 4; ++subgroup) {
             packed_scales[subgroup * kTileCols + col] =
@@ -117,7 +116,6 @@ inline int64_t repack_weights(const uint8_t* src,
     }
   }
 
-  warnings.warn("Q6_K int8");
   return bytes;
 }
 

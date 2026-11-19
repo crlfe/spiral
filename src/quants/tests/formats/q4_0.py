@@ -28,8 +28,22 @@ def make_raw(weights_rows, weights_cols, rng):
     for _col in range(weights_cols):
         for _block in range(blocks_per_col):
             quant = rng.integers(0, 16, BLOCK_ROWS, dtype=np.uint8)
-            scale = np.float16(rng.uniform(0.01, 3.0))
-            scale_bytes = np.array([scale], dtype=np.float16).view(np.uint8)
+            # Mix normal and subnormal scales, including both signs. The first
+            # block covers the smallest and largest subnormal magnitudes.
+            edge_scale = (0x0001, 0x03FF, 0x8001, 0x83FF, 0x0200, 0x8200)
+            if _block == 0 and _col < len(edge_scale):
+                scale_bits = edge_scale[_col]
+            else:
+                if rng.random() < 0.5:
+                    scale_bits = int(rng.integers(1, 0x0400))
+                else:
+                    scale_bits = int(
+                        np.array([rng.uniform(0.01, 3.0)], dtype=np.float16)
+                        .view(np.uint16)[0]
+                    )
+                if rng.random() < 0.5:
+                    scale_bits |= 0x8000
+            scale_bytes = np.array([scale_bits], dtype=np.uint16).view(np.uint8)
             raw[offset : offset + 2] = scale_bytes
             raw[offset + 2 : offset + BLOCK_BYTES] = (
                 quant[:16] | (quant[16:] << 4)
@@ -87,11 +101,24 @@ def verify(actual, expected):
     if np.array_equal(actual, expected):
         return True, "exact bf16 match"
 
-    error = np.abs(
-        actual.astype(np.float32) - expected.astype(np.float32)
-    )
-    if error.max() <= 0.01:
+    actual_f = actual.astype(np.float32)
+    expected_f = expected.astype(np.float32)
+    error = np.abs(actual_f - expected_f)
+    if error.max() > 0.01:
+        return False, f"max abs error {error.max():.6f}"
+
+    # The absolute tolerance cannot see a flushed subnormal block, so nonzero
+    # values must also match within a bf16-relative tolerance.
+    nonzero = expected_f != 0
+    if np.any(nonzero):
+        relative = error[nonzero] / np.abs(expected_f[nonzero])
+        if relative.max() > 0.02:
+            return False, (
+                f"max relative error {relative.max():.6f} "
+                f"(max abs error {error.max():.6f})"
+            )
         return True, (
-            f"within bf16 tolerance (max abs error {error.max():.6f})"
+            f"within bf16 tolerance (max abs error {error.max():.6f}, "
+            f"max relative error {relative.max():.6f})"
         )
-    return False, f"max abs error {error.max():.6f}"
+    return True, f"within bf16 tolerance (max abs error {error.max():.6f})"

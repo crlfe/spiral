@@ -37,7 +37,8 @@ constexpr int64_t packed_bytes(int64_t weights_rows, int64_t weights_cols) {
 
 // Repack canonical column-major Q8_0 into 256-row x 16-column transport tiles.
 // Each record is payload-first, and each 64-byte tile payload holds one 8x8
-// matrix in row-major order.
+// matrix in row-major order. Scales are stored as canonical fp16; the device
+// decodes them exactly, including subnormals.
 inline int64_t repack_weights(const uint8_t* src,
                               int64_t src_col_stride_bytes,
                               uint8_t* dst,
@@ -46,8 +47,7 @@ inline int64_t repack_weights(const uint8_t* src,
                               int64_t weights_cols) {
   const int64_t tiles = tile_count(weights_rows, weights_cols);
   const int64_t bytes = tiles * kPackedTransportTileBytes;
-  if (tiles == 0 || bytes > dst_capacity || src == nullptr ||
-      dst == nullptr) {
+  if (tiles == 0 || bytes > dst_capacity || src == nullptr || dst == nullptr) {
     return 0;
   }
   const int64_t blocks_per_col = weights_rows / kBlockRows;
@@ -59,15 +59,13 @@ inline int64_t repack_weights(const uint8_t* src,
   const int64_t cols_pairs = weights_cols / kTransportTileCols;
   const int64_t rows_records = weights_rows / kRecordRows;
   memset(dst, 0, bytes);
-  spiral::quants::detail::RepackWarnings warnings;
 
   for (int64_t rows_record = 0; rows_record < rows_records; ++rows_record) {
     for (int64_t cols_tile = 0; cols_tile < cols_tiles; ++cols_tile) {
       const int64_t col_pair = cols_tile / 2;
       const int local_col = static_cast<int>(cols_tile % 2);
-      uint8_t* tile =
-          dst + (rows_record * cols_pairs + col_pair) *
-                    kPackedTransportTileBytes;
+      uint8_t* tile = dst + (rows_record * cols_pairs + col_pair) *
+                                kPackedTransportTileBytes;
       uint8_t* record = record_ptr(tile, local_col);
       uint8_t* packed_chunk = record + kCommonScaleBytes;
 
@@ -84,30 +82,21 @@ inline int64_t repack_weights(const uint8_t* src,
                                      block_index * kBlockBytes;
 
           uint8_t* scale = scales + col * kBlockScaleBytes;
-          uint16_t scale_bits = load_u16(block_ptr);
-          if (fp16_is_subnormal(scale_bits)) {
-            scale_bits = 0;
-            warnings.subnormal_scale = true;
-          }
-          store_u16(scale, scale_bits);
+          store_u16(scale, load_u16(block_ptr));
 
           const uint8_t* quant = block_ptr + kBlockScaleBytes;
           for (int row = 0; row < kBlockRows; ++row) {
             const uint8_t value = quant[row];
-            if (value == 0x80u) {
-              warnings.min_int8 = true;
-            }
             const int tile_index = row / kTileRows;
             const int tile_row = row % kTileRows;
-            payloads[tile_index * kTilePayloadBytes +
-                     tile_row * kTileCols + col] = value;
+            payloads[tile_index * kTilePayloadBytes + tile_row * kTileCols +
+                     col] = value;
           }
         }
       }
     }
   }
 
-  warnings.warn("Q8_0");
   return bytes;
 }
 

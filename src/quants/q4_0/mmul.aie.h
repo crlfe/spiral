@@ -60,13 +60,21 @@ inline void unpack_mmul(const uint8_t* packed,
       MMUL accumulator0(*outputs_tile0);
       MMUL accumulator1(*outputs_tile1);
 
+      // Both column records contribute 16 scales each; decode all 32 once.
+      aie::vector<bfloat16, 32> hi32;
+      aie::vector<bfloat16, 32> lo32;
+      split_fp16x32_exact(scales0, scales1, hi32, lo32);
+
+#pragma unroll
       for (int block = 0; block < kBlocksPerRecord; ++block) {
         aie::vector<bfloat16, kMmulWeightsElems> hi0;
         aie::vector<bfloat16, kMmulWeightsElems> lo0;
         aie::vector<bfloat16, kMmulWeightsElems> hi1;
         aie::vector<bfloat16, kMmulWeightsElems> lo1;
-        detail::load_block_scales64(scales0, block, hi0, lo0);
-        detail::load_block_scales64(scales1, block, hi1, lo1);
+        detail::expand_scale64(hi32, block, hi0);
+        detail::expand_scale64(lo32, block, lo0);
+        detail::expand_scale64(hi32, kBlocksPerRecord + block, hi1);
+        detail::expand_scale64(lo32, kBlocksPerRecord + block, lo1);
 
 #pragma unroll
         for (int tile_index = 0; tile_index < kTilesPerBlock; ++tile_index) {
