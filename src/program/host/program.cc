@@ -5,11 +5,19 @@
 #include <xrt/xrt_kernel.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
 #include <utility>
+
+#if defined(__linux__)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 #include <vector>
 
 #include "design_meta.h"
@@ -51,7 +59,8 @@ size_t max_instruction_words() {
               weight_padded);
   auto sequence = generate_txn_main_sequence(
       input_parts[0], input_parts[1], input_parts[2], input_parts[3],
-      weight_parts[0], weight_parts[1]);
+      weight_parts[0], weight_parts[1],
+      design::kMaxWeightBlocks * (design::kL2StreamBytes / 4));
   if (!sequence.has_value()) {
     throw std::runtime_error("transaction generation failed");
   }
@@ -59,13 +68,17 @@ size_t max_instruction_words() {
 }
 
 RepackFn repack_fn(int32_t format) {
-  return format == 1 ? spiral::quants::q4_0::repack_weights
-                     : spiral::quants::q6_k::repack_weights;
+  if (format == 1) {
+    return spiral::quants::q4_0::repack_weights;
+  }
+  return spiral::quants::q6_k::repack_weights;
 }
 
 PackedBytesFn packed_bytes_fn(int32_t format) {
-  return format == 1 ? spiral::quants::q4_0::packed_bytes
-                     : spiral::quants::q6_k::packed_bytes;
+  if (format == 1) {
+    return spiral::quants::q4_0::packed_bytes;
+  }
+  return spiral::quants::q6_k::packed_bytes;
 }
 
 int32_t tile_bytes(int32_t format) {
@@ -258,6 +271,12 @@ double elapsed_us(Clock::time_point start) {
       .count();
 }
 
+double now_us() {
+  return std::chrono::duration<double, std::micro>(
+             Clock::now().time_since_epoch())
+      .count();
+}
+
 struct LoadedDevice {
   xrt::device device;
   xrt::xclbin xclbin;
@@ -274,11 +293,31 @@ struct Program::Impl {
   LoadedDevice loaded;
   xrt::hw_context context;
   xrt::kernel kernel;
-  xrt::run run;
-  xrt::bo instr;
+  // One independent set of BOs and a run object per in-flight call.  Keeping
+  // several lets the caller start the next call before waiting on the previous
+  // one, which hides the launch/pipeline-fill delay.
+  std::vector<xrt::run> runs;
+  std::vector<xrt::bo> instrs;
+  std::vector<xrt::bo> inputs;
+  std::vector<xrt::bo> outputs;
+  std::vector<bool> busy;
+  int32_t next_slot = 0;
+  int32_t outstanding = 0;
+  int32_t max_outstanding = 0;
   xrt::bo weights;
-  xrt::bo inputs;
-  xrt::bo outputs;
+  // Held for the lifetime of the Program.  Writing 0 asks the kernel for the
+  // lowest permitted CPU DMA latency, which keeps the CPU out of deep idle
+  // states while we are waiting on the NPU.
+  int dma_latency_fd = -1;
+
+  ~Impl() {
+#if defined(__linux__)
+    if (dma_latency_fd >= 0) {
+      ::close(dma_latency_fd);
+      dma_latency_fd = -1;
+    }
+#endif
+  }
 
   Impl()
       : instr_words(max_instruction_words()),
@@ -286,15 +325,54 @@ struct Program::Impl {
         context(loaded.device, loaded.xclbin.get_uuid(),
                 xrt::hw_context::access_mode::exclusive),
         kernel(context, "MLIR_AIE"),
-        run(kernel),
-        instr(loaded.device, instr_words * sizeof(uint32_t),
-              xrt::bo::flags::cacheable, kernel.group_id(1)),
         weights(loaded.device, design::kWeightWords * sizeof(uint32_t),
-                xrt::bo::flags::host_only, kernel.group_id(3)),
-        inputs(loaded.device, design::kInputWords * sizeof(uint32_t),
-               xrt::bo::flags::host_only, kernel.group_id(4)),
-        outputs(loaded.device, design::kOutputFloats * sizeof(float),
-                xrt::bo::flags::host_only, kernel.group_id(5)) {}
+                xrt::bo::flags::host_only, kernel.group_id(3)) {
+    int32_t depth = 2;
+    if (const char* env = std::getenv("SPIRAL_PIPELINE_SLOTS")) {
+      const int32_t configured = std::atoi(env);
+      if (configured > 0) {
+        depth = std::min(configured, 8);
+      }
+    }
+    runs.reserve(depth);
+    instrs.reserve(depth);
+    inputs.reserve(depth);
+    outputs.reserve(depth);
+    for (int32_t i = 0; i < depth; ++i) {
+      runs.emplace_back(kernel);
+      instrs.emplace_back(loaded.device, instr_words * sizeof(uint32_t),
+                          xrt::bo::flags::cacheable, kernel.group_id(1));
+      inputs.emplace_back(loaded.device, design::kInputWords * sizeof(uint32_t),
+                          xrt::bo::flags::host_only, kernel.group_id(4));
+      outputs.emplace_back(loaded.device, design::kOutputFloats * sizeof(float),
+                           xrt::bo::flags::host_only, kernel.group_id(5));
+    }
+    busy.assign(static_cast<size_t>(depth), false);
+#if defined(__linux__)
+    if (std::getenv("SPIRAL_NO_DMA_LATENCY") == nullptr) {
+      const char* latency_path = std::getenv("SPIRAL_DMA_LATENCY_PATH");
+      if (latency_path == nullptr) {
+        latency_path = "/dev/cpu_dma_latency";
+      }
+      dma_latency_fd = ::open(latency_path, O_WRONLY);
+      if (dma_latency_fd < 0) {
+        std::fprintf(stderr,
+                     "spiral: %s unavailable (%s); PM QoS unchanged\n",
+                     latency_path, std::strerror(errno));
+      } else {
+        const uint32_t zero = 0;
+        if (::write(dma_latency_fd, &zero, sizeof(zero)) !=
+            static_cast<ssize_t>(sizeof(zero))) {
+          std::fprintf(stderr,
+                       "spiral: cpu_dma_latency write failed (%s)\n",
+                       std::strerror(errno));
+          ::close(dma_latency_fd);
+          dma_latency_fd = -1;
+        }
+      }
+    }
+#endif
+  }
 };
 
 struct PreparedWeights::Impl {
@@ -309,6 +387,7 @@ struct PreparedWeights::Impl {
   int32_t input_pad = 0;
   int32_t weight_pad = 0;
   int32_t group_bytes = 0;
+  std::unique_ptr<xrt::bo> weights_bo;
   std::vector<uint8_t> weights;
   std::vector<uint32_t> txn;
 };
@@ -482,20 +561,49 @@ PreparedWeights Program::prepare_packed(const MatmulShape& shape,
   impl.input_pad = input_padded - input_groups;
   impl.weight_pad = weight_padded - weights_blocks;
 
+  const int32_t group_stride_words =
+      weights_blocks * (design::kL2StreamBytes / 4);
   auto sequence = generate_txn_main_sequence(
       input_parts[0], input_parts[1], input_parts[2], input_parts[3],
-      weight_parts[0], weight_parts[1]);
+      weight_parts[0], weight_parts[1], group_stride_words);
   if (!sequence.has_value()) {
     throw std::runtime_error("transaction generation failed");
   }
   impl.txn = std::move(*sequence);
+
+  // Resident compact weight buffer.  The transaction above uses a group
+  // stride of weights_blocks * L2.  The device prefetches the next L2 block
+  // while streaming, including past the final block of the last group, so
+  // leave one zeroed block of mapped guard space; without it the over-read
+  // raises AMD-Vi IO_PAGE_FAULTs and stalls the call.
+  const size_t data_bytes =
+      static_cast<size_t>(design::kGroups) * impl.group_bytes;
+  const size_t bo_bytes = data_bytes + design::kL2StreamBytes;
+  impl.weights.resize(bo_bytes, 0);
+  impl.weights_bo = std::make_unique<xrt::bo>(
+      impl_->loaded.device, bo_bytes, xrt::bo::flags::host_only,
+      impl_->kernel.group_id(3));
+  if (!impl.weights.empty()) {
+    impl.weights_bo->write(impl.weights.data(), bo_bytes, 0);
+    impl.weights_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  }
+  impl.weights.clear();
+  impl.weights.shrink_to_fit();
   return prepared;
 }
 
-void Program::run(const MatmulShape& shape, const PreparedWeights& weights,
-                  const uint16_t* inputs, float* outputs,
-                  int32_t outputs_cols, int32_t outputs_col_offset,
-                  RunTimings* timings) {
+int32_t Program::pipeline_slots() const {
+  return impl_ ? static_cast<int32_t>(impl_->runs.size()) : 1;
+}
+
+int32_t Program::max_outstanding() const {
+  return impl_ ? impl_->max_outstanding : 0;
+}
+
+RunTicket Program::submit(const MatmulShape& shape,
+                          const PreparedWeights& weights,
+                          const uint16_t* inputs, float* outputs,
+                          int32_t outputs_cols, int32_t outputs_col_offset) {
   if (!impl_) {
     throw std::runtime_error("Program is not initialized");
   }
@@ -519,83 +627,135 @@ void Program::run(const MatmulShape& shape, const PreparedWeights& weights,
       outputs_cols < outputs_col_offset + shape.weights_cols) {
     throw std::invalid_argument("output buffer is too small");
   }
-  if (timings) {
-    *timings = RunTimings{};
+
+  const int32_t slots = static_cast<int32_t>(impl_->runs.size());
+  int32_t slot = -1;
+  for (int32_t k = 0; k < slots; ++k) {
+    const int32_t candidate = (impl_->next_slot + k) % slots;
+    if (!impl_->busy[static_cast<size_t>(candidate)]) {
+      slot = candidate;
+      break;
+    }
   }
-  const auto total_start = Clock::now();
+  if (slot < 0) {
+    throw std::runtime_error("all pipeline slots are busy");
+  }
+  impl_->next_slot = (slot + 1) % slots;
+  impl_->busy[static_cast<size_t>(slot)] = true;
+  ++impl_->outstanding;
+  impl_->max_outstanding =
+      std::max(impl_->max_outstanding, impl_->outstanding);
+
+  RunTicket ticket;
+  ticket.slot = slot;
+  ticket.cols_bands = prepared.cols_bands;
+  ticket.outputs = outputs;
+  ticket.outputs_cols = outputs_cols;
+  ticket.outputs_col_offset = outputs_col_offset;
+  ticket.start_time = now_us();
+  RunTimings& timings = ticket.timings;
 
   if (prepared.txn.size() > impl_->instr_words) {
     throw std::runtime_error("instruction buffer overflow");
   }
   auto stage = Clock::now();
-  impl_->instr.write(prepared.txn.data(),
-                     prepared.txn.size() * sizeof(uint32_t), 0);
-  impl_->instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-  if (timings) {
-    timings->txn_us = elapsed_us(stage);
-  }
+  impl_->instrs[static_cast<size_t>(slot)].write(
+      prepared.txn.data(), prepared.txn.size() * sizeof(uint32_t), 0);
+  impl_->instrs[static_cast<size_t>(slot)].sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  timings.txn_us = elapsed_us(stage);
 
   stage = Clock::now();
-  const size_t max_group_bytes =
-      static_cast<size_t>(design::kMaxWeightBlocks) *
-      design::kL2StreamBytes;
-  auto* weight_dst = impl_->weights.map<uint8_t*>();
-  if (prepared.id != impl_->last_weight_id) {
-    for (int32_t g = 0; g < design::kGroups; ++g) {
-      const size_t group_offset =
-          static_cast<size_t>(g) * max_group_bytes;
-      std::memcpy(weight_dst + group_offset,
-                  prepared.weights.data() +
-                      static_cast<size_t>(g) * prepared.group_bytes,
-                  prepared.group_bytes);
-      impl_->weights.sync(XCL_BO_SYNC_BO_TO_DEVICE, prepared.group_bytes,
-                          group_offset);
+  xrt::bo* weight_bo = prepared.weights_bo
+                           ? prepared.weights_bo.get()
+                           : &impl_->weights;
+  if (!prepared.weights_bo) {
+    // Fallback for handles created before per-handle BOs existed.
+    const size_t max_group_bytes =
+        static_cast<size_t>(design::kMaxWeightBlocks) *
+        design::kL2StreamBytes;
+    auto* weight_dst = impl_->weights.map<uint8_t*>();
+    if (prepared.id != impl_->last_weight_id) {
+      for (int32_t g = 0; g < design::kGroups; ++g) {
+        const size_t group_offset =
+            static_cast<size_t>(g) * max_group_bytes;
+        std::memcpy(weight_dst + group_offset,
+                    prepared.weights.data() +
+                        static_cast<size_t>(g) * prepared.group_bytes,
+                    prepared.group_bytes);
+        impl_->weights.sync(XCL_BO_SYNC_BO_TO_DEVICE, prepared.group_bytes,
+                            group_offset);
+      }
+      impl_->last_weight_id = prepared.id;
     }
-    impl_->last_weight_id = prepared.id;
   }
-  if (timings) {
-    timings->upload_us = elapsed_us(stage);
-  }
+  timings.upload_us = elapsed_us(stage);
 
   stage = Clock::now();
-  fill_inputs(impl_->inputs.map<uint32_t*>(), shape.format,
-              prepared.tile_bytes, prepared.rows_steps, prepared.cols_bands,
-              prepared.weights_blocks, prepared.total_tiles,
-              prepared.input_pad, prepared.weight_pad,
+  fill_inputs(impl_->inputs[static_cast<size_t>(slot)].map<uint32_t*>(),
+              shape.format, prepared.tile_bytes, prepared.rows_steps,
+              prepared.cols_bands, prepared.weights_blocks,
+              prepared.total_tiles, prepared.input_pad, prepared.weight_pad,
               shape.weights_rows, inputs);
   const int32_t input_groups =
       (prepared.rows_steps + design::kInputGroupRows - 1) /
       design::kInputGroupRows;
-  const size_t input_objects =
-      1 + input_groups + prepared.input_pad;
-  impl_->inputs.sync(
+  const size_t input_objects = 1 + input_groups + prepared.input_pad;
+  impl_->inputs[static_cast<size_t>(slot)].sync(
       XCL_BO_SYNC_BO_TO_DEVICE,
       input_objects * design::kInputGroupElems * sizeof(uint16_t), 0);
-  if (timings) {
-    timings->input_us = elapsed_us(stage);
-  }
+  timings.input_us = elapsed_us(stage);
 
   stage = Clock::now();
-  auto& run = impl_->run;
+  auto& run = impl_->runs[static_cast<size_t>(slot)];
   run.set_arg(0, kRunOpcode);
-  run.set_arg(1, impl_->instr);
+  run.set_arg(1, impl_->instrs[static_cast<size_t>(slot)]);
   run.set_arg(2, static_cast<uint32_t>(prepared.txn.size()));
-  run.set_arg(3, impl_->weights);
-  run.set_arg(4, impl_->inputs);
-  run.set_arg(5, impl_->outputs);
+  run.set_arg(3, *weight_bo);
+  run.set_arg(4, impl_->inputs[static_cast<size_t>(slot)]);
+  run.set_arg(5, impl_->outputs[static_cast<size_t>(slot)]);
   run.start();
-  run.wait2(std::chrono::milliseconds(kRunTimeoutMs));
-  impl_->outputs.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-  if (timings) {
-    timings->kernel_us = elapsed_us(stage);
+  timings.start_us = elapsed_us(stage);
+  return ticket;
+}
+
+void Program::finish(RunTicket& ticket) {
+  if (!impl_ || ticket.slot < 0) {
+    return;
   }
+  const size_t slot = static_cast<size_t>(ticket.slot);
+  auto& timings = ticket.timings;
+  auto stage = Clock::now();
+  impl_->runs[slot].wait2(std::chrono::milliseconds(kRunTimeoutMs));
+  timings.wait_us = elapsed_us(stage);
 
   stage = Clock::now();
-  unpack_outputs(impl_->outputs.map<const float*>(), outputs,
-                 prepared.cols_bands, outputs_cols, outputs_col_offset);
+  impl_->outputs[slot].sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+  timings.sync_us = elapsed_us(stage);
+  timings.kernel_us = timings.start_us + timings.wait_us + timings.sync_us;
+
+  stage = Clock::now();
+  unpack_outputs(impl_->outputs[slot].map<const float*>(), ticket.outputs,
+                 ticket.cols_bands, ticket.outputs_cols,
+                 ticket.outputs_col_offset);
+  timings.unpack_us = elapsed_us(stage);
+  timings.total_us = now_us() - ticket.start_time;
+
+  impl_->busy[slot] = false;
+  if (impl_->outstanding > 0) {
+    --impl_->outstanding;
+  }
+  ticket.slot = -1;
+}
+
+void Program::run(const MatmulShape& shape, const PreparedWeights& weights,
+                  const uint16_t* inputs, float* outputs,
+                  int32_t outputs_cols, int32_t outputs_col_offset,
+                  RunTimings* timings) {
+  RunTicket ticket =
+      submit(shape, weights, inputs, outputs, outputs_cols, outputs_col_offset);
+  finish(ticket);
   if (timings) {
-    timings->unpack_us = elapsed_us(stage);
-    timings->total_us = elapsed_us(total_start);
+    *timings = ticket.timings;
   }
 }
 

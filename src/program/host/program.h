@@ -31,9 +31,27 @@ struct RunTimings {
   double upload_us = 0;   // weight host -> BO
   double txn_us = 0;      // instruction BO write
   double input_us = 0;    // input packing + BO sync
-  double kernel_us = 0;   // start + wait
+  double kernel_us = 0;   // start + wait + output sync
+  double start_us = 0;    // argument setup + run.start
+  double wait_us = 0;     // waiting for the device
+  double sync_us = 0;     // output BO sync
   double unpack_us = 0;   // device output -> logical output
   double total_us = 0;
+};
+
+// One submitted call that has been started but not waited on.
+//
+// Submit several tickets before finishing the first to keep the device queue
+// full and hide launch latency.  A ticket owns its timing record; read it
+// after finish().
+struct RunTicket {
+  int32_t slot = -1;
+  int32_t cols_bands = 0;
+  float* outputs = nullptr;
+  int32_t outputs_cols = 0;
+  int32_t outputs_col_offset = 0;
+  RunTimings timings;
+  double start_time = 0.0;
 };
 
 // Host-side weights prepared for repeated calls.
@@ -92,6 +110,22 @@ class Program {
   void run(const MatmulShape& shape, const PreparedWeights& weights,
            const uint16_t* inputs, float* outputs, int32_t outputs_cols,
            int32_t outputs_col_offset, RunTimings* timings = nullptr);
+
+  // Number of calls that can be in flight at once (>= 1).
+  int32_t pipeline_slots() const;
+
+  // High-water mark of submitted-but-not-finished calls (diagnostics).
+  int32_t max_outstanding() const;
+
+  // Stage, start, and return a call without waiting.  At most
+  // pipeline_slots() tickets may be outstanding.  `inputs` may be reused as
+  // soon as submit() returns; `outputs` is written by finish().
+  RunTicket submit(const MatmulShape& shape, const PreparedWeights& weights,
+                   const uint16_t* inputs, float* outputs,
+                   int32_t outputs_cols, int32_t outputs_col_offset);
+
+  // Wait for a submitted call, unpack it, and release its slot.
+  void finish(RunTicket& ticket);
 
   // One-shot convenience: prepare, run, and discard the repacked weights.
   //

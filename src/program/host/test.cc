@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -8,6 +9,7 @@
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "design_meta.h"
@@ -319,6 +321,70 @@ bool run_timing(spiral::Program& program, const std::string& name,
   return check_outputs(name + " timing", golden, outputs);
 }
 
+bool run_cold_timing(spiral::Program& program, const std::string& name,
+                     int iterations) {
+  Golden golden = load_golden(name);
+  spiral::MatmulShape shape;
+  shape.format = golden.format;
+  shape.weights_rows = golden.weights_rows;
+  shape.weights_cols = golden.weights_cols;
+  shape.inputs_vecs = design::kInputsVecs;
+  // Distinct resident BOs so consecutive calls cannot keep the weights hot
+  // in the last-level cache.  More than two also exercises IOMMU/TLB spread.
+  int copies = 2;
+  if (const char* env = std::getenv("SPIRAL_COLD_BOS")) {
+    const int configured = std::atoi(env);
+    if (configured > 0) {
+      copies = configured;
+    }
+  }
+  if (const char* env = std::getenv("SPIRAL_COLD_ITERS")) {
+    const int configured = std::atoi(env);
+    if (configured > 0) {
+      iterations = configured;
+    }
+  }
+  std::vector<spiral::PreparedWeights> prepared;
+  prepared.reserve(copies);
+  for (int i = 0; i < copies; ++i) {
+    prepared.push_back(
+        program.prepare(shape, golden.raw.data(), golden.raw_stride, 0));
+  }
+  std::vector<float> outputs(
+      static_cast<size_t>(design::kInputsVecs) * golden.weights_cols,
+      std::numeric_limits<float>::quiet_NaN());
+  int gap_us = 0;
+  if (const char* env = std::getenv("SPIRAL_COLD_GAP_US")) {
+    gap_us = std::atoi(env);
+  }
+  spiral::RunTimings total;
+  std::vector<double> kernels;
+  kernels.reserve(static_cast<size_t>(iterations));
+  for (int i = 0; i < iterations; ++i) {
+    if (gap_us > 0) {
+      std::this_thread::sleep_for(std::chrono::microseconds(gap_us));
+    }
+    spiral::RunTimings timings;
+    program.run(shape, prepared[static_cast<size_t>(i) % prepared.size()],
+                golden.inputs.data(), outputs.data(), golden.weights_cols, 0,
+                &timings);
+    total.kernel_us += timings.kernel_us;
+    total.unpack_us += timings.unpack_us;
+    total.total_us += timings.total_us;
+    kernels.push_back(timings.kernel_us);
+  }
+  const double n = static_cast<double>(iterations);
+  std::printf("%-22s %7.1f %7.1f %7.1f %7.1f %7.1f %7.1f %7.1f\n",
+              name.c_str(), 0.0, 0.0, 0.0, 0.0, total.kernel_us / n,
+              total.unpack_us / n, total.total_us / n);
+  std::sort(kernels.begin(), kernels.end());
+  std::printf("%-22s kernel min %.1f  p50 %.1f  p95 %.1f  max %.1f us\n",
+              name.c_str(), kernels.front(),
+              kernels[kernels.size() / 2],
+              kernels[kernels.size() * 95 / 100], kernels.back());
+  return check_outputs(name + " cold timing", golden, outputs);
+}
+
 bool run_steady_timing(spiral::Program& program, const std::string& name,
                        int iterations) {
   Golden golden = load_golden(name);
@@ -430,6 +496,77 @@ bool run_combined_timing(spiral::Program& program, const std::string& label,
   return ok;
 }
 
+bool run_pipeline_timing(spiral::Program& program, const std::string& name,
+                         int iterations) {
+  Golden golden = load_golden(name);
+  if (golden.chunk_bands <= 0) {
+    throw std::runtime_error(name + " has no chunk_bands");
+  }
+  struct Chunk {
+    spiral::MatmulShape shape;
+    int32_t col_offset = 0;
+    spiral::PreparedWeights prepared;
+  };
+  std::vector<Chunk> chunks;
+  for (int32_t start = 0; start < golden.cols_bands;
+       start += golden.chunk_bands) {
+    const int32_t bands =
+        std::min(golden.chunk_bands, golden.cols_bands - start);
+    Chunk chunk;
+    chunk.shape.format = golden.format;
+    chunk.shape.weights_rows = golden.weights_rows;
+    chunk.shape.weights_cols = bands * design::kBandCols;
+    chunk.shape.inputs_vecs = design::kInputsVecs;
+    chunk.col_offset = start * design::kBandCols;
+    chunk.prepared = program.prepare(chunk.shape, golden.raw.data(),
+                                     golden.raw_stride, chunk.col_offset);
+    chunks.push_back(std::move(chunk));
+  }
+  std::vector<float> outputs(
+      static_cast<size_t>(design::kInputsVecs) * golden.weights_cols,
+      std::numeric_limits<float>::quiet_NaN());
+  auto pass = [&](double* kernel_sum) {
+    std::vector<spiral::RunTicket> pending;
+    const int32_t slots = program.pipeline_slots();
+    pending.reserve(static_cast<size_t>(slots));
+    for (const Chunk& chunk : chunks) {
+      if (static_cast<int32_t>(pending.size()) >= slots) {
+        spiral::RunTicket ticket = pending.front();
+        pending.erase(pending.begin());
+        program.finish(ticket);
+        if (kernel_sum != nullptr) {
+          *kernel_sum += ticket.timings.kernel_us;
+        }
+      }
+      pending.push_back(program.submit(
+          chunk.shape, chunk.prepared, golden.inputs.data(), outputs.data(),
+          golden.weights_cols, chunk.col_offset));
+    }
+    while (!pending.empty()) {
+      spiral::RunTicket ticket = pending.front();
+      pending.erase(pending.begin());
+      program.finish(ticket);
+      if (kernel_sum != nullptr) {
+        *kernel_sum += ticket.timings.kernel_us;
+      }
+    }
+  };
+  pass(nullptr);  // warm-up
+  const auto start = std::chrono::steady_clock::now();
+  double kernel_sum = 0.0;
+  for (int i = 0; i < iterations; ++i) {
+    pass(&kernel_sum);
+  }
+  const auto end = std::chrono::steady_clock::now();
+  const double wall_us =
+      std::chrono::duration<double, std::micro>(end - start).count();
+  const bool ok = check_outputs(name + " pipeline", golden, outputs);
+  std::printf("%-22s slots=%d wall %.1f us  kernel_sum %.1f us  %s\n",
+              name.c_str(), program.pipeline_slots(), wall_us / iterations,
+              kernel_sum / iterations, ok ? "ok" : "FAIL");
+  return ok;
+}
+
 bool run_manifest_timing(spiral::Program& program, int iterations) {
   std::ifstream index("golden/index.txt");
   if (!index) {
@@ -514,6 +651,23 @@ int main(int argc, char** argv) {
                   "upload", "txn", "input", "kernel", "unpack", "total");
       return run_head_timing(program, "q6_k_head", 10) ? 0 : 1;
     }
+    if (argc > 1 && std::string(argv[1]) == "--cold-timing") {
+      std::printf("%-22s %7s %7s %7s %7s %7s %7s %7s\n", "case", "prepare",
+                  "upload", "txn", "input", "kernel", "unpack", "total");
+      bool ok = true;
+      ok = run_cold_timing(program, "q4_0_12288x1536", 50) && ok;
+      ok = run_cold_timing(program, "q4_0_2048x1536", 20) && ok;
+      ok = run_cold_timing(program, "q4_0_1536x12288", 20) && ok;
+      ok = run_cold_timing(program, "q4_0_1536x6144", 20) && ok;
+      return ok ? 0 : 1;
+    }
+    if (argc > 1 && std::string(argv[1]) == "--pipeline-timing") {
+      std::printf("%-22s %7s %7s %7s %7s %7s %7s %7s\n", "case", "prepare",
+                  "upload", "txn", "input", "kernel", "unpack", "total");
+      bool ok = true;
+      ok = run_pipeline_timing(program, "q6_k_head", 5) && ok;
+      return ok ? 0 : 1;
+    }
     if (argc > 1 && std::string(argv[1]) == "--all-timing") {
       std::printf("%-22s %7s %7s %7s %7s %7s %7s %7s\n", "case", "prepare",
                   "upload", "txn", "input", "kernel", "unpack", "total");
@@ -534,12 +688,12 @@ int main(int argc, char** argv) {
       ok = run_combined_timing(
                program, "qkv_sliding",
                {"q4_0_1536x2048", "q4_0_1536x512", "q4_0_1536x512"}, 20,
-               false) &&
+               true) &&
            ok;
       ok = run_combined_timing(
                program, "qkv_full",
                {"q4_0_1536x4096", "q4_0_1536x512", "q4_0_1536x512"}, 20,
-               false) &&
+               true) &&
            ok;
       return ok ? 0 : 1;
     }

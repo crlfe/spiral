@@ -60,11 +60,63 @@ over peak bandwidth.
       Added `./test --head-timing` for prepared-weight head measurements.
 - [x] Cached `xrt::run` in `Program::Impl` for reuse across calls (small,
       low-risk launch-cleanup; effect within noise).
+- [x] Per-handle resident weight BOs in `PreparedWeights`, using a compact
+      group stride so tensors do not need fixed-max padding.
 - [x] Combined column matmuls: `Program::prepare(shape, WeightSegment[],
       count)` concatenates segments along `weights_cols`; `--combined-timing`
-      benchmarks gate+up and Q+K+V.  Gate+up saves ~3.2 ms/token and QKV
-      ~2.1 ms/token (~5.4 total), taking the launch-limited estimate to
-      ~19.8 tok/s.
+      benchmarks gate+up and Q+K+V and now verifies every segment.
+- [x] `./test --cold-timing` alternates two resident BOs to measure the real
+      per-layer streaming cost instead of the warm-cache number.
+- [x] The llama.cpp `ggml-spiral` backend now chains consecutive `MUL_MAT`s
+      with the same input data and K into one wide call (up to four
+      segments).  Gate+up is the beneficiary in Gemma; pp8 improved from
+      ~45.4 to ~51.3 t/s and tg1 from ~7.7 to ~9.2 t/s.  Chaining across
+      intervening ops is unsafe because the scheduler reuses compute buffers
+      based on graph-order lifetimes.  Combined handles duplicate the paired
+      weights in NPU BOs and cost ~1 s to prepare on the first graph.
+- [x] Investigated the large-matmul streaming path.  Per-call kernel time fits
+      `~80 us + bytes / 48 GB/s`; host stages are <20 us.  Naive bytes/time is
+      misleading because the fixed launch floor and sporadic stalls dominate
+      small calls and averages.  `xrt::bo` cacheable/normal flags are unusable,
+      `weights_l2` FIFO depth 3 is neutral, and host CPU/memory stress only
+      moves the kernel by a few percent.  Reduced call count, not more
+      bandwidth, is the actionable lever.
+- [x] `./test --cold-timing` reports min/p50/p95/max over alternating BOs
+      (`SPIRAL_COLD_BOS`, `SPIRAL_COLD_ITERS`).
+- [x] Fix the weight over-read: one `kL2StreamBytes` guard block after the
+      compact weights BO removes the AMD-Vi IO_PAGE_FAULTs (10/run -> 0).
+- [x] Split `kernel_us` into `start_us` / `wait_us` / `sync_us`; stalls are
+      entirely in `wait_us`.
+- [x] `SPIRAL_COLD_GAP_US` shows a 5 ms NPU-idle gap costs ~34% on the next
+      call, so keeping the NPU busy matters.
+- [x] Pipelined submissions: `Program::submit`/`finish` with a configurable
+      slot pool (`SPIRAL_PIPELINE_SLOTS`, default 2).  Q6_K head pass drops
+      by ~16% wall; two slots capture almost all of it.  `pp8` ~42 -> ~50
+      t/s; `tg16` unchanged because decode is stall-bound.
+- [x] Cross-node look-ahead: submit the next same-input matmul early and
+      defer only its host unpack.  Correct, but within noise on Gemma; kept
+      behind `SPIRAL_LOOKAHEAD=1` (off by default).
+- [x] Trial `q4_0_packed16` as a build-time Q4 block choice.  It was 11.2%
+      faster in the kernel (8328 -> 7397) and ~2% faster on the model, but the
+      exact Q4_0 path then improved to 7883 cycles with the shared split, and
+      packed16 is near-exact rather than bit-exact.  Removed from `src/program`;
+      the `src/quants` format and its tests remain.
+- [x] Hold `/dev/cpu_dma_latency` at 0 for the Program lifetime (PM QoS);
+      `SPIRAL_NO_DMA_LATENCY` disables it, `SPIRAL_DMA_LATENCY_PATH` overrides
+      the node.  With a writable node and locked clocks it improved a 300-token
+      generation from 7.12 to 7.50-7.61 t/s; on Linux 7.3 with unlocked clocks
+      `tg16` is 8.82 vs 7.75 t/s and `pp8` 62.1 vs 54.8 t/s.
+- [x] Real-query baseline: Gemma E2B Q4_0, 300-token greedy answer, 7.5-7.6
+      t/s generation and 114-121 t/s prompt on Linux 7.0 (CPU: 9.9 / 152).
+      Linux 7.3 / amdxdna 0.10.0, unlocked clocks: 7.95-8.10 t/s and 133-155
+      t/s prompt, `tg16` 8.82 t/s.
+- [x] Characterise the wait stalls over 127 tokens: 1.10/token, 46-62 ms
+      (median 50.6), 56.1 ms/token, clean calls 51.6 ms/token.  Removing them
+      would give ~14 t/s.  Ruled out BO count, idle gaps, CPU/memory stress,
+      IOMMU faults, PM QoS, and clock state.  Linux 7.3 / amdxdna 0.10.0 still
+      shows them (0.97/token, median 46.9 ms) and produces no IO_PAGE_FAULTs.
+- [ ] Test the ~50 ms stalls on a machine with no other `/dev/accel0` users.
+      `pmode` is permission-locked in this sandbox.
 - [x] `tests/poc/iter_args.py` device regression for carried memrefs and
       conditional acquire/release.
 
@@ -100,9 +152,12 @@ over peak bandwidth.
    exhaustion), and depth 3 (no gain over 2).
 2. **Combine parallel column matmuls in the caller/model driver** (API and
    benchmarks are in place):
-   - use gate+up as one wide call per FFN layer;
-   - use Q+K+V as one wide call for the 15 KV layers;
-   - keep the existing per-shape fallback for shared-KV layers.
+   - [x] gate+up as one wide call per FFN layer (graph-level chain in the
+     llama.cpp backend);
+   - Q+K+V as one wide call is not safe across the QK-norm/RoPE gaps: the
+     scheduler reuses compute buffers by graph-order lifetime, so moving a
+     later matmul early can clobber a gap tensor.  The opt-in look-ahead
+     avoids host reordering but is within noise on Gemma.
 3. **Sequential fusions that need new device dataflow:**
    - `inp_gate` + `proj`: two-stage kernel with a 256-wide intermediate,
      device gate activation, and a broadcast before `proj`;

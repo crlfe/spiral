@@ -73,7 +73,16 @@ cd src/program/build && ./test --all-timing
 
 `--head-timing` measures the prepared-weight, steady-state Q6_K head over all
 band chunks.  `--combined-timing` measures gate+up and Q+K+V as single wide
-matmuls.  `--all-timing` measures every golden case with prepared weights.
+matmuls and verifies each segment.  `--cold-timing` cycles through several
+resident BOs so the weights are not cache-warm and reports min/p50/p95/max
+(`SPIRAL_COLD_BOS`, `SPIRAL_COLD_ITERS`).  `SPIRAL_COLD_GAP_US` inserts an
+idle gap between calls to measure the power-state penalty.  `--pipeline-timing`
+runs the head through the `submit`/`finish` queue; `SPIRAL_PIPELINE_SLOTS`
+sets the in-flight slot count (default 2).  `SPIRAL_LOOKAHEAD=1` enables the
+experimental cross-node look-ahead (off by default; neutral on Gemma).
+`SPIRAL_NO_DMA_LATENCY=1` disables holding `/dev/cpu_dma_latency` at 0;
+`SPIRAL_DMA_LATENCY_PATH` overrides the node path.  `--all-timing` measures every
+golden case with prepared weights.
 
 The diagnostic build's timing table also includes `probe` (stream + assembly,
 no quant math) and `cycle` (fills + FIFO acquire/release only) rows.  The
@@ -111,10 +120,10 @@ for (int step = 0; step < steps; ++step) {
 }
 ```
 
-The most recently prepared tensor stays in the host weight BO, so repeated
-runs with the same handle skip the weight copy/flush.  The weight, input, and
-output BOs use `host_only`; the NPU reads them from host memory over the
-interconnect.
+Each prepared handle owns its own resident host weight BO, so repeated runs
+skip the weight upload and multiple handles can remain resident.  The weight,
+input, and output BOs use `host_only`; the NPU reads them from host memory over
+the interconnect.
 
 For a tensor chunk, pass the first 512-column band as `weights_col_offset`
 and the corresponding destination column as `outputs_col_offset`:

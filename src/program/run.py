@@ -51,6 +51,9 @@ PROBE_SOURCE = KERNEL_DIR / "program_probe.aie.cc"
 STREAM_SOURCE = KERNEL_DIR / "program_stream.aie.cc"
 Q4_0_BLOCK_SOURCE = KERNEL_DIR / "program_q4_block.aie.cc"
 Q6_K_BLOCK_SOURCE = KERNEL_DIR / "program_q6_block.aie.cc"
+# Shared block body and helpers; included by every `program_*_block` source.
+BLOCK_IMPL_HEADER = KERNEL_DIR / "program_block_impl.h"
+BLOCK_COMMON_HEADER = KERNEL_DIR / "program_block_common.h"
 Q4_0_HEADERS = [
     QUANTS_ROOT / "quants/q4_0/mmul.aie.h",
     QUANTS_ROOT / "quants/q4_0/unpack.aie.h",
@@ -83,6 +86,8 @@ SOURCE_FILES = [
     STREAM_SOURCE,
     Q4_0_BLOCK_SOURCE,
     Q6_K_BLOCK_SOURCE,
+    BLOCK_IMPL_HEADER,
+    BLOCK_COMMON_HEADER,
     *Q4_0_HEADERS,
     *Q6_K_HEADERS,
 ]
@@ -98,6 +103,8 @@ PRODUCTION_SOURCE_FILES = [
     BLOCK_SOURCE,
     Q4_0_BLOCK_SOURCE,
     Q6_K_BLOCK_SOURCE,
+    BLOCK_IMPL_HEADER,
+    BLOCK_COMMON_HEADER,
     *Q4_0_HEADERS,
     *Q6_K_HEADERS,
 ]
@@ -796,6 +803,7 @@ def _make_program(dynamic, production=False):
         input3,
         weight0,
         weight1,
+        group_stride_words,
     ):
         i32 = IntegerType.get_signless(32)
         i64 = IntegerType.get_signless(64)
@@ -806,7 +814,6 @@ def _make_program(dynamic, production=False):
         input_words = design.INPUT_GROUP_ELEMS // 2
         l1_words = design.L1_STREAM_BYTES // 4
         l2_words = design.L2_STREAM_BYTES // 4
-        group_stride_words = design.MAX_WEIGHT_BLOCKS * l2_words
         l1_lo = 512 if l1_words % 512 == 0 else 256
         l1_hi = l1_words // l1_lo
         combined = design.COMPUTES_PER_GROUP * l1_hi
@@ -840,8 +847,8 @@ def _make_program(dynamic, production=False):
             )
 
         for g in range(design.GROUPS):
-            offset = arith.constant(
-                i32, g * group_stride_words
+            offset = arith.muli(
+                arith.constant(i32, g), group_stride_words
             )
             for part in (weight0, weight1):
                 weights_prods[g].fill(
@@ -885,7 +892,7 @@ def _make_program(dynamic, production=False):
         ],
     ]
     if dynamic:
-        runtime_args += [np.int32] * 6
+        runtime_args += [np.int32] * 7
         rt = Runtime(
             sequence_dynamic, runtime_args, strict_task_groups=False
         )
