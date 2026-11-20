@@ -118,6 +118,23 @@ clear the stale kernel objects in the JIT cache (for example, remove the
 `~/.npu/cache/*` directories containing `iter_args_*.cc`) because
 `compile_external_kernels` skips existing object files.
 
+## Instruction Overlay Reload
+
+`overlay.py` and `overlay_blocks.py` probe whether a loaded xclbin can swap a
+compute tile's program memory without a full PDI reconfiguration.  The runtime
+side rewrites the 16 KiB PM window with a `blockwrite` after resetting the
+core; the link-only side checks that the Q4_0/Q6_K blocks can move into a
+reloadable `.text` tail without shifting any resident symbol.
+
+Current results: reload cost scales at ~1.3-1.5 us/KiB of program memory, so
+all 32 production computes (~11 KiB each) would reload in ~0.45-0.5 ms versus
+~2.6 ms for a PDI reload.  Both block variants link with an identical
+`overlay_entry` at `0xe0` (current tails 4848 B and 5648 B), and the control-packet
+path is slower for bulk PM (138.6 us vs 96.3 us for 4 cores).
+
+The mechanism, measurement tables, link layout, and caveats are in
+[`overlay.md`](overlay.md).
+
 ## Call Overheads
 
 `invoke.py` reports the time required to call the NPU using different patterns,
