@@ -215,6 +215,37 @@ output.  The C++ wrapper repacks with the real `src/quants` headers, builds
 the per-compute block-major streams, packs the input groups, runs, and
 unpacks into logical `[inputs_vecs][weights_cols]` outputs.
 
+### Golden verification tolerance
+
+Outputs are checked per column against
+
+```
+tolerance = max(1e-3, 2e-5 * column_scale)
+```
+
+where `column_scale` is the largest `|expected|` in that output column over
+the four input vectors.  An element passes when its error is within its
+column's tolerance; the reported `worst` ratio is `error / tolerance`.
+
+The absolute error is not a shape-independent quantity.  The kernel
+accumulates the K terms in fp32; the mean absolute error grows as
+~`1.2e-7 * K`, and the max abs error is about 0.0026 at K=2048, 0.0049 at
+4096, 0.0071 at 6144, and 0.0127 at 12288.  That is the envelope of an
+unbiased round-to-nearest accumulation, not a rounding-mode bug: the signed
+mean is ~1-4% of the absolute mean, the `dev > ref` sign split is 46-52%, and
+emulating a truncating accumulation is about 100x worse at K=12288.  A
+sequential fp32 RTNE sum of the same terms reproduces the measured mean
+within ~10%.
+
+`src/quants/tests/mmul.py` already uses a per-column bound for the same
+reason; the program uses a tighter relative term (`2e-5`, versus `1e-3`) and
+the same `1e-3` floor.  The worst ratio across the 27 golden cases is ~0.39
+(the Q6_K head), so the bound has about 2.6x margin.  `run.py` applies the
+identical policy.
+Do not replace this with a fixed absolute error again: it cannot fit both
+K=1536 and K=12288, and it makes the effective relative bound depend on the
+column's magnitude (loose for small columns, tight for large ones).
+
 Python checks:
 
 ```bash

@@ -134,8 +134,17 @@ def _unpack_output_tile(raw):
     )
 
 
-def _real_max_error(actual, expected, cols_bands):
+def _real_error_metrics(actual, expected, cols_bands):
+    """Return (max abs error, worst error / per-column tolerance).
+
+    The device accumulates K terms in fp32, so the absolute error grows with
+    K and with the column's output scale.  The pass/fail quantity is the
+    element's error against ``max(1e-3, 2e-5 * column_scale)``, where the
+    column scale is the largest expected magnitude in that output column over
+    the four input vectors.  This mirrors host/test.cc.
+    """
     max_error = 0.0
+    max_ratio = 0.0
     for g in range(design.GROUPS):
         for c in range(design.COMPUTES_PER_GROUP):
             base = (
@@ -147,9 +156,13 @@ def _real_max_error(actual, expected, cols_bands):
                 tile = _unpack_output_tile(
                     actual[start : start + design.OUTPUT_TILE_ELEMS]
                 )
-                error = float(np.abs(tile - expected[g, c, band]).max())
-                max_error = max(max_error, error)
-    return max_error
+                reference = expected[g, c, band]
+                error = np.abs(tile - reference)
+                column_scale = np.abs(reference).max(axis=0)
+                tolerance = np.maximum(1e-3, 2e-5 * column_scale)
+                max_error = max(max_error, float(error.max()))
+                max_ratio = max(max_ratio, float((error / tolerance).max()))
+    return max_error, max_ratio
 
 
 def _noop_mismatches(actual, expected, total_tiles):
@@ -1025,17 +1038,17 @@ def run_case(rows_steps, cols_bands, tile_bytes, seed=1,
         return mismatches == 0
 
     if format != design.MODE_TILE_CHECK:
-        max_error = _real_max_error(
+        max_error, max_ratio = _real_error_metrics(
             np.asarray(outputs_tensor), case["expected"], cols_bands
         )
         label = "q4_0" if format == design.FORMAT_Q4_0 else "q6_k"
-        tolerance = 1e-2 if format == design.FORMAT_Q4_0 else 2e-2
         print(
             f"{label} rows_steps={rows_steps} cols_bands={cols_bands} "
             f"tile={tile_bytes} blocks={weights_blocks} "
-            f"tiles={total_tiles} max_error={max_error:.6f}"
+            f"tiles={total_tiles} max_error={max_error:.6f} "
+            f"worst_tolerance={max_ratio:.3f}"
         )
-        return max_error <= tolerance
+        return max_ratio <= 1.0
 
     mismatches, first = _noop_mismatches(
         np.asarray(outputs_tensor).view(np.uint32),

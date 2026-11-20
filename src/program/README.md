@@ -34,6 +34,10 @@ two padded 256-column cases, Q6_K variants up to `1792x11264`, and the full
 262144-column Q6_K head as 11 chunks.  The golden set includes the raw head
 (about 315 MB), so golden generation takes a few minutes.
 
+Outputs are compared per column against `max(1e-3, 2e-5 * column_scale)`,
+because the fp32 accumulation error grows with K; the rationale and the
+measured error model are in `NOTES.md` under "Golden verification tolerance".
+
 Kernel edits need a clean object build: `build.py` deletes the active build
 directory's `*.o` because `compile_external_kernels` otherwise reuses stale
 objects.  Inline kernels can also leave stale `~/.npu/cache` entries;

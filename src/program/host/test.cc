@@ -106,11 +106,56 @@ bool check_outputs(const std::string& name, const Golden& golden,
   if (outputs_cols <= 0) {
     outputs_cols = golden.weights_cols;
   }
+
+  // The device accumulates the K terms in fp32, so the absolute error grows
+  // with K (~1.2e-7 * K mean) and with the column's own output scale.  A fixed
+  // absolute tolerance therefore cannot fit every shape.  Bound each element
+  // against its output column: an absolute floor for near-zero columns plus a
+  // relative term on that column's largest expected magnitude.  This is the
+  // same shape as src/quants/tests/mmul.py; the worst observed ratio across the
+  // golden set is ~0.39.  See NOTES.md, "Golden verification tolerance".
+  constexpr double kAbsFloor = 1e-3;
+  constexpr double kRel = 2e-5;
+
+  std::vector<double> column_scale(static_cast<size_t>(outputs_cols), 0.0);
+  for (int32_t g = 0; g < design::kGroups; ++g) {
+    for (int32_t c = 0; c < design::kComputesPerGroup; ++c) {
+      for (int32_t band = 0; band < golden.cols_bands; ++band) {
+        const size_t exp_base =
+            ((static_cast<size_t>(g) * design::kComputesPerGroup + c) *
+                 golden.cols_bands +
+             band) *
+            design::kOutputTileElems;
+        const int32_t col_base =
+            band * design::kBandCols +
+            (g * design::kComputesPerGroup + c) * design::kColsTile;
+        for (int32_t half = 0; half < 2; ++half) {
+          for (int32_t vec = 0; vec < design::kInputsVecs; ++vec) {
+            for (int32_t col = 0; col < design::kColsTile / 2; ++col) {
+              const size_t exp_index =
+                  exp_base + vec * design::kColsTile +
+                  half * (design::kColsTile / 2) + col;
+              const int32_t col_index =
+                  outputs_col_offset + col_base + half * (design::kColsTile / 2) + col;
+              const double magnitude =
+                  std::fabs(static_cast<double>(golden.expected[exp_index]));
+              if (magnitude > column_scale[static_cast<size_t>(col_index)]) {
+                column_scale[static_cast<size_t>(col_index)] = magnitude;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
   double max_error = 0.0;
+  double max_ratio = 0.0;
   size_t worst = 0;
   int32_t worst_g = -1;
   int32_t worst_c = -1;
   int32_t worst_band = -1;
+  int32_t worst_col = -1;
   for (int32_t g = 0; g < design::kGroups; ++g) {
     for (int32_t c = 0; c < design::kComputesPerGroup; ++c) {
       for (int32_t band = 0; band < golden.cols_bands; ++band) {
@@ -132,15 +177,23 @@ bool check_outputs(const std::string& name, const Golden& golden,
                   outputs_col_offset + col_base + half * (design::kColsTile / 2) + col;
               const float got =
                   outputs[static_cast<size_t>(vec) * outputs_cols + col_index];
-              const double diff = std::fabs(
-                  static_cast<double>(got) -
-                  static_cast<double>(golden.expected[exp_index]));
-              if (diff > max_error) {
-                max_error = diff;
+              const double expected =
+                  static_cast<double>(golden.expected[exp_index]);
+              const double diff =
+                  std::fabs(static_cast<double>(got) - expected);
+              const double tolerance =
+                  std::max(kAbsFloor, kRel * column_scale[static_cast<size_t>(col_index)]);
+              const double ratio = diff / tolerance;
+              if (ratio > max_ratio) {
+                max_ratio = ratio;
                 worst = static_cast<size_t>(vec) * outputs_cols + col_index;
                 worst_g = g;
                 worst_c = c;
                 worst_band = band;
+                worst_col = col_index;
+              }
+              if (diff > max_error) {
+                max_error = diff;
               }
               if (!std::isfinite(got)) {
                 std::fprintf(stderr, "%s: non-finite output at %zu\n",
@@ -156,15 +209,18 @@ bool check_outputs(const std::string& name, const Golden& golden,
     }
   }
 
-  const double tolerance =
-      golden.format == design::kFormatQ4_0 ? 0.01 : 0.02;
-  const bool ok = max_error <= tolerance;
-  std::printf("%s golden: %s (max error %.6f, %d tiles)\n", name.c_str(),
-              ok ? "ok" : "FAILED", max_error, golden.total_tiles);
+  const bool ok = max_ratio <= 1.0;
+  std::printf(
+      "%s golden: %s (max error %.6f, worst %.3f of tolerance, %d tiles)\n",
+      name.c_str(), ok ? "ok" : "FAILED", max_error, max_ratio,
+      golden.total_tiles);
   if (!ok) {
     std::fprintf(stderr,
-                 "%s: worst output index %zu (g=%d c=%d band=%d)\n",
-                 name.c_str(), worst, worst_g, worst_c, worst_band);
+                 "%s: worst output index %zu (g=%d c=%d band=%d col=%d, "
+                 "tolerance %.6f)\n",
+                 name.c_str(), worst, worst_g, worst_c, worst_band, worst_col,
+                 std::max(kAbsFloor,
+                          kRel * column_scale[static_cast<size_t>(worst_col)]));
   }
   return ok;
 }
