@@ -39,6 +39,16 @@ GROUP_OUTPUTS = COMPUTES_PER_GROUP * OUTPUT_ELEMS
 CONFIG_LEN = 8
 STATE_WORDS = 8
 
+# Format ids follow ggml_type for quant formats.  Values 0xF0-0xFF are
+# diagnostic-only modes and never reach a production build.
+FORMAT_Q4_0 = 2
+FORMAT_Q6_K = 14
+MODE_BASE = 0xF0
+MODE_FIFO = 0xF0       # acquire/release only
+MODE_RAW_CHECK = 0xF1  # per-block checksum of delivered stream bytes
+MODE_TILE_CHECK = 0xF2 # assemble/carry, then per-tile checksum
+MODE_LAST = 0xFF
+
 # Config word indices.
 CFG_FORMAT = 0
 CFG_TILE_BYTES = 1

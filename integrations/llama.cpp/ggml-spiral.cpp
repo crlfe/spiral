@@ -41,9 +41,9 @@ ggml_guid_t spiral_guid() {
 int32_t spiral_format(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q4_0:
-            return 1;
+            return GGML_TYPE_Q4_0;
         case GGML_TYPE_Q6_K:
-            return 2;
+            return GGML_TYPE_Q6_K;
         default:
             return 0;
     }

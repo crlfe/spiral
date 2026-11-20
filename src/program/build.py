@@ -114,6 +114,13 @@ def _emit_design_meta():
         "kCfgTotalTiles": design.CFG_TOTAL_TILES,
         "kCfgInputPad": design.CFG_INPUT_PAD,
         "kCfgWeightPad": design.CFG_WEIGHT_PAD,
+        "kFormatQ4_0": design.FORMAT_Q4_0,
+        "kFormatQ6K": design.FORMAT_Q6_K,
+        "kModeBase": design.MODE_BASE,
+        "kModeFifo": design.MODE_FIFO,
+        "kModeRawCheck": design.MODE_RAW_CHECK,
+        "kModeTileCheck": design.MODE_TILE_CHECK,
+        "kModeLast": design.MODE_LAST,
         "kProduction": 1 if PRODUCTION else 0,
     }
     size_values = {

@@ -8,11 +8,11 @@ namespace spiral {
 
 // One matmul call.  Dimensions use the model vocabulary, not M/N/K.
 struct MatmulShape {
-  int32_t format = 1;        // 0 = probe, 1 = Q4_0, 2 = Q6_K
+  int32_t format = 2;        // ggml_type; 2 = Q4_0, 14 = Q6_K
   int32_t weights_rows = 0;  // multiple of 256
   int32_t weights_cols = 0;  // multiple of 512
   int32_t inputs_vecs = 4;   // must match the fixed design
-  int32_t tile_bytes = 0;    // format 0 only; ignored for 1/2
+  int32_t tile_bytes = 0;    // diagnostic modes only; ignored for quant formats
 };
 
 // One weight block used to build a wider prepared tensor.  The segments are

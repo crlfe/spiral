@@ -38,6 +38,11 @@ using PackedBytesFn = int64_t (*)(int64_t, int64_t);
 constexpr int32_t kInputParts = 4;
 constexpr int32_t kWeightParts = 2;
 
+bool is_diagnostic_mode(int32_t format) {
+  return format == design::kModeFifo || format == design::kModeRawCheck ||
+         format == design::kModeTileCheck;
+}
+
 void split_parts(int32_t total, int32_t parts, int32_t* out,
                  int32_t& padded) {
   padded = std::max(total, parts);
@@ -68,21 +73,21 @@ size_t max_instruction_words() {
 }
 
 RepackFn repack_fn(int32_t format) {
-  if (format == 1) {
+  if (format == design::kFormatQ4_0) {
     return spiral::quants::q4_0::repack_weights;
   }
   return spiral::quants::q6_k::repack_weights;
 }
 
 PackedBytesFn packed_bytes_fn(int32_t format) {
-  if (format == 1) {
+  if (format == design::kFormatQ4_0) {
     return spiral::quants::q4_0::packed_bytes;
   }
   return spiral::quants::q6_k::packed_bytes;
 }
 
 int32_t tile_bytes(int32_t format) {
-  return format == 1
+  return format == design::kFormatQ4_0
              ? spiral::quants::q4_0::kPackedTransportTileBytes
              : spiral::quants::q6_k::kPackedTransportTileBytes;
 }
@@ -208,10 +213,10 @@ void unpack_outputs(const float* raw, float* outputs, int32_t cols_bands,
 }
 
 int32_t shape_tile_bytes(const MatmulShape& shape) {
-  if (shape.format == 0 || shape.format == 3 || shape.format == 4) {
+  if (is_diagnostic_mode(shape.format)) {
     if (design::kProduction) {
       throw std::invalid_argument(
-          "diagnostic formats are disabled in the production build");
+          "diagnostic modes are disabled in the production build");
     }
     if (shape.tile_bytes <= 0 ||
         shape.tile_bytes > design::kL1StreamBytes) {
@@ -220,10 +225,11 @@ int32_t shape_tile_bytes(const MatmulShape& shape) {
     }
     return shape.tile_bytes;
   }
-  if (shape.format == 1 || shape.format == 2) {
+  if (shape.format == design::kFormatQ4_0 ||
+      shape.format == design::kFormatQ6K) {
     return tile_bytes(shape.format);
   }
-  throw std::invalid_argument("format must be 0, 1, 2, 3, or 4");
+  throw std::invalid_argument("unknown format or diagnostic mode");
 }
 
 void check_shape(const MatmulShape& shape, int32_t& rows_steps,
@@ -410,8 +416,7 @@ PreparedWeights Program::prepare(const MatmulShape& shape,
                                  const uint8_t* raw_weights,
                                  int64_t raw_stride,
                                  int32_t weights_col_offset) {
-  const bool probe =
-      shape.format == 0 || shape.format == 3 || shape.format == 4;
+  const bool probe = is_diagnostic_mode(shape.format);
   if (!probe && raw_weights == nullptr) {
     throw std::invalid_argument("null weight buffer");
   }
@@ -459,9 +464,10 @@ PreparedWeights Program::prepare(const MatmulShape& shape,
   if (segments == nullptr || segment_count <= 0) {
     throw std::invalid_argument("at least one weight segment is required");
   }
-  if (shape.format != 1 && shape.format != 2) {
+  if (shape.format != design::kFormatQ4_0 &&
+      shape.format != design::kFormatQ6K) {
     throw std::invalid_argument(
-        "combined weights require format 1 (Q4_0) or 2 (Q6_K)");
+        "combined weights require Q4_0 or Q6_K");
   }
   int32_t total_cols = 0;
   for (int32_t i = 0; i < segment_count; ++i) {
@@ -530,8 +536,7 @@ PreparedWeights Program::prepare_packed(const MatmulShape& shape,
   int32_t weights_blocks = 0;
   check_shape(shape, rows_steps, cols_bands, total_tiles, weights_blocks);
   const int32_t bytes = shape_tile_bytes(shape);
-  const bool probe =
-      shape.format == 0 || shape.format == 3 || shape.format == 4;
+  const bool probe = is_diagnostic_mode(shape.format);
 
   PreparedWeights prepared;
   prepared.impl_ = std::make_unique<PreparedWeights::Impl>();

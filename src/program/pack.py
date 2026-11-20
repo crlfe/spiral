@@ -13,6 +13,9 @@ from design import (
     CFG_ROWS_STEPS,
     CFG_TILE_BYTES,
     CFG_TOTAL_TILES,
+    FORMAT_Q4_0,
+    FORMAT_Q6_K,
+    MODE_TILE_CHECK,
     CFG_WEIGHTS_BLOCKS,
     COLS_TILE,
     COMPUTES_PER_GROUP,
@@ -119,7 +122,8 @@ def _tile_words(group, compute, tile_index, tile_bytes, seed):
     return words.astype(np.uint32)
 
 
-def build_case(rows_steps, cols_bands, tile_bytes, seed=1):
+def build_case(rows_steps, cols_bands, tile_bytes, seed=1,
+               format_id=MODE_TILE_CHECK):
     """Build a synthetic no-op case.
 
     Layouts:
@@ -132,7 +136,8 @@ def build_case(rows_steps, cols_bands, tile_bytes, seed=1):
     total_tiles = rows_steps * cols_bands
     weights_blocks = _blocks_for(rows_steps, cols_bands, tile_bytes)
     config = _make_config(
-        0, tile_bytes, rows_steps, cols_bands, weights_blocks, total_tiles
+        format_id, tile_bytes, rows_steps, cols_bands, weights_blocks,
+        total_tiles
     )
 
     input_offsets = np.arange(
@@ -337,7 +342,7 @@ def build_q4_0_case(
         cols_bands,
         seed,
         "q4_0",
-        1,
+        FORMAT_Q4_0,
         weights_cols_real=weights_cols_real,
     )
 
@@ -350,7 +355,7 @@ def build_q6_k_case(
         cols_bands,
         seed,
         "q6_k",
-        2,
+        FORMAT_Q6_K,
         weights_cols_real=weights_cols_real,
     )
 
@@ -397,7 +402,7 @@ def build_q6_k_head_case(
     total_tiles = rows_steps * total_bands
     tile_bytes = first["tile_bytes"]
     return {
-        "format": 2,
+        "format": FORMAT_Q6_K,
         "rows_steps": rows_steps,
         "cols_bands": total_bands,
         "tile_bytes": tile_bytes,

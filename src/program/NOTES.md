@@ -104,7 +104,7 @@ per-compute buffer and decoded by the worker.
 
 | word | value |
 | --: | :-- |
-| 0 | format (0 = no-op probe, 1 = Q4_0, 2 = Q6_K, 3 = stream probe, 4 = cycle) |
+| 0 | format/mode (ggml_type: 2 = Q4_0, 14 = Q6_K; 0xF0 = FIFO, 0xF1 = raw checksum, 0xF2 = tile checksum) |
 | 1 | `tile_bytes` |
 | 2 | `rows_steps` (`weights_rows` / 256) |
 | 3 | `cols_bands` (bands in this chunk) |
@@ -281,9 +281,8 @@ timing driver.
 ## Performance history
 
 `./test --timing` breaks a call into prepare, upload, txn, input, kernel, and
-unpack.  It also runs probe (`format=3`, stream + assembly, no quant math) and
-cycle (`format=4`, fills + FIFO acquire/release only) rows on the diagnostic
-build.
+unpack.  It also runs a `cycle` row (FIFO mode, fills + acquire/release only)
+and a `raw` row (per-block transport checksum) on the diagnostic build.
 
 - Before direct reads: Q4_0 1536x12288 real 1527 us / probe 1447 us; Q6_K
   1536x6144 real 1227 us / probe 1130 us.
@@ -305,6 +304,16 @@ build.
 - Single-loop continuous streams before the loop-idiom changes: Q4_0
   2048x2048 ~123 us, Q6_K 2048x2048 ~148 us, Q4_0 1536x12288 ~315 us,
   Q6_K 1536x6144 ~247 us, Q4_0 1536x512 ~133 us.
+- Shared block loop: the assembly loop is now one non-template
+  `program_block::run` with a format function pointer instead of an inlined
+  template copy per format, and the pointer is the `unpack_mmul` instantiation
+  itself.  Production `.text` 12192 -> 11104 bytes; Q4_0 block 4368 -> 3232
+  bytes (32-byte thunk + 3200-byte `unpack_mmul`), Q6_K 5168 -> 4032 bytes
+  (32 + 4000).  The shared loop is 1184 bytes.  Interleaved A/B with five
+  warm-up and twenty timed runs: Q4_0 1536x512 78.9 -> 79.8 us, Q4_0
+  1536x12288 285.0 -> 278.2 us, Q6_K 1536x6144 228.4 -> 223.9 us, Q4_0
+  2048x2048 118.2 -> 117.8 us, Q6_K 2048x2048 141.2 -> 144.1 us.  The
+  pointer call is inside the run-to-run noise.
 
 ### Real-query throughput
 
@@ -474,7 +483,8 @@ acceptance".
 
 Diagnostic probe/cycle medians were nearly identical, e.g. Q4_0 1536x12288
 probe 262.1 / cycle 266.2 us, Q6_K 1536x6144 probe 216.6 / cycle 214.8 us.
-Fill and launch dominate; assembly overhead is negligible.
+Fill and launch dominate; assembly overhead is negligible.  The probe row was
+later removed (see below): it tracked the real kernel within run noise.
 
 Head chunk sweep, same xclbin and prepared weights, 3 runs each (total per
 token):
@@ -502,8 +512,8 @@ penalty.  Final production medians (5 warm runs):
 Head timing with 48 bands and dynamic zero is ~8.2 ms per token
 (11 chunks), versus ~9.1-9.5 ms at 25 bands in the controlled sweep.  Keep
 `MAX_BANDS_PER_CHUNK = 48` and use it for `HEAD_GOLDEN`; the output object is
-12 KiB per compute (48 KiB per group).  Program `.text` is unchanged at 11232
-bytes production / 13984 diagnostic, stack 2432 bytes.
+12 KiB per compute (48 KiB per group).  Program `.text` is 11104 bytes
+production / 14048 diagnostic, stack 2432 bytes.
 
 ### Streaming gap versus the PoC
 
@@ -850,22 +860,24 @@ remaining real-kernel difference is quant compute, not fill throughput.
 
 - Measure compute-tile program memory from the linked ELF:
   `llvm-size -A <build-dir>/xclbin_build/elfs_main_core_*/*.elf`.
-  Diagnostic builds report `.text` = 13984 bytes on all 32 cores; production
-  builds report 11232 bytes (69% of the 16 KiB limit).  Diagnostic overhead is
-  `program_assemble` (832), `program_probe` (768), `program_stream` (352),
+  Diagnostic builds report `.text` = 14048 bytes on all 32 cores; production
+  builds report 11104 bytes (68% of the 16 KiB limit).  Diagnostic overhead is
+  `program_assemble` (832), `program_probe` (768), `program_raw_check` (432),
   the split-path worker code, and `__floatunsisf` (160).
 - `build.py --production` builds into `build-production/` from
   `production_dynamic_program`.  It links only `program_config_decode`,
   `program_init`, `program_zero`, `program_block_begin`,
   `program_q4_block`, and `program_q6_block`.  It rejects config formats
-  0/3/4 and skips probe/cycle timing rows.  The normal build keeps the
-  diagnostic split path.
+  the diagnostic mode range and skips the cycle timing row.  The normal build
+  keeps the diagnostic split path.
 - Unused device functions and kernels should still be removed from `run.py`:
   they slow JIT/build, appear in the source-file cache set, and hide which
   kernels the worker actually calls.  The old split `program_q4_0` /
   `program_q6_k`, `program_row_begin`, and the unused `full_blocks` /
   `last_blocks` math were removed.  The block kernels own the production
-  path; `assemble`/`probe`/`stream` remain for diagnostics.
+  path; `assemble`/`probe` remain for diagnostics.  `program_stream`/format 3
+  were removed: its timing tracked the real kernel within run noise, so the
+  tile-checksum probe and the FIFO cycle floor are the useful diagnostics.
 - `else_` is a context manager that takes the `if_` handle:
   `with if_(cond) as branch:` then `with else_(branch):`.
 - Result-producing `scf.if` is needed when a memref must be selected; plain

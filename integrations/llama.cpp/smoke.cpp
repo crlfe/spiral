@@ -155,7 +155,7 @@ bool run_case(spiral::Program & program, const std::string & name) {
         std::chrono::duration<double, std::micro>(end - start).count();
 
     const double max_error = check_outputs(golden, outputs);
-    const double tolerance = golden.format == 1 ? 1e-2 : 2e-2;
+    const double tolerance = golden.format == GGML_TYPE_Q4_0 ? 1e-2 : 2e-2;
     std::printf("%-22s %8.1f us  max_error %.6f  %s\n", name.c_str(),
                 elapsed_us, max_error, max_error <= tolerance ? "ok" : "FAIL");
     return max_error <= tolerance;
@@ -307,7 +307,7 @@ bool run_residency_case(spiral::Program & program) {
 bool run_buffer_case(const std::string & name, int32_t override_cols = 0) {
     const Golden golden = load_golden(name);
     const ggml_type weight_type =
-        golden.format == 1 ? GGML_TYPE_Q4_0 : GGML_TYPE_Q6_K;
+        golden.format == GGML_TYPE_Q4_0 ? GGML_TYPE_Q4_0 : GGML_TYPE_Q6_K;
 
     const int32_t K = golden.weights_rows;
     const int32_t N = override_cols > 0 ? override_cols : golden.weights_cols;
@@ -402,7 +402,7 @@ bool run_buffer_case(const std::string & name, int32_t override_cols = 0) {
                         static_cast<size_t>(N) * sizeof(float));
         }
         const double max_error = check_outputs(golden, outputs);
-        const double tolerance = golden.format == 1 ? 1e-2 : 2e-2;
+        const double tolerance = golden.format == GGML_TYPE_Q4_0 ? 1e-2 : 2e-2;
         std::printf("%-22s buffer path  max_error %.6f  %s\n", name.c_str(),
                     max_error, max_error <= tolerance ? "ok" : "FAIL");
         ok = max_error <= tolerance;

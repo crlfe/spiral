@@ -156,7 +156,8 @@ bool check_outputs(const std::string& name, const Golden& golden,
     }
   }
 
-  const double tolerance = golden.format == 1 ? 0.01 : 0.02;
+  const double tolerance =
+      golden.format == design::kFormatQ4_0 ? 0.01 : 0.02;
   const bool ok = max_error <= tolerance;
   std::printf("%s golden: %s (max error %.6f, %d tiles)\n", name.c_str(),
               ok ? "ok" : "FAILED", max_error, golden.total_tiles);
@@ -299,6 +300,13 @@ bool run_timing(spiral::Program& program, const std::string& name,
   std::vector<float> outputs(
       static_cast<size_t>(design::kInputsVecs) * golden.weights_cols,
       std::numeric_limits<float>::quiet_NaN());
+  // Warm up the pipeline and prepared weights before measuring.  Five warm-up
+  // passes match the head-timing path; the default measurement is five warm-up
+  // runs followed by twenty timed iterations.
+  for (int i = 0; i < 5; ++i) {
+    program.run(shape, prepared, golden.inputs.data(), outputs.data(),
+                golden.weights_cols, 0);
+  }
   spiral::RunTimings total;
   for (int i = 0; i < iterations; ++i) {
     spiral::RunTimings timings;
@@ -603,6 +611,11 @@ bool run_probe_timing(spiral::Program& program, const std::string& name,
   std::vector<float> outputs(
       static_cast<size_t>(design::kInputsVecs) * golden.weights_cols,
       std::numeric_limits<float>::quiet_NaN());
+  // Match the real-kernel timing measurement: five warm-up passes.
+  for (int i = 0; i < 5; ++i) {
+    program.run(shape, prepared, golden.inputs.data(), outputs.data(),
+                golden.weights_cols, 0);
+  }
   spiral::RunTimings total;
   for (int i = 0; i < iterations; ++i) {
     spiral::RunTimings timings;
@@ -704,49 +717,47 @@ int main(int argc, char** argv) {
     if (argc > 1 && std::string(argv[1]) == "--timing") {
       std::printf("%-22s %7s %7s %7s %7s %7s %7s %7s\n", "case", "prepare",
                   "upload", "txn", "input", "kernel", "unpack", "total");
-      if (!run_timing(program, "q4_0_1536x512", 50)) {
+      if (!run_timing(program, "q4_0_1536x512", 20)) {
         return 1;
       }
-      if (!run_probe_timing(program, "q4_0_1536x512", 50, 3, "probe ")) {
+      if (!run_probe_timing(program, "q4_0_1536x512", 50,
+                              design::kModeFifo, "cycle ")) {
         return 1;
       }
-      if (!run_probe_timing(program, "q4_0_1536x512", 50, 4, "cycle ")) {
+      if (!run_probe_timing(program, "q4_0_1536x512", 50,
+                              design::kModeRawCheck, "raw ")) {
         return 1;
       }
       if (!run_timing(program, "q4_0_1536x12288", 20)) {
         return 1;
       }
-      if (!run_probe_timing(program, "q4_0_1536x12288", 20, 3, "probe ")) {
-        return 1;
-      }
-      if (!run_probe_timing(program, "q4_0_1536x12288", 20, 4, "cycle ")) {
+      if (!run_probe_timing(program, "q4_0_1536x12288", 20,
+                              design::kModeFifo, "cycle ")) {
         return 1;
       }
       if (!run_timing(program, "q6_k_1536x6144", 20)) {
         return 1;
       }
-      if (!run_timing(program, "q4_0_2048x2048", 50)) {
+      if (!run_timing(program, "q4_0_2048x2048", 20)) {
         return 1;
       }
-      if (!run_probe_timing(program, "q4_0_2048x2048", 50, 3, "probe ")) {
+      if (!run_probe_timing(program, "q4_0_2048x2048", 50,
+                              design::kModeFifo, "cycle ")) {
         return 1;
       }
-      if (!run_probe_timing(program, "q4_0_2048x2048", 50, 4, "cycle ")) {
+      if (!run_timing(program, "q6_k_2048x2048", 20)) {
         return 1;
       }
-      if (!run_timing(program, "q6_k_2048x2048", 50)) {
+      if (!run_probe_timing(program, "q6_k_2048x2048", 50,
+                              design::kModeFifo, "cycle ")) {
         return 1;
       }
-      if (!run_probe_timing(program, "q6_k_2048x2048", 50, 3, "probe ")) {
+      if (!run_probe_timing(program, "q6_k_1536x6144", 20,
+                              design::kModeFifo, "cycle ")) {
         return 1;
       }
-      if (!run_probe_timing(program, "q6_k_2048x2048", 50, 4, "cycle ")) {
-        return 1;
-      }
-      if (!run_probe_timing(program, "q6_k_1536x6144", 20, 3, "probe ")) {
-        return 1;
-      }
-      if (!run_probe_timing(program, "q6_k_1536x6144", 20, 4, "cycle ")) {
+      if (!run_probe_timing(program, "q6_k_1536x6144", 20,
+                              design::kModeRawCheck, "raw ")) {
         return 1;
       }
       return 0;

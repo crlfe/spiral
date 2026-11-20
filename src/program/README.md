@@ -14,7 +14,7 @@ design.py           fixed geometry, buffer types, config layout
 pack.py             case construction, host packing, NumPy references
 run.py              JIT program and Python test runner
 build.py            xclbin + transaction + design_meta.h + golden data
-kernels/            AIE tile assembly, probe/stream diagnostics, quant compute
+kernels/            AIE tile assembly, probe diagnostics, quant compute
 host/program.h/.cc  loaded design and host repack/pack/unpack API
 host/test.cc        manifest-driven golden and timing driver
 ```
@@ -47,14 +47,15 @@ cd src/program/build-production && ./test
 ```
 
 The production variant uses `run.production_dynamic_program` and omits the
-diagnostic path: `program_assemble`, `program_probe`, `program_stream`, the
-`ready` dispatch, and the format-4 cycle branch.  Only formats 1 (Q4_0) and 2
-(Q6_K) are accepted; the host wrapper rejects 0/3/4.  It builds into
+diagnostic path: `program_assemble`, `program_probe`, `program_raw_check`, the
+`ready` dispatch, and the diagnostic modes.  Only Q4_0 (ggml_type 2) and Q6_K
+(14) are accepted; the host wrapper rejects the diagnostic range
+0xF0-0xFF.  It builds into
 `build-production/`, reuses `build/golden` through a symlink when available,
-and `./test --timing` skips the probe and cycle rows.
+and `./test --timing` skips the diagnostic timing rows.
 
-Linked program memory is 11232 bytes per compute core (69% of 16 KiB),
-versus 13984 bytes for the diagnostic build.
+Linked program memory is 11104 bytes per compute core (68% of 16 KiB),
+versus 14048 bytes for the diagnostic build.
 
 ### Python checks
 
@@ -86,9 +87,9 @@ off; it helps prompt processing but costs decode), and
 `SPIRAL_DMA_LATENCY_PATH` overrides the node path.  `--all-timing` measures every
 golden case with prepared weights.
 
-The diagnostic build's timing table also includes `probe` (stream + assembly,
-no quant math) and `cycle` (fills + FIFO acquire/release only) rows.  The
-production build omits them.
+The diagnostic build's timing table also includes `cycle` (fills + FIFO
+acquire/release only) and `raw` (per-block transport checksum, no assembly)
+rows.  The production build omits them.
 
 ## C++ API
 
@@ -98,7 +99,7 @@ production build omits them.
 spiral::Program program;
 
 spiral::MatmulShape shape;
-shape.format = 1;          // 1 = Q4_0, 2 = Q6_K
+shape.format = 2;          // ggml_type: Q4_0 = 2, Q6_K = 14
 shape.weights_rows = 1536; // multiple of 256
 shape.weights_cols = 2048; // multiple of 512; max 48 bands per call
 shape.inputs_vecs = 4;     // must match the fixed design
@@ -179,7 +180,7 @@ launch-limited model breakdown.
 - 8 groups x 4 compute tiles, 4 input vectors, 256-row tiles,
   16-column tiles, 8 KiB L1 stream blocks, 32 KiB L2 stream blocks.
 - Q4_0 and Q6_K use one block kernel per L1 block: assembly/carry and mmul run
-  in the same call.  Probe/stream diagnostics keep the split tile path.
+  in the same call.  Probe diagnostics keep the split tile path.
 - Tiles wholly contained in one L1 block are read in place; only tiles that
   straddle a block boundary are copied through the carry buffer.
 - Weight streams are continuous and padded only at the end.  One input object

@@ -48,7 +48,7 @@ ZERO_SOURCE = KERNEL_DIR / "program_zero.aie.cc"
 ASSEMBLE_SOURCE = KERNEL_DIR / "program_assemble.aie.cc"
 BLOCK_SOURCE = KERNEL_DIR / "program_block.aie.cc"
 PROBE_SOURCE = KERNEL_DIR / "program_probe.aie.cc"
-STREAM_SOURCE = KERNEL_DIR / "program_stream.aie.cc"
+RAW_CHECK_SOURCE = KERNEL_DIR / "program_raw_check.aie.cc"
 Q4_0_BLOCK_SOURCE = KERNEL_DIR / "program_q4_block.aie.cc"
 Q6_K_BLOCK_SOURCE = KERNEL_DIR / "program_q6_block.aie.cc"
 # Shared block body and helpers; included by every `program_*_block` source.
@@ -83,7 +83,7 @@ SOURCE_FILES = [
     ASSEMBLE_SOURCE,
     BLOCK_SOURCE,
     PROBE_SOURCE,
-    STREAM_SOURCE,
+    RAW_CHECK_SOURCE,
     Q4_0_BLOCK_SOURCE,
     Q6_K_BLOCK_SOURCE,
     BLOCK_IMPL_HEADER,
@@ -191,8 +191,8 @@ def _make_kernels(production=False):
         inline=False,
     )
     assemble = None
-    stream = None
     probe = None
+    raw_check = None
     if not production:
         assemble = ExternalFunction(
             "program_assemble",
@@ -205,7 +205,6 @@ def _make_kernels(production=False):
             ],
             compile_flags=[
                 f"-DPROGRAM_BLOCK_BYTES={design.L1_STREAM_BYTES}",
-                f"-DPROGRAM_CARRY_BYTES={design.CARRY_BYTES}",
             ],
             source_file=str(ASSEMBLE_SOURCE),
             inline=False,
@@ -216,20 +215,6 @@ def _make_kernels(production=False):
         source_file=str(BLOCK_SOURCE),
         inline=False,
     )
-    if not production:
-        stream = ExternalFunction(
-            "program_stream",
-            arg_types=[
-                design.l1_stream_type,
-                design.l1_carry_type,
-                design.l1_input_group_type,
-                design.l1_outputs_type,
-                design.l1_state_type,
-                np.int32,
-            ],
-            source_file=str(STREAM_SOURCE),
-            inline=False,
-        )
     block_args = [
         design.l1_stream_type,
         design.l1_carry_type,
@@ -281,6 +266,17 @@ def _make_kernels(production=False):
             source_file=str(PROBE_SOURCE),
             inline=False,
         )
+        raw_check = ExternalFunction(
+            "program_raw_check",
+            arg_types=[
+                design.l1_stream_type,
+                design.l1_outputs_type,
+                np.int32,
+                np.int32,
+            ],
+            source_file=str(RAW_CHECK_SOURCE),
+            inline=False,
+        )
     return (
         config,
         init,
@@ -288,7 +284,7 @@ def _make_kernels(production=False):
         assemble,
         block_begin,
         probe,
-        stream,
+        raw_check,
         q4_0_block,
         q6_k_block,
     )
@@ -390,7 +386,7 @@ def _make_program(dynamic, production=False):
         assemble,
         block_begin,
         probe,
-        stream,
+        raw_check,
         q4_0_block,
         q6_k_block,
     ) = _make_kernels(production)
@@ -426,7 +422,7 @@ def _make_program(dynamic, production=False):
         q6_k_block,
         assemble=None,
         probe=None,
-        stream=None,
+        raw_check=None,
     ):
         config_buf = inputs_cons.acquire(1)
         decode(config_buf, config_out)
@@ -446,6 +442,10 @@ def _make_program(dynamic, production=False):
         two_i32 = arith.constant(i32, 2)
         three_i32 = arith.constant(i32, 3)
         four_i32 = arith.constant(i32, 4)
+        fmt_q4_i32 = arith.constant(i32, design.FORMAT_Q4_0)
+        fmt_q6_i32 = arith.constant(i32, design.FORMAT_Q6_K)
+        mode_fifo_i32 = arith.constant(i32, design.MODE_FIFO)
+        mode_raw_i32 = arith.constant(i32, design.MODE_RAW_CHECK)
         num_groups = arith.divui(
             arith.addi(rows_steps, three_i32), four_i32
         )
@@ -567,7 +567,7 @@ def _make_program(dynamic, production=False):
 
                 with if_(active):
                     with if_(
-                        arith.cmpi(CmpIPredicate.eq, fmt, one_i32)
+                        arith.cmpi(CmpIPredicate.eq, fmt, fmt_q4_i32)
                     ) as is_q4:
                         q4_0_block(
                             active_block,
@@ -594,7 +594,7 @@ def _make_program(dynamic, production=False):
                         else:
                             with if_(
                                 arith.cmpi(
-                                    CmpIPredicate.eq, fmt, two_i32
+                                    CmpIPredicate.eq, fmt, fmt_q6_i32
                                 )
                             ) as is_q6:
                                 q6_k_block(
@@ -624,31 +624,15 @@ def _make_program(dynamic, production=False):
                                         zero_i32,
                                     )
                                     with if_(ready):
-                                        with if_(
-                                            arith.cmpi(
-                                                CmpIPredicate.eq,
-                                                fmt,
-                                                three_i32,
-                                            )
-                                        ) as is_stream:
-                                            stream(
-                                                active_block,
-                                                carry,
-                                                active_input,
-                                                outputs_buf,
-                                                state,
-                                                cols_bands,
-                                            )
-                                        with else_(is_stream):
-                                            probe(
-                                                active_block,
-                                                carry,
-                                                active_input,
-                                                outputs_buf,
-                                                state,
-                                                tile_bytes,
-                                                cols_bands,
-                                            )
+                                        probe(
+                                            active_block,
+                                            carry,
+                                            active_input,
+                                            outputs_buf,
+                                            state,
+                                            tile_bytes,
+                                            cols_bands,
+                                        )
 
                 iron_yield(
                     [active_block, active_input, active_group]
@@ -662,7 +646,7 @@ def _make_program(dynamic, production=False):
             emit_loop()
         else:
             with if_(
-                arith.cmpi(CmpIPredicate.eq, fmt, four_i32)
+                arith.cmpi(CmpIPredicate.eq, fmt, mode_fifo_i32)
             ) as is_cycle:
                 for _ in range_(weights_blocks):
                     l1_block = weights_cons.acquire(1)
@@ -673,7 +657,27 @@ def _make_program(dynamic, production=False):
                 outputs_buf = outputs_prod.acquire(1)
                 outputs_prod.release(1)
             with else_(is_cycle):
-                emit_loop()
+                with if_(
+                    arith.cmpi(CmpIPredicate.eq, fmt, mode_raw_i32)
+                ) as is_raw:
+                    outputs_buf = outputs_prod.acquire(1)
+                    for block_index in range_(weights_blocks):
+                        l1_block = weights_cons.acquire(1)
+                        raw_check(
+                            l1_block,
+                            outputs_buf,
+                            block_index,
+                            arith.constant(
+                                i32, design.L1_STREAM_BYTES
+                            ),
+                        )
+                        weights_cons.release(1)
+                    for _ in range_(num_groups):
+                        inputs_buf = inputs_cons.acquire(1)
+                        inputs_cons.release(1)
+                    outputs_prod.release(1)
+                with else_(is_raw):
+                    emit_loop()
 
         if dynamic:
             input_pad = config_out[design.CFG_INPUT_PAD]
@@ -711,7 +715,7 @@ def _make_program(dynamic, production=False):
         q6_k_block,
     ]
     if not production:
-        worker_kernels += [assemble, probe, stream]
+        worker_kernels += [assemble, probe, raw_check]
 
     workers = [
         Worker(
@@ -939,12 +943,17 @@ def production_dynamic_program(
     return _make_program(True, production=True)
 
 
-def run_case(rows_steps, cols_bands, tile_bytes, seed=1, format=0):
-    if format == 0:
+def run_case(rows_steps, cols_bands, tile_bytes, seed=1,
+             format=design.MODE_TILE_CHECK):
+    if format == design.MODE_TILE_CHECK:
         case = pack.build_case(rows_steps, cols_bands, tile_bytes, seed)
-    elif format == 1:
+    elif format == design.MODE_RAW_CHECK:
+        case = pack.build_case(
+            rows_steps, cols_bands, tile_bytes, seed, format_id=format
+        )
+    elif format == design.FORMAT_Q4_0:
         case = pack.build_q4_0_case(rows_steps, cols_bands, seed)
-    elif format == 2:
+    elif format == design.FORMAT_Q6_K:
         case = pack.build_q6_k_case(rows_steps, cols_bands, seed)
     else:
         raise ValueError(f"unknown format {format}")
@@ -984,12 +993,43 @@ def run_case(rows_steps, cols_bands, tile_bytes, seed=1, format=0):
 
     program(weights_tensor, inputs_tensor, outputs_tensor)
 
-    if format != 0:
+    if format == design.MODE_RAW_CHECK:
+        blocks = weights_blocks
+        expected = (
+            case["weights"]
+            .reshape(
+                design.GROUPS,
+                blocks,
+                design.COMPUTES_PER_GROUP,
+                design.L1_STREAM_BYTES,
+            )
+            .view(np.uint32)
+            .sum(axis=3, dtype=np.uint64)
+            .astype(np.uint32)
+            .transpose(0, 2, 1)
+        )
+        actual = (
+            np.asarray(outputs_tensor)
+            .reshape(
+                design.GROUPS,
+                design.COMPUTES_PER_GROUP,
+                design.OUTPUT_ELEMS,
+            )[:, :, :blocks]
+            .view(np.uint32)
+        )
+        mismatches = int(np.count_nonzero(actual != expected))
+        print(
+            f"raw rows_steps={rows_steps} cols_bands={cols_bands} "
+            f"blocks={blocks} mismatches={mismatches}"
+        )
+        return mismatches == 0
+
+    if format != design.MODE_TILE_CHECK:
         max_error = _real_max_error(
             np.asarray(outputs_tensor), case["expected"], cols_bands
         )
-        label = "q4_0" if format == 1 else "q6_k"
-        tolerance = 1e-2 if format == 1 else 2e-2
+        label = "q4_0" if format == design.FORMAT_Q4_0 else "q6_k"
+        tolerance = 1e-2 if format == design.FORMAT_Q4_0 else 2e-2
         print(
             f"{label} rows_steps={rows_steps} cols_bands={cols_bands} "
             f"tile={tile_bytes} blocks={weights_blocks} "
@@ -1030,7 +1070,7 @@ def run_head_chunks(
             bands,
             Q6_K_TILE_BYTES,
             seed=100 + chunk,
-            format=2,
+            format=design.FORMAT_Q6_K,
         )
         remaining -= bands
         chunk += 1
@@ -1068,17 +1108,29 @@ def main():
         (6, 12),
         (6, 24),
     ]
+    raw_cases = [
+        (1, 1, Q4_0_TILE_BYTES),
+        (4, 4, Q4_0_TILE_BYTES),
+        (6, 12, Q6_K_TILE_BYTES),
+    ]
 
     status = True
     for rows_steps, cols_bands, tile_bytes in noop_cases:
         status &= run_case(rows_steps, cols_bands, tile_bytes)
     for rows_steps, cols_bands in q4_0_cases:
         status &= run_case(
-            rows_steps, cols_bands, Q4_0_TILE_BYTES, format=1
+            rows_steps, cols_bands, Q4_0_TILE_BYTES, format=design.FORMAT_Q4_0
         )
     for rows_steps, cols_bands in q6_k_cases:
         status &= run_case(
-            rows_steps, cols_bands, Q6_K_TILE_BYTES, format=2
+            rows_steps, cols_bands, Q6_K_TILE_BYTES, format=design.FORMAT_Q6_K
+        )
+    for rows_steps, cols_bands, tile_bytes in raw_cases:
+        status &= run_case(
+            rows_steps,
+            cols_bands,
+            tile_bytes,
+            format=design.MODE_RAW_CHECK,
         )
     return 0 if status else 1
 
