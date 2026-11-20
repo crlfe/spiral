@@ -2,16 +2,10 @@
 
 #include <stdint.h>
 
-namespace {
-enum State {
-  kBlockPos = 1,
-  kBlockDone = 2,
-  kReady = 4,
-};
-}  // namespace
+#include "program_state.h"
 
 extern "C" void program_block_begin(int32_t* restrict state) {
-  state[kBlockPos] = 0;
-  state[kBlockDone] = 0;
-  state[kReady] = 0;
+  state[program::kBlockPos] = 0;
+  state[program::kBlockDone] = 0;
+  state[program::kReady] = 0;
 }

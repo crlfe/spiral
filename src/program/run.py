@@ -53,7 +53,7 @@ Q4_0_BLOCK_SOURCE = KERNEL_DIR / "program_q4_block.aie.cc"
 Q6_K_BLOCK_SOURCE = KERNEL_DIR / "program_q6_block.aie.cc"
 # Shared block body and helpers; included by every `program_*_block` source.
 BLOCK_IMPL_HEADER = KERNEL_DIR / "program_block_impl.h"
-BLOCK_COMMON_HEADER = KERNEL_DIR / "program_block_common.h"
+STATE_HEADER = KERNEL_DIR / "program_state.h"
 Q4_0_HEADERS = [
     QUANTS_ROOT / "quants/q4_0/mmul.aie.h",
     QUANTS_ROOT / "quants/q4_0/unpack.aie.h",
@@ -87,7 +87,7 @@ SOURCE_FILES = [
     Q4_0_BLOCK_SOURCE,
     Q6_K_BLOCK_SOURCE,
     BLOCK_IMPL_HEADER,
-    BLOCK_COMMON_HEADER,
+    STATE_HEADER,
     *Q4_0_HEADERS,
     *Q6_K_HEADERS,
 ]
@@ -104,7 +104,7 @@ PRODUCTION_SOURCE_FILES = [
     Q4_0_BLOCK_SOURCE,
     Q6_K_BLOCK_SOURCE,
     BLOCK_IMPL_HEADER,
-    BLOCK_COMMON_HEADER,
+    STATE_HEADER,
     *Q4_0_HEADERS,
     *Q6_K_HEADERS,
 ]

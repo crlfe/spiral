@@ -11,24 +11,19 @@
 
 #include <stdint.h>
 
+#include "program_state.h"
+
 #ifndef PROGRAM_BLOCK_BYTES
 #define PROGRAM_BLOCK_BYTES 4096
 #endif
-#ifndef PROGRAM_CARRY_BYTES
-#define PROGRAM_CARRY_BYTES 4096
-#endif
 
-namespace {
-enum State {
-  kCarryLen = 0,
-  kBlockPos = 1,
-  kBlockDone = 2,
-  kTileIndex = 3,
-  kReady = 4,
-  kTileSource = 5,
-  kTileOffset = 6,
-};
-}  // namespace
+using program::kBlockDone;
+using program::kBlockPos;
+using program::kCarryLen;
+using program::kReady;
+using program::kTileIndex;
+using program::kTileOffset;
+using program::kTileSource;
 
 extern "C" void program_assemble(const uint8_t* restrict block,
                                  uint8_t* restrict carry,

@@ -6,6 +6,8 @@
 
 #include <stdint.h>
 
+#include "program_state.h"
+
 #ifndef PROGRAM_INPUT_ELEMS
 #define PROGRAM_INPUT_ELEMS 1024
 #endif
@@ -13,18 +15,10 @@
 #define PROGRAM_INPUT_GROUP_ROWS 4
 #endif
 
-#ifndef PROGRAM_INPUT_ELEMS
-#define PROGRAM_INPUT_ELEMS 1024
-#endif
-
-namespace {
-enum State {
-  kTileIndex = 3,
-  kReady = 4,
-  kTileSource = 5,
-  kTileOffset = 6,
-};
-}  // namespace
+using program::kReady;
+using program::kTileIndex;
+using program::kTileOffset;
+using program::kTileSource;
 
 extern "C" void program_probe(const uint8_t* restrict block,
                               const uint8_t* restrict carry,
