@@ -118,22 +118,35 @@ clear the stale kernel objects in the JIT cache (for example, remove the
 `~/.npu/cache/*` directories containing `iter_args_*.cc`) because
 `compile_external_kernels` skips existing object files.
 
-## Instruction Overlay Reload
+## Program-Memory Overlays
 
-`overlay.py` and `overlay_blocks.py` probe whether a loaded xclbin can swap a
-compute tile's program memory without a full PDI reconfiguration.  The runtime
-side rewrites the 16 KiB PM window with a `blockwrite` after resetting the
-core; the link-only side checks that the Q4_0/Q6_K blocks can move into a
-reloadable `.text` tail without shifting any resident symbol.
+Three scripts show that a loaded xclbin can replace compute-tile program memory
+without a PDI reload, and how far that can be taken while the tiles keep
+running.
 
-Current results: reload cost scales at ~1.3-1.5 us/KiB of program memory, so
-all 32 production computes (~11 KiB each) would reload in ~0.45-0.5 ms versus
-~2.6 ms for a PDI reload.  Both block variants link with an identical
-`overlay_entry` at `0xe0` (current tails 4848 B and 5648 B), and the control-packet
-path is slower for bulk PM (138.6 us vs 96.3 us for 4 cores).
+- `overlay.py` - the cost baseline. It swaps two real kernels by writing their
+  program memory from the command processor, and compares that with loading a
+  different xclbin. It resets the cores around the write, so it is the
+  reference, not the running case.
+- `overlay_blocks.py` - the link side. It checks that the format blocks can move
+  into a reloadable tail while the resident code keeps the same addresses and
+  entry point, so a tail can be swapped without relinking or reloading the
+  xclbin.
+- `overlay_packets.py` - the runtime experiment. It streams control packets
+  over the NoC into program memory while the core runs, with three modes:
+  - `slot` writes a second kernel into a spare region of one tile's program
+    memory and reads it back to verify.
+  - `broadcast` sends one write stream to every compute tile at once and has
+    the command processor verify it in place, so no read-back traffic is
+    needed.
+  - `switch` keeps the tile running on one stage while the next stage is
+    streamed into the spare region, then transfers execution to the new stage
+    and proves it ran. A/B rounds can repeat, either one dispatch per round or
+    all unrolled into a single dispatch.
 
-The mechanism, measurement tables, link layout, and caveats are in
-[`overlay.md`](overlay.md).
+Commands, measurements, the packet and link-layout findings, limits, and the
+next steps (real quant block images at fixed slots, whole-array format
+switching) are in [`overlay.md`](overlay.md).
 
 ## Call Overheads
 

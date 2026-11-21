@@ -36,6 +36,7 @@ import re
 import shutil
 import struct
 import subprocess
+import sys
 import sysconfig
 from pathlib import Path
 
@@ -175,8 +176,21 @@ def _env() -> dict:
     return env
 
 
-def _tool(*args, cwd: Path):
-    subprocess.run(list(map(str, args)), check=True, cwd=cwd, env=_env())
+def _tool(*args, cwd: Path, quiet: bool = False):
+    try:
+        subprocess.run(
+            list(map(str, args)),
+            check=True,
+            cwd=cwd,
+            env=_env(),
+            capture_output=quiet,
+            text=quiet,
+        )
+    except subprocess.CalledProcessError as err:
+        if quiet:
+            sys.stderr.write(err.stdout or "")
+            sys.stderr.write(err.stderr or "")
+        raise
 
 
 def _parse_core_elf(path: Path) -> bytes:
@@ -208,7 +222,9 @@ def _parse_core_elf(path: Path) -> bytes:
     return segments[0][1]
 
 
-def build_variant(name: str, delta: int, pad: int, tiles: int) -> dict:
+def build_variant(
+    name: str, delta: int, pad: int, tiles: int, quiet: bool = False
+) -> dict:
     work = WORK_ROOT / name
     if work.exists():
         shutil.rmtree(work)
@@ -229,6 +245,7 @@ def build_variant(name: str, delta: int, pad: int, tiles: int) -> dict:
         "lowered.mlir",
         "input_with_addresses.mlir",
         cwd=work,
+        quiet=quiet,
     )
     _tool(
         "aie-translate",
@@ -237,8 +254,16 @@ def build_variant(name: str, delta: int, pad: int, tiles: int) -> dict:
         "generate_txn.h",
         "lowered.mlir",
         cwd=work,
+        quiet=quiet,
     )
-    _tool("aiecc", "--get-xclbin", "--tmpdir=xclbin_build", "lowered.mlir", cwd=work)
+    _tool(
+        "aiecc",
+        "--get-xclbin",
+        "--tmpdir=xclbin_build",
+        "lowered.mlir",
+        cwd=work,
+        quiet=quiet,
+    )
 
     # Patch generated overflow returns into throws, as invoke.py does.
     txn_path = work / "generate_txn.h"
@@ -498,8 +523,10 @@ def main() -> None:
     site = Path(sysconfig.get_paths()["purelib"])
     # The harness is host code, so use the system C++ compiler rather than the
     # Peano/aiecc tools on the modified PATH used for the device build.
-    host_cxx = "/usr/bin/clang++" if Path("/usr/bin/clang++").exists() else (
-        shutil.which("clang++") or "g++"
+    host_cxx = (
+        "/usr/bin/clang++"
+        if Path("/usr/bin/clang++").exists()
+        else (shutil.which("clang++") or "g++")
     )
     subprocess.run(
         [
@@ -518,7 +545,7 @@ def main() -> None:
         cwd=run_dir,
     )
 
-    for (o, tag) in ((a["overlays"], "A"), (b["overlays"], "B")):
+    for o, tag in ((a["overlays"], "A"), (b["overlays"], "B")):
         sizes = sorted({v["bytes"] for v in o.values()})
         print(f"  {tag}: {len(o)} cores, .text {sizes[0]}-{sizes[-1]} bytes")
 

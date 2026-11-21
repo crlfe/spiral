@@ -1,277 +1,338 @@
-# Block overlays
+# Program-memory overlays
 
-This note explores making the format-specific dequant+mmul blocks in
-`src/program/kernels` swappable at runtime without reloading the xclbin or the
-rest of the worker.  It is a `tests/poc` experiment; nothing in `src/program`
-depends on it today.
+Can a loaded xclbin swap compute-tile program memory quickly, without a PDI
+reconfiguration, while the tiles keep running? And can one host stream do it
+for every tile at once?
 
-The working link-only prototype is `tests/poc/overlay_blocks.py`. It uses the
-real `program_q4_block.aie.cc` and `program_q6_block.aie.cc` sources and prints
-the stable symbols and overlay sizes. The runtime block-write side is
-`tests/poc/overlay.py`.
+Current answer: yes. A 12 KiB slot is rewritten in one BD while the core keeps
+running, one broadcast stream updates all 32 tiles (verified by CP polls), and a
+streamed slot executes; A/B rounds repeat either one dispatch per round or
+unrolled into a single dispatch. The production shape (real Q4_0/Q6_K tails at
+two fixed slots, a format dispatcher, whole-array switch) is not wired yet; see
+[Next](#next).
 
-## Shape
+Three scripts cover the pieces:
 
-Keep one resident worker image and one tail overlay region:
+| script | phase | proves | status |
+|---|---|---|---|
+| `overlay.py` | cost baseline | blockwrite reload cost vs PDI; A/B images with two real kernels | keep for now; retire once its variant builder moves |
+| `overlay_blocks.py` | link layout | real Q4_0/Q6_K tails, stable `overlay_entry`, identical resident symbols | keep |
+| `overlay_packets.py` | transport + switch | one BD carries a whole control-packet stream; slot write while running; 32-tile broadcast; executing a streamed slot | keep |
+
+## Cost baseline
+
+Measured on the Ryzen AI 9 HX 475 (blockwrite and PDI from `overlay.py`;
+control packets from the earlier per-tile experiment, which included the
+overlay load per configuration):
+
+| path | cost |
+|---|---|
+| full PDI reload | ~2.6 ms |
+| blockwrite, per tile | ~1.3-1.5 us/KiB |
+| blockwrite, 32 tiles x ~11 KiB | ~0.45-0.5 ms |
+| control packets, per tile (1/4 cores) | 68.8 / 138.6 us vs 50.7 / 96.3 us for blockwrite |
+
+The cost is the command processor's block-write throughput, not host
+bandwidth. A blockwrite is one `TXN_OPC_BLOCKWRITE` executed by the CP; its
+payload is inline in the instruction buffer and the destination is the flat AIE
+address space (`col << 25 | row << 20 | offset` on AIE2P). No switchbox route
+is involved, which is why it beats control packets for bulk program memory but
+still costs one CP write per word.
+
+`overlay.py` builds two variants that differ only in a compile-time addend,
+extracts each core's `.text`, and prepends a disable/reset + blockwrite +
+release/reset sequence to the generated transaction. That establishes that
+swapping works and what it costs. It resets the cores around the write, so it
+is not the "while running" case.
+
+## Link layout
+
+`overlay_blocks.py` is link-only and uses the real production block sources:
 
 ```text
 program memory (16 KiB)
 0x0000  crt0 / worker loop / config / init / zero / block_begin
-...     resident main (same bytes for every format)
-X       overlay_entry
-...     format block(s), dispatcher, any compiler-rt helpers they pull in
+...     resident main (same bytes in every variant)
+0xe0    overlay_entry
+...     format block, dispatcher, compiler-rt helpers it pulls in
 0x4000  end
 ```
 
-The resident worker calls one external symbol, `overlay_entry`, with the
-existing block signature. Only one overlay object is linked at a time, so the
-worker no longer references `program_q4_block` and `program_q6_block`
-directly. The host decides which overlay is present.
+It checks the property the host loader depends on: the resident object is
+identical across variants, so every symbol below `overlay_entry` has the same
+address, and the host can replace the bytes from `overlay_entry` on. Current
+tails: Q4_0 4848 B, Q6_K 5648 B; with the shared block loop the payload is the
+`unpack_mmul` instantiation, 3200 B and 4000 B.
 
-The overlay object is linked **last**. Because the resident object is
-identical across variants, the linker gives every resident symbol and
-`overlay_entry` the same address in each variant. The host can therefore
-replace the bytes starting at `overlay_entry`; no resident code or relocation
-changes.
+AIE2 calls are absolute (`j #0x3000`), so a second fixed slot needs either a
+linker-script region (`AIETargetLdScript.cpp`) or a custom module link at that
+base, with a `slot0_entry`/`slot1_entry` pair as the callable bases. The switch
+test uses one fixed entry at `0x21000`; a production design would use such a
+pair behind a per-call dispatcher.
 
-The PoC confirms this with the real block sources:
+### Runtime load
+
+The production worker blocks on its config FIFO between calls, which is the
+quiescent point to replace its tail: it is executing only resident code then.
+The load must happen after the previous call has drained and before the next
+config object is released.  Relying on the output drain alone is racy (the core
+releases the output before it reaches the loop tail), so the robust sequence
+adds a worker-to-host "ready for next config" lock.
+
+`overlay_packets.py --design slot` is the non-destructive form: it writes a
+*different* PM region (`0x21000`) while the core runs from `0x20000`, so no
+quiescent point is needed.  Replacing the slot the core is executing still
+requires the dispatcher and the switch.
+
+### Bundles
+
+There is one tail slot.  To keep several formats resident, link a dispatcher
+(`overlay_entry(fmt) { switch (fmt) { ... } }`) and load the bundle once; the
+host reloads only when the set of formats changes.  Multiple simultaneous fixed
+slots would need a linker-script region per slot (an `AIETargetLdScript.cpp`
+change) or the custom module link above.
+
+### Caveats
+
+- Program memory has no hardware A/B banks: "slots" are fixed address ranges
+  inside the single 16 KiB region.
+- Only `.text` is swapped.  Static data, stack and DM initialization stay
+  resident, so variants must agree on their data layout; format-specific LUTs
+  or tables need their own region or must remain resident.
+- Resetting a core blocked mid-stream on a depth-2 FIFO can leave stale lock
+  state.  Prefer the quiescent point, or reinitialize the affected locks and
+  DMA as the `--expand-load-pdis` path does.
+
+## Transport: control packets
+
+A control packet's stream header carries the routing id; its 20-bit address is
+**tile-relative**. One packet copied by the switchboxes to N `TileControl` ports
+performs the same write in every tile's window, which is what makes a broadcast
+possible.
+
+`overlay_packets.py` hand-builds the stream:
 
 ```text
-q4: core=0x20 overlay=0xe0 (4848 B) text=5072 B
-q6: core=0x20 overlay=0xe0 (5648 B) text=5872 B
-
-resident __start       0x0
-resident core_0_2      0x20
-overlay_entry          0xe0
+stream header | control header (stream_id, opcode, beats, address) | 0..4 data
 ```
 
-The 4848/5648 B tails include the block wrapper, its `unpack_mmul`, and the
-compiler-rt helpers that were not already resident in the tiny PoC main. In
-the production worker those helpers are mostly resident.  With the shared
-block loop, the slot payload is exactly the `unpack_mmul` instantiation:
-Q4_0 3200 B, Q6_K 4000 B.
+Findings, each one a bug that cost time:
 
-## Instruction reload cost
+- **One BD can carry the whole stream.** A shim BD is one TLAST-delimited
+  stream packet and can hold hundreds of inline control packets: 768 packets
+  (12 KiB of PM, 18 KiB on the wire) in one BD works.
+- **Control headers need odd parity.** The TileControl silently drops a header
+  whose 32-bit popcount is even. `0x1F000` (five bits) works with bit 31 clear;
+  `0x1F020` (six bits) is ignored unless bit 31 is set. `create_ctrl_pkt` in
+  `xrt_test_wrapper.h` and the encoder in `AIETargetNPU.cpp` set it the same
+  way.
+- **BD ids are per channel and limited to 16.** Shim and core tiles have 16 BDs
+  per channel (mem tiles 48). `id = 100` runs past the table and the transfer
+  never happens.
+- **Reads are expensive.** A read request carries at most four words and must be
+  its own BD (upstream `aie-ctrl-packet-to-dma` only batches opcode 0). Two and
+  four reads per pass work, eight is flaky, fifteen fails on the first pass.
 
-`tests/poc/overlay.py` measures whether a loaded xclbin can swap a compute
-tile's program-memory image without paying the full PDI reconfiguration cost.
-It builds two kernels that differ only in a compile-time addend, extracts each
-core's `.text` from the per-core ELF that `aiecc` emits, and prepends a small
-instruction sequence to the normal `aie-npu-to-cpp` transaction:
+### Sizing the write: `--packets` and `--batch`
+
+A control packet carries four 32-bit data words (16 bytes); the header's
+`beats` field is two bits. On the wire it is six words: stream header, control
+header, four data words (24 bytes). Each packet's address advances by 16 bytes,
+so `--packets N` writes `16 * N` bytes per destination tile and `24 * N` bytes
+cross the wire.
+
+- `broadcast` defaults to 768 packets: 12 KiB per tile, the free PM window
+  `0x21000..0x23fff` (the resident `.text` at `0x20000` is untouched).
+- `slot` defaults to 14 packets: 224 bytes, the most that fits in the
+  per-packet form.
+- `switch` takes the count from the compiled slot image (six packets for the
+  0x60-byte function).
+
+`--batch` is a `slot` option and changes how the stream is sent, not what it
+contains. Without it, `slot` programs one BD per control packet (a BD is one
+TLAST-delimited stream packet, and the TileControl consumes one control packet
+per stream packet). A shim channel has 16 BDs and the two read requests need
+two, so the per-packet form tops out at 14. `--batch` sends the whole stream in
+one BD, so `--packets` is limited only by the host buffer and the BD length;
+`--verify-all` forces it. `broadcast` and `switch` always use one BD.
+
+## Single tile: write while running, then read back
+
+`--design slot` free-runs a core in slot A (`0x20000`) writing a counter, and
+streams a second kernel's `.text` into slot B (`0x21000`) with no reset. By
+default the image comes from `overlay.py`'s two-variant builder (`--image
+variant`), so it is a genuinely different kernel; `--image resident` repeats the
+resident core's `.text`. Control-packet reads return the words; `--verify-all`
+reads every 4-word chunk.
 
 ```text
-write32 core_control = 0        # disable
-write32 core_control = 2        # reset, PC = 0
-blockwrite 0x20000 <- overlay   # per-tile program memory
-write32 core_control = 0        # release reset
-write32 core_control = 1        # enable
+12288 bytes into slot B in 304.5 us        # first dispatch
+core counter: first snapshot 0x1, second 0x2
+verified 768 of 768 chunks (192 passes of 4 reads)   # --verify-all --read-batch 4
 ```
 
-The runtime sequence generated for the xclbin then runs unchanged.  This avoids
-a new xclbin, hw_context, or PDI load; only the 16 KiB program-memory window at
-tile offset `0x20000` is rewritten.
+A 14-packet (224-byte) write costs ~65-82 us after the first dispatch (which
+pays the xclbin/overlay setup); 12 KiB in one BD is not measurably more. The counter
+advancing across dispatches shows the core never reset.
+
+## Broadcast: one stream, 32 tiles
+
+`--design broadcast` (default) sends one 12 KiB write stream into one packet
+flow with 32 `TileControl` destinations, then verifies the result with CP
+`maskpoll`s at the start, middle and end of every tile:
+
+```text
+all maskpolls matched in 430.6 us
+all maskpolls matched in 118.6 us
+ok: CP polls verified start/middle/end of 32 tiles
+```
+
+No read-back flow, no response channel, no per-tile copy of the image.  For
+comparison, 32 x 11 KiB through the blockwrite path is ~0.45-0.5 ms.
+
+## Verifying without a read-back packet
+
+The instruction stream has no data-returning `read32`: `write32`, `blockwrite`
+and `maskwrite32` are writes, and `maskpoll` reads a word only to compare it.
+`TXN_OPC_READ_REGS` is a legacy opcode in `include/aie/Runtime/TxnEncoding.h`;
+nothing emits it, there is no op/test/layout for it, and current aie-rt has
+dropped it. Host-side `XAie_Read32` is the host backend, not the CP.
+
+With the expected image known, `maskpoll(addr, value, mask = 0xFFFFFFFF)` makes
+the CP read the word and fail the dispatch unless it matches. The installed
+September `aiecc` predates `aiex.npu.maskpoll`, so `append_polls()` appends the
+txn instruction (`opcode 4, 0, address, 0, value, mask, byte size`) and bumps
+the header's opcount/size.
+
+Flipping one data word in the blob (at the end, and separately in the middle)
+each turned the broadcast dispatch into a poll timeout, so the poll reads PM
+rather than the blob. A failure is a dispatch timeout with no address, so
+bisecting the poll set is the only diagnostic; it is a comparator, not a reader.
+
+## Switch: execute the streamed slot
+
+`--design switch` closes the loop, and repeats it. The resident core loops:
+run stage A (writes `0xA000 + (round&1)*0x100`), publish it through the output
+DMA, block on a hardware lock, then call `0x21000` (stage B) and publish that.
+The host does one dispatch per round: stream that round's slot image, release
+the lock, drain both buffers.
+
+```text
+$ ... --design switch --count 6
+  round 0: A 0xa000 B 0xb000  ok  (353.1 us)
+  round 1: A 0xa100 B 0xb100  ok  (81.8 us)
+  round 2: A 0xa000 B 0xb000  ok  (63.3 us)
+  round 3: A 0xa100 B 0xb100  ok  (68.0 us)
+  round 4: A 0xa000 B 0xb000  ok  (65.1 us)
+  round 5: A 0xa100 B 0xb100  ok  (64.0 us)
+ok: 6 rounds of A,B executed with the streamed slot
+```
+
+A1,B1,A2,B2,A1,B1... with the slot image rewritten between every round: B1
+writes `0xB000..`, B2 writes `0xB100..`. The first round pays the setup; later
+rounds are ~50-80 us each with one dispatch per round.
+
+All rounds can also run in **one dispatch**:
+
+```text
+$ ... --design switch --count 32 --one-run
+  round 31: A 0xa100 B 0xb100  ok
+  32 rounds in one dispatch: 404.5 us (12.6 us/round)
+ok: one xrt::run executed 32 A,B rounds
+```
+
+The runtime sequence is unrolled at build time: both slot images are staged in
+the packet buffer (`[B1][B2][lock]`), each round gets its own 8-word drain
+offsets in one host buffer, and the CP walks the rounds itself. Per round this
+is ~13-50 us instead of ~55-95 us, because the host launch is paid once; the
+laptop's clock state moves both numbers, so compare within a run. The trade is
+that the round count and both images are compile-time fixed; the per-round mode
+is still the one to use when the image is chosen at runtime.
+
+How the pieces fit:
+
+- Each slot image is compiled by Peano and linked with `ld.lld -T` at
+  `0x21000` (`.text` is 0x60 bytes, six 16-byte control packets). In the
+  per-round mode the host rewrites that code section of the packet buffer each
+  round, keeping the lock packet in place; in one-run both sections are staged
+  and the sequence selects them by offset.
+- The resident calls `((void (*)(int32_t *))0x21000)(out)`. A constant function
+  pointer compiles to `movxm p1, #0x21000; jl p1`, so no linker symbol or
+  second link step is needed for the call.
+- The switch is a **hardware lock**, not a DM flag. A `.bss` flag loses a race
+  with the core's startup zeroing (the host's write can be erased before the
+  kernel polls it), which made an earlier version intermittently time out. The
+  lock is initialized by the PDI and the core blocks on it; the control packet
+  releases it after the code stream, so ordering is explicit.
+- Both stages are drained to separate host buffers, so stage A is evidence the
+  core was running before the switch, not just that B ran.
+
+Negative control: corrupting one word of round 3's streamed code leaves rounds
+0-2 and 4-5 passing and fails only round 3 (`B 0xa107` instead of `0xb107`), so
+each round executes the image streamed for that round and the loop keeps
+running across replacements.
+
+## Limits
+
+- A shim channel has 16 BDs; a full-slot read-back spends one per four words.
+- A read carries four words and cannot be batched, so `--verify-all` uses one
+  pass per `--read-batch` group.
+- A broadcast write plus per-tile read-back does not route: both flows target
+  `TileControl`, and a master port belongs to one masterset. Per-tile 1:1 flows
+  do route, but the write stream is then duplicated 32x and the NPU DMA window
+  on one host buffer is ~128 KiB of used data (2 KiB per tile). `maskpoll`
+  verification avoids both the conflict and the cap.
+- Polling every word of every tile is 98,304 polls (32 x 3072 words, ~2.7 MB
+  of instructions); three points per tile is cheap, full coverage is practical
+  for one tile or in slices.
+
+## Running it
 
 ```bash
-~/Projects/mlir-aie/ironenv/bin/python tests/poc/overlay.py --tiles 1 --pad 380
-~/Projects/mlir-aie/ironenv/bin/python tests/poc/overlay.py --tiles 4 --pad 0
+# link layout and tails (no hardware)
+~/Projects/mlir-aie/ironenv/bin/python tests/poc/overlay_blocks.py
+
+# transport: one tile, write + read-back
+~/Projects/mlir-aie/ironenv/bin/python tests/poc/overlay_packets.py --design slot --batch --packets 768
+~/Projects/mlir-aie/ironenv/bin/python tests/poc/overlay_packets.py --design slot --packets 768 --verify-all --read-batch 4
+
+# broadcast: all 32 tiles + polls (default)
+~/Projects/mlir-aie/ironenv/bin/python tests/poc/overlay_packets.py
+
+# switch: alternate A,B rounds with the slot rewritten each round
+~/Projects/mlir-aie/ironenv/bin/python tests/poc/overlay_packets.py --design switch --count 6
+# the same rounds unrolled into one dispatch
+~/Projects/mlir-aie/ironenv/bin/python tests/poc/overlay_packets.py --design switch --count 32 --one-run
+
+# cost baseline / A/B images; still used by slot --image variant
+~/Projects/mlir-aie/ironenv/bin/python tests/poc/overlay.py
 ```
 
-The first run uses a production-sized ~10.5 KiB `.text`; the second uses a
-~0.5 KiB image.  On the Ryzen AI 9 HX 475 laptop:
+`overlay_packets.py` options: `--design broadcast|slot|switch`, `--packets N`
+(4-word packets; 16 bytes each), `--batch` (slot), `--verify-all --read-batch N`
+(slot), `--image variant|resident` (slot), `--count N` (broadcast/slot
+dispatches, switch rounds; default 1, or 4 for switch), `--one-run` (switch),
+`--no-run`. Artifacts land in
+`tests/poc/build/overlay_packets/{broadcast,slot,switch}`.
 
-```text
-tiles  pad  .text/tile  total overlay  reload
-    1  380     10672 B       10672 B   62-65 us
-    1    0       496 B         496 B   49-53 us
-    4  380     10672 B       42688 B   107 us
-    4    0       496 B        1984 B   50 us
-    6  380     10672 B       64032 B   131 us
-```
+## Rejected experiments
 
-The marginal cost is ~1.3-1.5 us per KiB of program memory, so reloading every
-one of the 32 production computes (~11 KiB each, ~340 KiB total) should cost
-roughly 0.45-0.5 ms, still well below the ~2.6 ms PDI reconfiguration.  The
-cost is control-processor block-write throughput, not host bandwidth.
+- **Per-tile streams with per-tile read-back**: routed and verified all 32 tiles
+  at 2048 bytes per tile, but the 32x blob hit the 128 KiB window and could not
+  reach a 12 KiB slot.
+- **`aiex.npu.maskpoll` in the MLIR**: the installed `aiecc` predates the op;
+  the txn words are appended instead.
+- **Broadcast write plus per-column read-back**: the masterset conflict above.
 
-The prototype's single split/join block supports at most six compute columns
-because one mem tile has six DMA channels per direction.  The production design
-uses one L2 block per group of four computes, so it does not have this limit
-and can be scaled to all eight columns / 32 computes.
+## Next
 
-## Control-packet reload (`--load-pdi-to-ctrl-pkt`)
+The switch test runs a hand-written slot function. The natural follow-ups:
 
-Recent `mlir-aie` can lower a `load_pdi` into an `@ctrl_pkt_overlay` load
-followed by a stream of `aiex.control_packet` ops instead of `write32` /
-`blockwrite` ops.  The stream does cover program memory: for a tile at
-`(0, 2)`, the generated packets include address `0x220000` (`0x20000` in the
-tile window), followed by the compiled instruction words.
-
-I benchmarked it against `--expand-load-pdis` (the write32/blockwrite path) and
-plain full-PDI reloads on two configurations with a 10.7 KiB `.text` per core.
-The full-ELF runtime sequence configures and runs each configuration once per
-dispatch, so the figures below are per configuration including its run:
-
-```text
-cores  path       per reconfig
-    1  PDI              82.1 us
-    1  write32          50.7 us
-    1  ctrl-pkt         68.8 us
-    4  write32          96.3 us
-    4  ctrl-pkt        138.6 us
-```
-
-The control-packet path is not faster for bulk program memory.  Legalization
-splits each block write into 16-byte control packets, and the per-packet
-TileControl-port processing dominates: the 4-core, two-configuration stream is
-~136 KiB of control packets for ~85 KiB of PM.  For a large quant overlay the
-command-processor `blockwrite` remains the better path.  `ctrl-pkt` is aimed at
-register-heavy reconfiguration with small `.text`.
-
-Two qualifications: this used the installed September toolchain, which lacks
-the newer `--reconfig-teardown` / `--reconfig-init-entry` flags.  The generated
-sequence also reloads the control overlay PDI once per configuration (the dump
-has both `@ctrl_pkt_overlay` and `@ctrl_pkt_overlay_copy`); `--reconfig-init-entry`
-should move that load out of the measured region.  Even so, the per-packet PM
-cost remains, so the write32/blockwrite result is unlikely to be overturned for
-32 x ~11 KiB overlays.
-
-## Runtime load
-
-The production worker already waits on the input config FIFO between calls.
-When it is blocked there, it is executing resident code only, so the host can
-block-write the overlay tail into the idle core's program memory **without
-resetting the core**. When the next config object arrives, the worker enters
-`overlay_entry` and runs the newly loaded code.
-
-This avoids the depth-2 FIFO lock problem seen when resetting a core mid-stream
-in `tests/poc/overlay.py`. The load must happen after the previous call has
-drained and before the next config/input object is released to the worker.
-
-Relying only on the output drain is slightly racy: the core releases the output
-object before it reaches the loop tail and blocks on the next config. For a
-robust host sequence, add a worker-to-host "ready for next config" lock that
-the worker releases just before its config acquire, and make the host wait on
-it before the overlay blockwrite. The existing config FIFO does not by itself
-prove that the core is out of the previous overlay.
-
-The overlay bytes travel through the command processor as a normal
-`blockwrite` to the tile's `0x20000 + overlay_entry` address. For 32 cores,
-loading a ~5 KiB overlay costs roughly `32 * 5 KiB * 1.3 us/KiB ~= 0.2 ms`.
-That cost is paid only when the overlay set changes, not per matmul call.
-
-A host manifest should contain, per variant/bundle:
-
-- the `overlay_entry` address (same for all variants),
-- the overlay tail bytes and size,
-- the set of formats included.
-
-The host can emit the blockwrite commands ahead of the next call's DMA
-commands, exactly as `tests/poc/overlay.py` prepends its overlay commands.
-
-## Bundles are the simple multi-format answer
-
-The current link shape gives one tail slot. The simplest way to keep several
-formats resident is to build an **overlay bundle**:
-
-```text
-overlay_entry(fmt, ...) {
-    switch (fmt) {
-      case 1: program_q4_block(...); break;
-      case 2: program_q6_block(...); break;
-      case 5: program_new_block(...); break;
-    }
-}
-```
-
-A bundle is linked once and loaded once, then serves many operations. The host
-only reloads when the required set of formats is not already in the current
-bundle.
-
-This avoids needing a custom linker script. Q4_0 + Q6_K fit comfortably today;
-a third ~5 KiB format still fits in the ~13 KiB left by a ~3 KiB resident
-worker. When a set no longer fits, build another bundle and swap it.
-
-Multiple simultaneous fixed slots would need a linker-script change: a
-`program` region bounded below the slot area plus one region per slot, with the
-corresponding sections placed at fixed addresses. That is a natural extension
-to `AIETargetLdScript.cpp` (for example, a core `overlay_slots` attribute), but
-it is not required for the first overlay step.
-
-## Fixed-address entries
-
-AIE2 calls are absolute: a C call to a symbol defined as an absolute address
-links to `j #0x3000` / `jl #0x3000`, with no GOT or register indirection.
-That means a slot entry does not need a function pointer if the caller knows
-the slot.  Verified with a C caller plus `.set slot0_entry, 0x3000`: the linked
-disassembly is `j #0x3000`.
-
-Placement has two routes:
-
-- **Toolchain change.** The generated `*(.text*)` script has no slot regions,
-  so `AIETargetLdScript.cpp` would need one region per slot and a matching
-  `.text.slotN` placement.  A core attribute (for example `overlay_slots`)
-  could drive it.
-- **Custom module link.** Keep aiecc for the resident xclbin, then link each
-  module with `ld.lld -T slot.ld` at its base.  The object is compiled with
-  `-ffunction-sections`; `--gc-sections` plus a script that keeps the
-  `unpack_mmul` section places it at the slot address.  A strong entry name
-  can be added with `--defsym=slot0_entry=<mangled unpack>`.  Unresolved
-  resident symbols come from `--just-symbols=<resident.elf>`; filter out
-  symbols the module itself defines so its own entry address wins.  This was
-  tested with the real Q4_0 object: `.text` at `0x3000`, size 3200 B.
-
-For the resident side, an object with `.globl slot0_entry` and
-`.set slot0_entry, 0x3000` supplies the absolute definitions to the normal
-aiecc link.  A tiny called function can pull that object into `link_files`.
-The worker then calls `slot0_entry` directly; if several slots are live, the
-loop needs a format branch per tile (or a small per-slot copy) rather than an
-indirect pointer.  With the shared loop, the entry payload is exactly the
-`unpack_mmul` instantiation: 3200 B for Q4_0 and 4000 B for Q6_K.
-
-## Build changes
-
-If this were taken into the production design:
-
-1. Replace the `q4_0_block` / `q6_k_block` branch in `run.py` with one
-   `program_block_overlay` external call. Keep the diagnostic build's existing
-   blocks for testing.
-2. Compile each overlay variant with the real block sources, renaming the
-   selected block to `program_block_overlay` (or compile a dispatcher bundle).
-3. Put the overlay object last in `link_files` and emit its tail plus the
-   `program_block_overlay` address from the final ELF. The PoC's
-   `readelf`/`PT_LOAD` extraction is the reference.
-4. Keep the resident main identical across variants. Check `core_0_2`,
-   `__start`, and every other resident symbol before trusting an overlay.
-5. In the host, choose the overlay/bundle for the next format and prepend its
-   blockwrite to the next call while the worker is blocked on its config FIFO.
-
-The only format-specific code is in `.text`; the current Q4_0/Q6_K block
-objects have no `.data`/`.rodata` payload. If a future format has
-format-specific LUTs or static data, those must either stay resident for every
-format or get their own data-overlay region. A `.text`-only overlay will not
-move them.
-
-## Caveats found in the prototype
-
-- Program memory has no hardware A/B banks.  "Slots" are just fixed address
-  ranges inside the single 16 KiB region, so a resident dispatcher plus a
-  partial overlay has to be arranged by the linker.
-- The core must be disabled and reset while its PM is rewritten.  Resetting a
-  core that is blocked mid-stream on a depth-2 FIFO can leave stale lock state;
-  the prototype therefore uses depth-1 control FIFOs and reloads between
-  calls.  A production reload should happen at a quiescent point with no
-  objects in flight, or should reinitialize the affected locks/DMA (the
-  `--expand-load-pdis` reconfiguration path already does this).
-- Static data, stack, and the data-memory initialization are not part of the
-  overlay.  Only `.text` is swapped, so the variants must agree on their data
-  layout (the prototype deliberately uses identical internal symbol names).
-
-## Checks
-
-- `readelf -sW` the two variant ELFs and compare every resident symbol, not
-  just `overlay_entry`.
-- `readelf -SW` the `.text` size; main + overlay must stay under `0x4000`.
-- Run the existing `tests/poc/overlay_blocks.py` after changing block sources
-  or compile flags; it is the quickest way to catch a shifted overlay entry.
-- Verify the full production golden set after switching the worker to the
-  overlay call, especially the Q4_0/Q6_K boundary cases.
+- Two **real block images** (Q4_0/Q6_K) at two fixed slots, using
+  `overlay_blocks.py`'s link layout, with a dispatcher keyed by format. This is
+  the production shape: swap the tail, then call the new format's entry.
+- **Broadcast + switch across 32 tiles**: the broadcast write is proven, and a
+  per-tile go-lock release is the same mechanism; combine them for a whole-NPU
+  format switch.
+- Retire `overlay.py`: move its variant builder into `overlay_packets.py` and
+  drop the transitional import.
