@@ -101,8 +101,12 @@ L3 usage at tens of MB instead of the full 333 MB head.
 
 ## Config words
 
-The config object is the first input-FIFO object.  It is copied into a
-per-compute buffer and decoded by the worker.
+The config object is the first input-FIFO object.  It is filled by its own
+shim fill from a dedicated config BO, so the input BO contains only input
+groups; both fills drive the same producer channel, so the config fill is
+finished before the input fill is issued.  The config object is still 8 KiB
+because the input FIFO has a fixed object type, but only the first 64 bytes
+are used.  It is copied into a per-compute buffer and decoded by the worker.
 
 | word | value |
 | --: | :-- |
@@ -143,7 +147,8 @@ inputs [rows_step][inputs_vecs][8] bf16
 ```
 
 The worker receives one L1 weight block per acquire (8 KiB of concatenated
-tiles), one input group per four rows, a private f32 accumulator per compute
+tiles), one config object filled separately, one input group per four rows,
+a private f32 accumulator per compute
 (zeroed before accumulation), a bf16 output object, and the decoded config.
 The epilogue produces the output object after the block loop; the accumulator
 is what persists across `rows_steps`.

@@ -760,7 +760,7 @@ def _make_program(dynamic, production=False):
                 weights_cons.release(1)
 
             extra_inputs = arith.subi(
-                arith.constant(i32, design.MAX_INPUT_GROUPS - 1),
+                arith.constant(i32, design.MAX_INPUT_GROUPS),
                 num_groups,
             )
             for _extra in range_(extra_inputs):
@@ -802,6 +802,7 @@ def _make_program(dynamic, production=False):
     def sequence_static(
         weights_buf,
         inputs_buf,
+        config_buf,
         outputs_buf,
         weights_prods,
         inputs_prod,
@@ -818,6 +819,17 @@ def _make_program(dynamic, production=False):
         outer_in, inner_in = _factor_bd(design.MAX_INPUT_GROUPS)
 
         tg = iron.TaskGroup()
+        config_tg = iron.TaskGroup()
+        inputs_prod.fill(
+            config_buf,
+            offset=0,
+            sizes=[1, 1, 1, input_words],
+            strides=[input_words, 0, 0, 1],
+            transfer_len=input_words,
+            group=config_tg,
+            wait=True,
+        )
+        config_tg.finish()
         inputs_prod.fill(
             inputs_buf,
             offset=0,
@@ -860,6 +872,7 @@ def _make_program(dynamic, production=False):
     def sequence_dynamic(
         weights_buf,
         inputs_buf,
+        config_buf,
         outputs_buf,
         weights_prods,
         inputs_prod,
@@ -888,17 +901,19 @@ def _make_program(dynamic, production=False):
         weight_step = arith.constant(i32, l2_words)
 
         tg = iron.TaskGroup()
+        config_tg = iron.TaskGroup()
         inputs_prod.fill(
-            inputs_buf,
+            config_buf,
             offset=0,
             sizes=[1, 1, 1, input_words],
             strides=[input_words, 0, 0, 1],
             transfer_len=input_words,
-            group=tg,
-            wait=False,
+            group=config_tg,
+            wait=True,
         )
+        config_tg.finish()
 
-        offset = arith.constant(i32, input_words)
+        offset = arith.constant(i32, 0)
         for part in (input0, input1, input2, input3):
             inputs_prod.fill(
                 inputs_buf,
@@ -947,6 +962,7 @@ def _make_program(dynamic, production=False):
     runtime_args = [
         design.l3_weights_type,
         design.l3_inputs_type,
+        design.l3_config_type,
         design.l3_outputs_type,
         [
             weights_l2[g].prod(tile=shim_tiles[g])
@@ -974,6 +990,7 @@ def _make_program(dynamic, production=False):
 def program(
     weights: In,
     inputs: In,
+    config: In,
     outputs: Out,
 ):
     return _make_program(False)
@@ -983,6 +1000,7 @@ def program(
 def dynamic_program(
     weights: In,
     inputs: In,
+    config: In,
     outputs: Out,
 ):
     return _make_program(True)
@@ -1001,6 +1019,7 @@ def production_program(
 def production_dynamic_program(
     weights: In,
     inputs: In,
+    config: In,
     outputs: Out,
 ):
     return _make_program(True, production=True)
@@ -1045,18 +1064,22 @@ def run_case(rows_steps, cols_bands, tile_bytes, seed=1,
     input_groups = (
         rows_steps + design.INPUT_GROUP_ROWS - 1
     ) // design.INPUT_GROUP_ROWS
-    input_objects = 1 + input_groups
+    input_objects = input_groups
     inputs_words[: input_objects * design.INPUT_GROUP_ELEMS] = case[
         "inputs"
     ].reshape(-1)
 
+    config_host = np.zeros(design.INPUT_GROUP_ELEMS // 2, dtype=np.uint32)
+    config_host[: design.CONFIG_LEN] = case["config"].view(np.uint32)
+
     weights_tensor = iron.tensor(weights_host, dtype=np.uint32)
     inputs_tensor = iron.tensor(inputs_host, dtype=np.uint32)
+    config_tensor = iron.tensor(config_host, dtype=np.uint32)
     outputs_tensor = iron.zeros(
         design.MAX_OUTPUT_ELEMS, dtype=bfloat16
     )
 
-    program(weights_tensor, inputs_tensor, outputs_tensor)
+    program(weights_tensor, inputs_tensor, config_tensor, outputs_tensor)
 
     if format == design.MODE_RAW_CHECK:
         blocks = weights_blocks

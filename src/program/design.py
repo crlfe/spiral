@@ -28,7 +28,7 @@ MAX_WEIGHT_BLOCKS = 128
 MAX_BANDS_PER_CHUNK = 48
 MAX_ROWS_STEPS = 48
 MAX_TILES_PER_BLOCK = 5
-# Static test path: fixed host buffer for one config plus input-group objects.
+# Static test path: fixed host buffer for input-group objects.
 MAX_INPUT_GROUPS = 64
 
 INPUT_GROUP_ROWS = 4
@@ -92,7 +92,7 @@ l1_config_out_type = np.ndarray[(CONFIG_LEN,), np.dtype[np.int32]]
 MAX_WEIGHT_WORDS = (
     GROUPS * MAX_WEIGHT_BLOCKS * L2_STREAM_BYTES // 4
 )
-MAX_INPUT_WORDS = (1 + MAX_INPUT_GROUPS) * INPUT_GROUP_ELEMS // 2
+MAX_INPUT_WORDS = MAX_INPUT_GROUPS * INPUT_GROUP_ELEMS // 2
 MAX_OUTPUT_ELEMS = GROUPS * GROUP_OUTPUTS
 
 l3_weights_type = np.ndarray[
@@ -100,6 +100,9 @@ l3_weights_type = np.ndarray[
 ]
 l3_inputs_type = np.ndarray[
     (MAX_INPUT_WORDS,), np.dtype[np.uint32]
+]
+l3_config_type = np.ndarray[
+    (INPUT_GROUP_ELEMS // 2,), np.dtype[np.uint32]
 ]
 l3_outputs_type = np.ndarray[
     (MAX_OUTPUT_ELEMS,), np.dtype[bfloat16]

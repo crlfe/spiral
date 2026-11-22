@@ -175,17 +175,10 @@ void fill_weights(uint8_t* dst, const uint8_t* packed, int32_t rows_steps,
   }
 }
 
-// Pack [inputs_vecs][weights_rows] bfloat16 bits into one object per row step.
-void fill_inputs(uint32_t* buf, int32_t format, int32_t tile_bytes,
-                 int32_t rows_steps, int32_t cols_bands,
-                 int32_t weights_blocks, int32_t total_tiles,
-                 int32_t input_pad, int32_t weight_pad,
-                 int32_t weights_rows, const uint16_t* inputs,
-                 float soft_cap) {
-  write_config(buf, format, tile_bytes, rows_steps, cols_bands,
-               weights_blocks, total_tiles, input_pad, weight_pad, soft_cap);
-  auto* objects =
-      reinterpret_cast<uint16_t*>(buf) + design::kInputGroupElems;
+// Pack [inputs_vecs][weights_rows] bfloat16 bits into one object per row group.
+void fill_inputs(uint32_t* buf, int32_t rows_steps, int32_t weights_rows,
+                 const uint16_t* inputs) {
+  auto* objects = reinterpret_cast<uint16_t*>(buf);
   constexpr int32_t kColsPerChunk = 8;
   for (int32_t row = 0; row < rows_steps; ++row) {
     const int32_t group = row / design::kInputGroupRows;
@@ -330,6 +323,7 @@ struct Program::Impl {
   std::vector<xrt::run> runs;
   std::vector<xrt::bo> instrs;
   std::vector<xrt::bo> inputs;
+  std::vector<xrt::bo> configs;
   std::vector<xrt::bo> outputs;
   std::vector<bool> busy;
   int32_t next_slot = 0;
@@ -368,6 +362,7 @@ struct Program::Impl {
     runs.reserve(depth);
     instrs.reserve(depth);
     inputs.reserve(depth);
+    configs.reserve(depth);
     outputs.reserve(depth);
     for (int32_t i = 0; i < depth; ++i) {
       runs.emplace_back(kernel);
@@ -375,9 +370,12 @@ struct Program::Impl {
                           xrt::bo::flags::cacheable, kernel.group_id(1));
       inputs.emplace_back(loaded.device, design::kInputWords * sizeof(uint32_t),
                           xrt::bo::flags::host_only, kernel.group_id(4));
+      configs.emplace_back(loaded.device,
+                           design::kInputGroupElems * sizeof(uint16_t),
+                           xrt::bo::flags::host_only, kernel.group_id(5));
       outputs.emplace_back(loaded.device,
                            design::kMaxOutputElems * sizeof(uint16_t),
-                           xrt::bo::flags::host_only, kernel.group_id(5));
+                           xrt::bo::flags::host_only, kernel.group_id(6));
     }
     busy.assign(static_cast<size_t>(depth), false);
 #if defined(__linux__)
@@ -724,15 +722,22 @@ RunTicket Program::submit(const MatmulShape& shape,
   timings.upload_us = elapsed_us(stage);
 
   stage = Clock::now();
+  auto* config_buf =
+      impl_->configs[static_cast<size_t>(slot)].map<uint32_t*>();
+  std::memset(config_buf, 0, design::kInputGroupElems * sizeof(uint16_t));
+  write_config(config_buf, shape.format, prepared.tile_bytes,
+               prepared.rows_steps, prepared.cols_bands,
+               prepared.weights_blocks, prepared.total_tiles,
+               prepared.input_pad, prepared.weight_pad, shape.soft_cap);
+  impl_->configs[static_cast<size_t>(slot)].sync(
+      XCL_BO_SYNC_BO_TO_DEVICE,
+      design::kInputGroupElems * sizeof(uint16_t), 0);
   fill_inputs(impl_->inputs[static_cast<size_t>(slot)].map<uint32_t*>(),
-              shape.format, prepared.tile_bytes, prepared.rows_steps,
-              prepared.cols_bands, prepared.weights_blocks,
-              prepared.total_tiles, prepared.input_pad, prepared.weight_pad,
-              shape.weights_rows, inputs, shape.soft_cap);
+              prepared.rows_steps, shape.weights_rows, inputs);
   const int32_t input_groups =
       (prepared.rows_steps + design::kInputGroupRows - 1) /
       design::kInputGroupRows;
-  const size_t input_objects = 1 + input_groups + prepared.input_pad;
+  const size_t input_objects = input_groups + prepared.input_pad;
   impl_->inputs[static_cast<size_t>(slot)].sync(
       XCL_BO_SYNC_BO_TO_DEVICE,
       input_objects * design::kInputGroupElems * sizeof(uint16_t), 0);
@@ -745,7 +750,8 @@ RunTicket Program::submit(const MatmulShape& shape,
   run.set_arg(2, static_cast<uint32_t>(prepared.txn.size()));
   run.set_arg(3, *weight_bo);
   run.set_arg(4, impl_->inputs[static_cast<size_t>(slot)]);
-  run.set_arg(5, impl_->outputs[static_cast<size_t>(slot)]);
+  run.set_arg(5, impl_->configs[static_cast<size_t>(slot)]);
+  run.set_arg(6, impl_->outputs[static_cast<size_t>(slot)]);
   run.start();
   timings.start_us = elapsed_us(stage);
   return ticket;

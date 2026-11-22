@@ -110,23 +110,21 @@ def _pack_row(inputs, row):
     return packed.reshape(-1).view(np.uint16)
 
 
-def _make_objects(inputs, config, rows_steps, cols_bands):
+def _make_objects(inputs, rows_steps, cols_bands):
     """Pack one input object per row group.
 
-    Each object holds ``INPUT_GROUP_ROWS`` row slices.  Missing rows in the
-    final group are left zero.
+    Each object holds ``INPUT_GROUP_ROWS`` row slices.  The config object is
+    filled separately by the runtime and is not part of this buffer.  Missing
+    rows in the final group are left zero.
     """
     groups = _group_count(rows_steps)
-    objects = np.zeros(
-        (1 + groups, INPUT_GROUP_ELEMS), dtype=np.uint16
-    )
-    objects[0].view(np.uint8)[: config.nbytes] = config.view(np.uint8)
+    objects = np.zeros((groups, INPUT_GROUP_ELEMS), dtype=np.uint16)
     row_sums = np.zeros(rows_steps, dtype=np.uint64)
     for row in range(rows_steps):
         packed = _pack_row(inputs, row)
         group = row // INPUT_GROUP_ROWS
         within = row % INPUT_GROUP_ROWS
-        objects[1 + group, within * INPUT_ELEMS : (within + 1) * INPUT_ELEMS] = packed
+        objects[group, within * INPUT_ELEMS : (within + 1) * INPUT_ELEMS] = packed
         row_sums[row] = (
             packed.astype(np.uint64).sum() & np.uint64(0xFFFFFFFF)
         )
@@ -183,9 +181,7 @@ def build_case(rows_steps, cols_bands, tile_bytes, seed=1,
     input_bits = input_bits.astype(np.uint16).reshape(
         INPUTS_VECS, rows_steps * ROWS_STEP
     )
-    objects, input_sums = _make_objects(
-        input_bits, config, rows_steps, cols_bands
-    )
+    objects, input_sums = _make_objects(input_bits, rows_steps, cols_bands)
 
     streams = np.zeros(
         (GROUPS, COMPUTES_PER_GROUP, weights_blocks * L1_STREAM_BYTES),
@@ -220,6 +216,7 @@ def build_case(rows_steps, cols_bands, tile_bytes, seed=1,
     return {
         "weights": _block_major(streams, weights_blocks),
         "inputs": objects,
+        "config": config,
         "expected": expected,
         "rows_steps": rows_steps,
         "cols_bands": cols_bands,
@@ -298,7 +295,7 @@ def _build_quants_case(
         )
     else:
         inputs = inputs_matrix
-    objects, _ = _make_objects(inputs, config, rows_steps, cols_bands)
+    objects, _ = _make_objects(inputs, rows_steps, cols_bands)
 
     streams = np.zeros(
         (GROUPS, COMPUTES_PER_GROUP, weights_blocks * L1_STREAM_BYTES),
@@ -359,6 +356,7 @@ def _build_quants_case(
     return {
         "weights": _block_major(streams, weights_blocks),
         "inputs": objects,
+        "config": config,
         "expected": expected,
         "rows_steps": rows_steps,
         "cols_bands": cols_bands,
