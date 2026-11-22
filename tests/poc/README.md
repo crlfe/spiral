@@ -194,3 +194,30 @@ C++ API, 128 calls (warmup 8)
   reuse A/B              228.0    ( 206.7- 248.8)
   pipeline A/B           158.5  (total 20286.3 us over 128 calls)
 ```
+
+## TXN Concatenation and Chained Matmuls
+
+`txn_concat/` builds two fixed-program matmuls into one NPU command and chains
+the first output directly into the second input, with no host conversion of the
+intermediate activation.  The prototype also repeats the pair eight times to
+show the per-dispatch floor being amortised.
+
+```
+# Build the production design first
+~/Projects/mlir-aie/ironenv/bin/python src/program/build.py --production
+~/Projects/mlir-aie/ironenv/bin/python tests/poc/txn_concat/run.py
+
+q4_0_1536x2048 -> q4_0_2048x1536
+  chain vs independent: bit_mismatches=0 max_abs=0.00000000
+  2 ops: chain 156.5 us vs independent 217.1 us (1.39x)
+  8 ops: chain 445.9 us (55.7 us/op) vs 866.8 us (108.4 us/op) (1.94x)
+
+q6_k_2048x2048 -> q6_k_2048x2048
+  chain vs independent: bit_mismatches=0 max_abs=0.00000000
+  2 ops: chain 222.0 us vs independent 290.3 us (1.31x)
+  8 ops: chain 695.7 us (87.0 us/op) vs 1095.1 us (136.9 us/op) (1.57x)
+```
+
+The durable design record, the current TXN argument mapping, the patch
+recipe, and the measurement history are in
+[`txn_concat/README.md`](txn_concat/README.md).
