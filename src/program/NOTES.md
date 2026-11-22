@@ -140,10 +140,9 @@ host canonical weights (up to ~333 MB for the Q6_K head)
 inputs [rows_step][inputs_vecs][8] bf16
   -> one 8 KiB L1 input group per four rows, broadcast to all computes
   -> per-compute f32 accumulator [band_chunk][outputs_vecs][16]
-  -> common epilogue: transpose to [outputs_vecs][16], optional softcap, bf16
-  -> per-compute bf16 output object [band_chunk][outputs_vecs][16]
-  -> group join
-  -> L3 outputs [band][outputs_vecs][outputs_len] at a disjoint chunk offset
+  -> common epilogue: optional softcap, bf16
+  -> chain layout: [N/8][outputs_vecs][8] in L3
+  -> host boundary: CPU utility converts blocks to [outputs_vecs][outputs_len]
 ```
 
 The worker receives one L1 weight block per acquire (8 KiB of concatenated
@@ -212,20 +211,24 @@ tiles, then still needs an attempt for the next prefix.
 Each compute keeps a 12 KiB f32 accumulator, because one output tile is
 reduced across all `rows_steps`.  After the block loop, the common
 `program_output` epilogue reads each 64-float accumulator tile and writes a
-64-element bf16 tile:
+64-element bf16 tile in the native chain order:
 
 ```text
 accumulator tile: [col_half][vec][8 cols] f32
-output tile:      [vec][16 cols] bf16
+output tile:      [col_half][vec][8 cols] bf16
 ```
 
 `program_output` also applies the optional tanh softcap
 (`cap * tanh(x / cap)`) using the native bf16 `vtanh`, then stores bf16 with
 round-to-nearest-even.  Config words 8 and 9 carry `cap` and `1/cap` as bf16
 hi/lo pairs; the epilogue reconstructs both in f32, so there is no device
-division.  The output layout is deliberately the same as
-`Program::run`'s input layout, `[inputs_vecs][weights_rows]`, so one call's
-bf16 output can feed the next call without a host conversion.  The C++ API is
+division.  The drain writes the chain layout `[N/8][outputs_vecs][8]`: each
+group's 3-D drain tap places its 64-column slice into the shared N-major
+buffer, so the next call's input fill can read the same buffer without a CPU
+transpose.  The C++ API still exposes `[inputs_vecs][outputs_cols]`;
+`unpack_outputs` is the host-side CPU utility that converts the chain blocks
+back to vec-major.  Diagnostic builds use the same layout; the Python runner
+inverts the drain mapping for its raw and tile-checksum paths.  The C++ API is
 bf16-only; a caller that needs f32 widens the result itself.
 
 The softcap is a named
@@ -395,9 +398,10 @@ and a `raw` row (per-block transport checksum) on the diagnostic build.
   run-to-run spread): Q4_0 1536x512 ~71-79 us, Q4_0 1536x12288 ~267-280 us,
   Q6_K 1536x6144 ~210-230 us, Q4_0 2048x2048 ~103-113 us, Q6_K 2048x2048
   ~127-151 us.  `--head-timing` is ~7.3-7.7 ms kernel / ~7.7-8.0 ms total for
-  the 11-chunk head.  The host unpack is now bf16-only and copies one 16-column
-  tile at a time: ~0.6 us for 1536x512, ~20 us for 1536x12288, ~280 us for the
-  head.  The llama.cpp backend converts those bf16 rows to f32 in its gather.
+  the 11-chunk head.  Production now drains the native chain blocks and the
+  host utility copies 8-column blocks: ~0.3 us for 1536x512, ~8 us for
+  1536x12288, ~230 us for the head.  The llama.cpp backend converts those
+  bf16 rows to f32 in its gather.
   Production `.text` moved 11104 -> 11872 bytes; diagnostic 14048 -> 14880
   bytes, leaving ~1.5 KiB headroom.
 

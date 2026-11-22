@@ -125,11 +125,52 @@ def _factor_bd(objects):
     raise ValueError(f"{objects} objects do not factor into two BD dimensions")
 
 
-def _unpack_output_tile(raw):
-    """Map the kernel's [vec][16 cols] tile into float [vec][16]."""
-    return np.asarray(raw, dtype=np.float32).reshape(
-        design.INPUTS_VECS, design.COLS_TILE
+def _native_block(g, c, band, half):
+    """Block index in the production [N/8][vec][8] output layout."""
+    half_cols = design.COLS_TILE // 2
+    blocks_per_band = design.BAND_COLS // half_cols
+    blocks_per_compute = design.COLS_TILE // half_cols
+    blocks_per_group = design.COMPUTES_PER_GROUP * blocks_per_compute
+    return (
+        band * blocks_per_band
+        + g * blocks_per_group
+        + c * blocks_per_compute
+        + half
     )
+
+
+def _native_tile(actual, g, c, band):
+    """Gather one compute's native blocks into float [vec][16]."""
+    half_cols = design.COLS_TILE // 2
+    block_elems = design.INPUTS_VECS * half_cols
+    tile = np.zeros((design.INPUTS_VECS, design.COLS_TILE), dtype=np.float32)
+    for half in range(2):
+        start = _native_block(g, c, band, half) * block_elems
+        for vec in range(design.INPUTS_VECS):
+            tile[vec, half * half_cols : (half + 1) * half_cols] = (
+                np.asarray(actual[start + vec * half_cols :
+                                  start + (vec + 1) * half_cols],
+                           dtype=np.float32)
+            )
+    return tile
+
+
+def _native_compute_bits(bits, g, c):
+    """Invert the native group drain for one compute's flat output object."""
+    group_offset = (
+        g * design.COMPUTES_PER_GROUP * design.COLS_TILE *
+        design.INPUTS_VECS
+    )
+    compute_offset = c * design.COLS_TILE * design.INPUTS_VECS
+    band_stride = design.BAND_COLS * design.INPUTS_VECS
+    obj = np.zeros(design.OUTPUT_ELEMS, dtype=np.uint16)
+    for band in range(design.MAX_BANDS_PER_CHUNK):
+        src = group_offset + compute_offset + band * band_stride
+        dst = band * design.OUTPUT_TILE_ELEMS
+        obj[dst : dst + design.OUTPUT_TILE_ELEMS] = bits[
+            src : src + design.OUTPUT_TILE_ELEMS
+        ]
+    return obj
 
 
 def _real_error_metrics(actual, expected, cols_bands, rel=6e-3):
@@ -147,15 +188,8 @@ def _real_error_metrics(actual, expected, cols_bands, rel=6e-3):
     max_ratio = 0.0
     for g in range(design.GROUPS):
         for c in range(design.COMPUTES_PER_GROUP):
-            base = (
-                g * design.GROUP_OUTPUTS
-                + c * design.OUTPUT_ELEMS
-            )
             for band in range(cols_bands):
-                start = base + band * design.OUTPUT_TILE_ELEMS
-                tile = _unpack_output_tile(
-                    actual[start : start + design.OUTPUT_TILE_ELEMS]
-                )
+                tile = _native_tile(actual, g, c, band)
                 reference = expected[g, c, band]
                 error = np.abs(tile - reference)
                 column_scale = np.abs(reference).max(axis=0)
@@ -165,19 +199,15 @@ def _real_error_metrics(actual, expected, cols_bands, rel=6e-3):
     return max_error, max_ratio
 
 
-def _noop_mismatches(actual, expected, total_tiles):
+def _noop_mismatches(actual, expected, total_tiles, cols_bands):
     mismatches = 0
     first = None
-    # `actual` is a uint32 view of a bf16 output object, so element offsets
-    # are in 32-bit words (two bf16 elements each).
+    bits = np.asarray(actual).view(np.uint16)
     for g in range(design.GROUPS):
         for c in range(design.COMPUTES_PER_GROUP):
-            compute_base = (
-                g * design.GROUP_OUTPUTS
-                + c * design.OUTPUT_ELEMS
-            ) // 2
+            obj = _native_compute_bits(bits, g, c).view(np.uint32)
             for tile_index in range(total_tiles):
-                got = actual[compute_base + tile_index]
+                got = obj[tile_index]
                 want = expected[g, c, tile_index]
                 if got != want:
                     mismatches += 1
@@ -859,9 +889,18 @@ def _make_program(dynamic, production=False):
         for g in range(design.GROUPS):
             outputs_conses[g].drain(
                 outputs_buf,
-                offset=g * design.GROUP_OUTPUTS,
-                sizes=[1, 1, 1, design.GROUP_OUTPUTS],
-                strides=[0, 0, 0, 1],
+                offset=g * design.COMPUTES_PER_GROUP * design.COLS_TILE *
+                design.INPUTS_VECS,
+                sizes=[
+                    design.COMPUTES_PER_GROUP,
+                    design.MAX_BANDS_PER_CHUNK,
+                    design.OUTPUT_TILE_ELEMS,
+                ],
+                strides=[
+                    design.COLS_TILE * design.INPUTS_VECS,
+                    design.BAND_COLS * design.INPUTS_VECS,
+                    1,
+                ],
                 transfer_len=design.GROUP_OUTPUTS,
                 group=tg,
                 wait=True,
@@ -949,9 +988,18 @@ def _make_program(dynamic, production=False):
         for g in range(design.GROUPS):
             outputs_conses[g].drain(
                 outputs_buf,
-                offset=g * design.GROUP_OUTPUTS,
-                sizes=[1, 1, 1, design.GROUP_OUTPUTS],
-                strides=[0, 0, 0, 1],
+                offset=g * design.COMPUTES_PER_GROUP * design.COLS_TILE *
+                design.INPUTS_VECS,
+                sizes=[
+                    design.COMPUTES_PER_GROUP,
+                    design.MAX_BANDS_PER_CHUNK,
+                    design.OUTPUT_TILE_ELEMS,
+                ],
+                strides=[
+                    design.COLS_TILE * design.INPUTS_VECS,
+                    design.BAND_COLS * design.INPUTS_VECS,
+                    1,
+                ],
                 transfer_len=design.GROUP_OUTPUTS,
                 group=tg,
                 wait=True,
@@ -1096,15 +1144,17 @@ def run_case(rows_steps, cols_bands, tile_bytes, seed=1,
             .astype(np.uint32)
             .transpose(0, 2, 1)
         )
-        actual = (
-            np.asarray(outputs_tensor)
-            .reshape(
-                design.GROUPS,
-                design.COMPUTES_PER_GROUP,
-                design.OUTPUT_ELEMS,
-            )
-            .view(np.uint32)[:, :, :blocks]
-        )
+        bits = np.asarray(outputs_tensor).view(np.uint16)
+        actual = np.stack(
+            [
+                [
+                    _native_compute_bits(bits, g, c)
+                    for c in range(design.COMPUTES_PER_GROUP)
+                ]
+                for g in range(design.GROUPS)
+            ],
+            axis=0,
+        ).view(np.uint32)[:, :, :blocks]
         mismatches = int(np.count_nonzero(actual != expected))
         print(
             f"raw rows_steps={rows_steps} cols_bands={cols_bands} "
@@ -1126,9 +1176,10 @@ def run_case(rows_steps, cols_bands, tile_bytes, seed=1,
         return max_ratio <= 1.0
 
     mismatches, first = _noop_mismatches(
-        np.asarray(outputs_tensor).view(np.uint32),
+        np.asarray(outputs_tensor),
         case["expected"],
         total_tiles,
+        cols_bands,
     )
     print(
         f"rows_steps={rows_steps} cols_bands={cols_bands} "

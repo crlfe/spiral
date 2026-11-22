@@ -201,29 +201,36 @@ void fill_inputs(uint32_t* buf, int32_t rows_steps, int32_t weights_rows,
   }
 }
 
-// Convert the kernel's [vec][16 cols] bf16 tiles to a logical output matrix.
-// The device tile order is already [inputs_vecs][weights_cols] within a tile,
-// matching the next run's input layout.
+// Convert the device [N/8][vec][8] chain layout to the host API's
+// [inputs_vecs][outputs_cols] matrix.
 void unpack_outputs(const uint16_t* raw, uint16_t* outputs, int32_t cols_bands,
                     int32_t outputs_cols, int32_t outputs_col_offset) {
-  const int32_t compute_stride = design::kOutputElems;
+  constexpr int32_t kHalfCols = design::kColsTile / 2;
+  constexpr int32_t kBlockElems = design::kInputsVecs * kHalfCols;
+  constexpr int32_t kBlocksPerBand = design::kBandCols / kHalfCols;
+  constexpr int32_t kBlocksPerCompute = design::kColsTile / kHalfCols;
+  constexpr int32_t kBlocksPerGroup =
+      design::kComputesPerGroup * kBlocksPerCompute;
   for (int32_t g = 0; g < design::kGroups; ++g) {
     for (int32_t c = 0; c < design::kComputesPerGroup; ++c) {
       for (int32_t band = 0; band < cols_bands; ++band) {
-        const int32_t raw_base = g * design::kGroupOutputs +
-                                 c * compute_stride +
-                                 band * design::kOutputTileElems;
         const int32_t col_base =
             band * design::kBandCols +
             (g * design::kComputesPerGroup + c) * design::kColsTile;
-        for (int32_t vec = 0; vec < design::kInputsVecs; ++vec) {
-          const int32_t raw_index = raw_base + vec * design::kColsTile;
-          const int64_t out_index =
-              static_cast<int64_t>(vec) * outputs_cols +
-              outputs_col_offset + col_base;
-          std::memcpy(outputs + out_index, raw + raw_index,
-                      static_cast<size_t>(design::kColsTile) *
-                          sizeof(uint16_t));
+        for (int32_t half = 0; half < 2; ++half) {
+          const int32_t block = band * kBlocksPerBand +
+                                g * kBlocksPerGroup +
+                                c * kBlocksPerCompute + half;
+          const int32_t raw_base = block * kBlockElems;
+          const int32_t half_base = half * kHalfCols;
+          for (int32_t vec = 0; vec < design::kInputsVecs; ++vec) {
+            const int64_t out_index =
+                static_cast<int64_t>(vec) * outputs_cols +
+                outputs_col_offset + col_base + half_base;
+            std::memcpy(outputs + out_index,
+                        raw + raw_base + vec * kHalfCols,
+                        static_cast<size_t>(kHalfCols) * sizeof(uint16_t));
+          }
         }
       }
     }

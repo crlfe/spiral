@@ -13,10 +13,9 @@
 
 namespace program {
 
-// The mmul accumulates f32 into the native [col_half][vec][8] tile.  A next
-// run consumes inputs as [inputs_vecs][weights_rows], so the stored tile is
-// [vec][16]: for each vec, the first half's 8 columns followed by the second
-// half's 8 columns.
+// The mmul accumulates f32 into the native [col_half][vec][8] tile.  The
+// stored tile keeps that order ([half][vec][8]), which is also the next
+// matmul's [K/8][vec][8] input block order.
 //
 // The optional tanh softcap uses the native bf16 vtanh.  The host passes cap
 // and 1/cap as bf16 hi/lo pairs (two 16-bit values per config word), so the
@@ -38,14 +37,14 @@ struct OutputStore {
                          int32_t inv_word) {
     if (cap_word == 0) {
       store_half(to_bf16(lo), out, 0);
-      store_half(to_bf16(hi), out, kHalfCols);
+      store_half(to_bf16(hi), out, 1);
       return;
     }
 
     const float cap = bf16_word_lo(cap_word) + bf16_word_hi(cap_word);
     const float inv = bf16_word_lo(inv_word) + bf16_word_hi(inv_word);
     store_half(softcap(lo, cap, inv), out, 0);
-    store_half(softcap(hi, cap, inv), out, kHalfCols);
+    store_half(softcap(hi, cap, inv), out, 1);
   }
 
  private:
@@ -76,14 +75,15 @@ struct OutputStore {
   }
 
   static inline void store_half(const HalfVecBf& v, bfloat16* out,
-                                int col_offset) {
-    aie::store_v(out + 0 * kColsTile + col_offset,
+                                int half) {
+    const int base = half * kHalfTile;
+    aie::store_v(out + base + 0 * kHalfCols,
                  v.template extract<kHalfCols>(0));
-    aie::store_v(out + 1 * kColsTile + col_offset,
+    aie::store_v(out + base + 1 * kHalfCols,
                  v.template extract<kHalfCols>(1));
-    aie::store_v(out + 2 * kColsTile + col_offset,
+    aie::store_v(out + base + 2 * kHalfCols,
                  v.template extract<kHalfCols>(2));
-    aie::store_v(out + 3 * kColsTile + col_offset,
+    aie::store_v(out + base + 3 * kHalfCols,
                  v.template extract<kHalfCols>(3));
   }
 };
