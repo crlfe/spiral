@@ -43,8 +43,7 @@ import pack
 
 KERNEL_DIR = PROGRAM_DIR / "kernels"
 QUANTS_ROOT = PROGRAM_DIR.parent
-CONFIG_SOURCE = KERNEL_DIR / "program_config.aie.cc"
-INIT_SOURCE = KERNEL_DIR / "program_init.aie.cc"
+BEGIN_SOURCE = KERNEL_DIR / "program_begin.aie.cc"
 ZERO_SOURCE = KERNEL_DIR / "program_zero.aie.cc"
 OUTPUT_SOURCE = KERNEL_DIR / "program_output.aie.cc"
 ASSEMBLE_SOURCE = KERNEL_DIR / "program_assemble.aie.cc"
@@ -79,8 +78,7 @@ Q6_K_HEADERS = [
 SOURCE_FILES = [
     Path(design.__file__).resolve(),
     Path(__file__).resolve(),
-    CONFIG_SOURCE,
-    INIT_SOURCE,
+    BEGIN_SOURCE,
     ZERO_SOURCE,
     OUTPUT_SOURCE,
     ASSEMBLE_SOURCE,
@@ -100,8 +98,7 @@ SOURCE_FILES = [
 PRODUCTION_SOURCE_FILES = [
     Path(design.__file__).resolve(),
     Path(__file__).resolve(),
-    CONFIG_SOURCE,
-    INIT_SOURCE,
+    BEGIN_SOURCE,
     ZERO_SOURCE,
     OUTPUT_SOURCE,
     BLOCK_SOURCE,
@@ -190,17 +187,18 @@ def _noop_mismatches(actual, expected, total_tiles):
 
 
 def _make_kernels(production=False):
-    config = ExternalFunction(
-        "program_config_decode",
-        arg_types=[design.l1_input_group_type, design.l1_config_out_type],
-        compile_flags=[f"-DPROGRAM_CONFIG_LEN={design.CONFIG_LEN}"],
-        source_file=str(CONFIG_SOURCE),
-        inline=False,
-    )
-    init = ExternalFunction(
-        "program_init",
-        arg_types=[design.l1_state_type],
-        source_file=str(INIT_SOURCE),
+    begin = ExternalFunction(
+        "program_begin",
+        arg_types=[
+            design.l1_input_group_type,
+            design.l1_config_out_type,
+            design.l1_state_type,
+        ],
+        compile_flags=[
+            f"-DPROGRAM_CONFIG_LEN={design.CONFIG_LEN}",
+            f"-DPROGRAM_STATE_WORDS={design.STATE_WORDS}",
+        ],
+        source_file=str(BEGIN_SOURCE),
         inline=False,
     )
     zero = ExternalFunction(
@@ -217,6 +215,10 @@ def _make_kernels(production=False):
             np.int32,
             np.int32,
             np.int32,
+        ],
+        compile_flags=[
+            f"-DPROGRAM_OUTPUT_TILE_ELEMS={design.OUTPUT_TILE_ELEMS}",
+            f"-DPROGRAM_COLS_TILE={design.COLS_TILE}",
         ],
         source_file=str(OUTPUT_SOURCE),
         inline=False,
@@ -261,6 +263,7 @@ def _make_kernels(production=False):
         f"-DPROGRAM_MAX_TILES={design.MAX_TILES_PER_BLOCK}",
         f"-DPROGRAM_INPUT_ELEMS={design.INPUT_ELEMS}",
         f"-DPROGRAM_INPUT_GROUP_ROWS={design.INPUT_GROUP_ROWS}",
+        f"-DPROGRAM_OUTPUT_TILE_ELEMS={design.OUTPUT_TILE_ELEMS}",
     ]
     q6_k_block = ExternalFunction(
         "program_q6_block",
@@ -309,8 +312,7 @@ def _make_kernels(production=False):
             inline=False,
         )
     return (
-        config,
-        init,
+        begin,
         zero,
         output,
         assemble,
@@ -412,8 +414,7 @@ def _make_program(dynamic, production=False):
     ) = _make_fifos(mem_tiles)
 
     (
-        config,
-        init,
+        begin,
         zero,
         output,
         assemble,
@@ -453,8 +454,7 @@ def _make_program(dynamic, production=False):
         carry,
         state,
         accum,
-        init,
-        decode,
+        begin,
         zero,
         output,
         block_begin,
@@ -465,7 +465,7 @@ def _make_program(dynamic, production=False):
         raw_check=None,
     ):
         config_buf = inputs_cons.acquire(1)
-        decode(config_buf, config_out)
+        begin(config_buf, config_out, state)
         inputs_cons.release(1)
 
         fmt = config_out[design.CFG_FORMAT]
@@ -475,7 +475,6 @@ def _make_program(dynamic, production=False):
         total_tiles = config_out[design.CFG_TOTAL_TILES]
         rows_steps = config_out[design.CFG_ROWS_STEPS]
 
-        init(state)
         i32 = IntegerType.get_signless(32)
         zero_i32 = arith.constant(i32, 0)
         one_i32 = arith.constant(i32, 1)
@@ -491,7 +490,8 @@ def _make_program(dynamic, production=False):
         )
 
         def emit_loop():
-            outputs_buf = outputs_prod.acquire(1)
+            if not production:
+                outputs_buf = outputs_prod.acquire(1)
             zero(
                 accum,
                 arith.muli(
@@ -680,11 +680,8 @@ def _make_program(dynamic, production=False):
 
             weights_cons.release(1)
             inputs_cons.release(1)
-            is_real = arith.ori(
-                arith.cmpi(CmpIPredicate.eq, fmt, fmt_q4_i32),
-                arith.cmpi(CmpIPredicate.eq, fmt, fmt_q6_i32),
-            )
-            with if_(is_real):
+            if production:
+                outputs_buf = outputs_prod.acquire(1)
                 output(
                     accum,
                     outputs_buf,
@@ -692,6 +689,19 @@ def _make_program(dynamic, production=False):
                     config_out[design.CFG_SOFT_CAP_HI_LO],
                     config_out[design.CFG_SOFT_INV_HI_LO],
                 )
+            else:
+                is_real = arith.ori(
+                    arith.cmpi(CmpIPredicate.eq, fmt, fmt_q4_i32),
+                    arith.cmpi(CmpIPredicate.eq, fmt, fmt_q6_i32),
+                )
+                with if_(is_real):
+                    output(
+                        accum,
+                        outputs_buf,
+                        cols_bands,
+                        config_out[design.CFG_SOFT_CAP_HI_LO],
+                        config_out[design.CFG_SOFT_INV_HI_LO],
+                    )
             outputs_prod.release(1)
 
         if production:
@@ -750,7 +760,7 @@ def _make_program(dynamic, production=False):
                 weights_cons.release(1)
 
             extra_inputs = arith.subi(
-                arith.constant(i32, design.MAX_INPUT_OBJECTS - 1),
+                arith.constant(i32, design.MAX_INPUT_GROUPS - 1),
                 num_groups,
             )
             for _extra in range_(extra_inputs):
@@ -759,8 +769,7 @@ def _make_program(dynamic, production=False):
 
 
     worker_kernels = [
-        init,
-        config,
+        begin,
         zero,
         output,
         block_begin,
@@ -806,7 +815,7 @@ def _make_program(dynamic, production=False):
         l1_hi = l1_words // l1_lo
         combined = design.COMPUTES_PER_GROUP * l1_hi
         outer, inner = _factor_bd(design.MAX_WEIGHT_BLOCKS)
-        outer_in, inner_in = _factor_bd(design.MAX_INPUT_OBJECTS)
+        outer_in, inner_in = _factor_bd(design.MAX_INPUT_GROUPS)
 
         tg = iron.TaskGroup()
         inputs_prod.fill(

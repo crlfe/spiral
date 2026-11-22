@@ -15,7 +15,7 @@ enum State : int32_t {
   kReady = 4,
   kTileSource = 5,
   kTileOffset = 6,
-  kCurrentRow = 7,
+  // Word 7 is reserved; the state object stays 8 words.
 };
 
 }  // namespace program

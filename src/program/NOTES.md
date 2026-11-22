@@ -34,6 +34,8 @@ Use `weights_rows`, `weights_cols`, `inputs_len`, `outputs_len`,
 - **transport tile** — one packed 256-`weights_rows` x 16-`weights_cols`
   weight tile.
 - **tile compute** — the per-tile unpack + `aie::mmul<4,8,8>` call.
+- **tile epilogue** — `program_output`: transpose the native mmul tile to
+  `[vec][16]`, optionally apply a tanh softcap, and store bf16.
 - **weight stream** — the concatenated transport tiles for one compute
   within one run, in `[rows_step][band]` order.
 - **stream drain** — the worker loop that consumes L1 blocks and invokes the
@@ -75,8 +77,8 @@ logic.  It is not a scaffold to extend; the real kernels live here.
 | max weight blocks per call | 128 (C++ splits into two <=64 fills; static Python factorizes) |
 | max total tiles per call | 2304 design cap; weight-block cap is lower (~455 Q4_0 / ~309 Q6_K) |
 | max chunk bands | 48 bands / 24576 columns |
-| L1 output object | 12 KiB (48-band chunk) |
-| L2 output object | 48 KiB (4 computes x 48-band chunk) |
+| L1 output object | 12 KiB f32 accumulator + 6 KiB bf16 output (48-band chunk) |
+| L2 output object | 24 KiB (4 computes x 6 KiB bf16, 48-band chunk) |
 | max L3 outputs | 4 MiB (weights_cols=262144, inputs_vecs=4) |
 | formats | Q4_0 and Q6_K; one per call, config-selected |
 | call ordering | sequential calls, one matmul per call |
@@ -112,10 +114,16 @@ per-compute buffer and decoded by the worker.
 | 5 | `total_tiles` (`rows_steps * cols_bands`) |
 | 6 | `input_pad` (extra input-group objects drained by the dynamic path) |
 | 7 | `weight_pad` (extra weight blocks drained by the dynamic path) |
+| 8 | softcap hi/lo: two bf16 bits (`cap_hi | cap_lo << 16`); 0 disables |
+| 9 | softcap reciprocal hi/lo: two bf16 bits (`inv_hi | inv_lo << 16`) |
 
 `weights_blocks` covers the whole continuous stream:
 `ceil(total_tiles * tile_bytes / 8192)`.  Padding exists only for the final
 partial block.
+
+The host splits `cap` and `1/cap` into bf16 hi/lo pairs; the epilogue adds
+`hi + lo` back in f32.  This removes the device division while keeping about
+16 bits of reciprocal precision.
 
 ## Data flow
 
@@ -127,14 +135,18 @@ host canonical weights (up to ~333 MB for the Q6_K head)
 
 inputs [rows_step][inputs_vecs][8] bf16
   -> one 8 KiB L1 input group per four rows, broadcast to all computes
-  -> per-compute output object [band_chunk][outputs_vecs][16] f32
+  -> per-compute f32 accumulator [band_chunk][outputs_vecs][16]
+  -> common epilogue: transpose to [outputs_vecs][16], optional softcap, bf16
+  -> per-compute bf16 output object [band_chunk][outputs_vecs][16]
   -> group join
   -> L3 outputs [band][outputs_vecs][outputs_len] at a disjoint chunk offset
 ```
 
 The worker receives one L1 weight block per acquire (8 KiB of concatenated
-tiles), one input group per four rows, one output object per call/chunk
-(zeroed before accumulation), and the decoded config.
+tiles), one input group per four rows, a private f32 accumulator per compute
+(zeroed before accumulation), a bf16 output object, and the decoded config.
+The epilogue produces the output object after the block loop; the accumulator
+is what persists across `rows_steps`.
 
 The L1 input object is four rows_steps, not the whole `inputs_len`:
 `weights_rows=12288` would need 96 KiB, which does not fit in compute-tile
@@ -157,11 +169,14 @@ Each iteration:
 2. If the block is exhausted and more tiles remain, release the old block,
    reset `block_pos`/`block_done`, acquire a fresh block, and select it with
    another result-producing `scf.if`.
-3. If the active group still has tiles, run the block kernel for it.
+3. If the active group still has tiles, run the block kernel for it; the
+   kernel accumulates the f32 tile into the private accumulator.
 4. Yield the updated block, input group, and group index.
 
 Extra units are no-ops because the group index or tile index is past the
-limit.  After the loop the final block and input group are released.
+limit.  After the loop the final block and input group are released, then the
+bf16 output object is produced by `program_output` (transpose, optional
+softcap, f32 -> bf16) and released to the group join.
 
 A block may span group boundaries.  Carry length and block position persist
 across groups; only `block_pos`, `block_done`, and `ready` reset when a new
@@ -189,14 +204,32 @@ tiles, then still needs an attempt for the next prefix.
 
 ### Output layout
 
-The tile kernel stores a 4x16 result as `[col_half][vec][8 cols]`, not
-`[vec][16]`.  Map it with
-`reshape(2, 4, 8).transpose(1, 0, 2).reshape(4, 16)`; the C++ unpack uses the
-same mapping.
+Each compute keeps a 12 KiB f32 accumulator, because one output tile is
+reduced across all `rows_steps`.  After the block loop, the common
+`program_output` epilogue reads each 64-float accumulator tile and writes a
+64-element bf16 tile:
+
+```text
+accumulator tile: [col_half][vec][8 cols] f32
+output tile:      [vec][16 cols] bf16
+```
+
+`program_output` also applies the optional tanh softcap
+(`cap * tanh(x / cap)`) using the native bf16 `vtanh`, then stores bf16 with
+round-to-nearest-even.  Config words 8 and 9 carry `cap` and `1/cap` as bf16
+hi/lo pairs; the epilogue reconstructs both in f32, so there is no device
+division.  The output layout is deliberately the same as
+`Program::run`'s input layout, `[inputs_vecs][weights_rows]`, so one call's
+bf16 output can feed the next call without a host conversion.  The C++ API is
+bf16-only; a caller that needs f32 widens the result itself.
+
+The softcap is a named
+reduced-precision mode: the bf16 vtanh is approximate, so its verification
+policy is `max(1e-3, 5e-2 * column_scale)`, not the normal bf16 policy.
 
 ## Golden and test layout
 
-`build.py` emits `build/golden/index.txt`, a manifest of 27 cases.  `./test`
+`build.py` emits `build/golden/index.txt`, a manifest of 30 cases.  `./test`
 loads the xclbin once and runs every listed case.  Coverage:
 
 - Q4_0 attention/FFN shapes in both orientations up to 12288 rows or 12288
@@ -220,12 +253,20 @@ unpacks into logical `[inputs_vecs][weights_cols]` outputs.
 Outputs are checked per column against
 
 ```
-tolerance = max(1e-3, 2e-5 * column_scale)
+tolerance = max(1e-3, 6e-3 * column_scale)
 ```
 
 where `column_scale` is the largest `|expected|` in that output column over
 the four input vectors.  An element passes when its error is within its
 column's tolerance; the reported `worst` ratio is `error / tolerance`.
+
+The device stores the epilogue result as bf16, so bf16 round-to-nearest now
+dominates the error: a value can move by one bf16 ulp relative to the f32
+reference when the f32 accumulations differ slightly across the rounding
+boundary, i.e. up to ~2^-8 relative.  The 6e-3 relative term leaves margin for
+that plus the fp32 accumulation error; the worst observed ratio across the 30
+golden cases is ~0.65.  The softcap case uses its own named policy,
+`max(1e-3, 5e-2 * column_scale)`, because the bf16 `vtanh` is approximate.
 
 The absolute error is not a shape-independent quantity.  The kernel
 accumulates the K terms in fp32; the mean absolute error grows as
@@ -237,11 +278,9 @@ emulating a truncating accumulation is about 100x worse at K=12288.  A
 sequential fp32 RTNE sum of the same terms reproduces the measured mean
 within ~10%.
 
-`src/quants/tests/mmul.py` already uses a per-column bound for the same
-reason; the program uses a tighter relative term (`2e-5`, versus `1e-3`) and
-the same `1e-3` floor.  The worst ratio across the 27 golden cases is ~0.39
-(the Q6_K head), so the bound has about 2.6x margin.  `run.py` applies the
-identical policy.
+`src/quants/tests/mmul.py` still uses its f32 per-column bound.  The program's
+bf16 epilogue uses the `6e-3` relative term and the same `1e-3` floor;
+`run.py` applies the identical policy and checks the same 30 cases.
 Do not replace this with a fixed absolute error again: it cannot fit both
 K=1536 and K=12288, and it makes the effective relative bound depend on the
 column's magnitude (loose for small columns, tight for large ones).
@@ -345,6 +384,17 @@ and a `raw` row (per-block transport checksum) on the diagnostic build.
   1536x12288 285.0 -> 278.2 us, Q6_K 1536x6144 228.4 -> 223.9 us, Q4_0
   2048x2048 118.2 -> 117.8 us, Q6_K 2048x2048 141.2 -> 144.1 us.  The
   pointer call is inside the run-to-run noise.
+- bf16 tile epilogue (`program_output`: transpose + optional softcap + f32 ->
+  bf16): one extra pass over the 12 KiB f32 accumulator per compute per call.
+  Production `--timing` (twenty runs; kernel times stay in the historical
+  run-to-run spread): Q4_0 1536x512 ~71-79 us, Q4_0 1536x12288 ~267-280 us,
+  Q6_K 1536x6144 ~210-230 us, Q4_0 2048x2048 ~103-113 us, Q6_K 2048x2048
+  ~127-151 us.  `--head-timing` is ~7.3-7.7 ms kernel / ~7.7-8.0 ms total for
+  the 11-chunk head.  The host unpack is now bf16-only and copies one 16-column
+  tile at a time: ~0.6 us for 1536x512, ~20 us for 1536x12288, ~280 us for the
+  head.  The llama.cpp backend converts those bf16 rows to f32 in its gather.
+  Production `.text` moved 11104 -> 11872 bytes; diagnostic 14048 -> 14880
+  bytes, leaving ~1.5 KiB headroom.
 
 ### Real-query throughput
 
@@ -542,9 +592,11 @@ penalty.  Final production medians (5 warm runs):
 
 Head timing with 48 bands and dynamic zero is ~8.2 ms per token
 (11 chunks), versus ~9.1-9.5 ms at 25 bands in the controlled sweep.  Keep
-`MAX_BANDS_PER_CHUNK = 48` and use it for `HEAD_GOLDEN`; the output object is
-12 KiB per compute (48 KiB per group).  Program `.text` is 11104 bytes
-production / 14048 diagnostic, stack 2432 bytes.
+`MAX_BANDS_PER_CHUNK = 48` and use it for `HEAD_GOLDEN`; per compute the f32
+accumulator is 12 KiB and the bf16 epilogue output is 6 KiB (24 KiB per
+group).  Program `.text` is 11872 bytes production / 14880 diagnostic, worker
+stack 8192 bytes.  The diagnostic build leaves about 1.4 KiB of
+program-memory headroom.
 
 ### Streaming gap versus the PoC
 
@@ -891,16 +943,16 @@ remaining real-kernel difference is quant compute, not fill throughput.
 
 - Measure compute-tile program memory from the linked ELF:
   `llvm-size -A <build-dir>/xclbin_build/elfs_main_core_*/*.elf`.
-  Diagnostic builds report `.text` = 14048 bytes on all 32 cores; production
-  builds report 11104 bytes (68% of the 16 KiB limit).  Diagnostic overhead is
-  `program_assemble` (832), `program_probe` (768), `program_raw_check` (432),
-  the split-path worker code, and `__floatunsisf` (160).
+  Diagnostic builds report `.text` = 14880 bytes on all 32 cores; production
+  builds report 11872 bytes (73% of the 16 KiB limit).  Diagnostic overhead is
+  `program_assemble`, `program_probe`, `program_raw_check`, the split-path
+  worker code, and diagnostic-only branches.
 - `build.py --production` builds into `build-production/` from
-  `production_dynamic_program`.  It links only `program_config_decode`,
-  `program_init`, `program_zero`, `program_block_begin`,
-  `program_q4_block`, and `program_q6_block`.  It rejects config formats
-  the diagnostic mode range and skips the cycle timing row.  The normal build
-  keeps the diagnostic split path.
+  `production_dynamic_program`.  It links only `program_begin`,
+  `program_zero`, `program_output`, `program_block_begin`,
+  `program_q4_block`, and `program_q6_block`.  It rejects the diagnostic mode
+  range and skips the cycle timing row.  The normal build keeps the diagnostic
+  split path.
 - Unused device functions and kernels should still be removed from `run.py`:
   they slow JIT/build, appear in the source-file cache set, and hide which
   kernels the worker actually calls.  The old split `program_q4_0` /
@@ -927,5 +979,5 @@ remaining real-kernel difference is quant compute, not fill throughput.
   verifies.
 - `Program::prepare` takes canonical quant bytes, a raw column stride, and a
   512-column weight offset.  `Program::run` takes bfloat16 bits in
-  `[inputs_vecs][weights_rows]` order and a logical
-  `[inputs_vecs][outputs_cols]` output buffer.
+  `[inputs_vecs][weights_rows]` order and returns bfloat16 bits in
+  `[inputs_vecs][outputs_cols]` order.

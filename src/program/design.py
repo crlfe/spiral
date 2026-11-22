@@ -28,7 +28,8 @@ MAX_WEIGHT_BLOCKS = 128
 MAX_BANDS_PER_CHUNK = 48
 MAX_ROWS_STEPS = 48
 MAX_TILES_PER_BLOCK = 5
-MAX_INPUT_OBJECTS = 256
+# Static test path: fixed host buffer for one config plus input-group objects.
+MAX_INPUT_GROUPS = 64
 
 INPUT_GROUP_ROWS = 4
 INPUT_ELEMS = ROWS_STEP * INPUTS_VECS
@@ -71,13 +72,12 @@ STATE_TILE_INDEX = 3
 STATE_READY = 4
 STATE_TILE_SOURCE = 5  # 0 = carry, 1 = current L1 block
 STATE_TILE_OFFSET = 6
-STATE_CURRENT_ROW = 7
+# Word 7 is reserved; STATE_WORDS stays 8 for a 32-byte state object.
 
 l1_stream_type = np.ndarray[(L1_STREAM_BYTES,), np.dtype[np.uint8]]
 l2_stream_type = np.ndarray[(L2_STREAM_BYTES,), np.dtype[np.uint8]]
 l1_carry_type = np.ndarray[(CARRY_BYTES,), np.dtype[np.uint8]]
 l1_state_type = np.ndarray[(STATE_WORDS,), np.dtype[np.int32]]
-l1_inputs_type = np.ndarray[(INPUT_ELEMS,), np.dtype[bfloat16]]
 l1_input_group_type = np.ndarray[
     (INPUT_GROUP_ELEMS,), np.dtype[bfloat16]
 ]
@@ -92,8 +92,7 @@ l1_config_out_type = np.ndarray[(CONFIG_LEN,), np.dtype[np.int32]]
 MAX_WEIGHT_WORDS = (
     GROUPS * MAX_WEIGHT_BLOCKS * L2_STREAM_BYTES // 4
 )
-MAX_INPUT_OBJECTS //= INPUT_GROUP_ROWS
-MAX_INPUT_WORDS = (1 + MAX_INPUT_OBJECTS) * INPUT_GROUP_ELEMS // 2
+MAX_INPUT_WORDS = (1 + MAX_INPUT_GROUPS) * INPUT_GROUP_ELEMS // 2
 MAX_OUTPUT_ELEMS = GROUPS * GROUP_OUTPUTS
 
 l3_weights_type = np.ndarray[

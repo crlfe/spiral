@@ -28,10 +28,10 @@ cd src/program/build && ./test
 
 `build.py` emits `aie.xclbin`, `generate_txn.h`, `design_meta.h`, the golden
 cases, and the C++ test.  `./test` loads the xclbin once and runs every case
-listed in `build/golden/index.txt`.  The manifest has 27 cases: Q4_0
+listed in `build/golden/index.txt`.  The manifest has 30 cases: Q4_0
 attention/FFN shapes in both orientations up to 12288 rows or 12288 columns,
-two padded 256-column cases, Q6_K variants up to `1792x11264`, and the full
-262144-column Q6_K head as 11 chunks.  The golden set includes the raw head
+two padded 256-column cases, a Q4_0 softcap case, Q6_K variants up to
+`1792x11264`, and the full 262144-column Q6_K head as 11 chunks.  The golden set includes the raw head
 (about 315 MB), so golden generation takes a few minutes.
 
 Outputs are compared per column against `max(1e-3, 2e-5 * column_scale)`,
@@ -58,8 +58,8 @@ diagnostic path: `program_assemble`, `program_probe`, `program_raw_check`, the
 `build-production/`, reuses `build/golden` through a symlink when available,
 and `./test --timing` skips the diagnostic timing rows.
 
-Linked program memory is 11104 bytes per compute core (68% of 16 KiB),
-versus 14048 bytes for the diagnostic build.
+Linked program memory is 11872 bytes per compute core (73% of 16 KiB),
+versus 14880 bytes for the diagnostic build.
 
 ### Python checks
 
@@ -107,23 +107,39 @@ shape.format = 2;          // ggml_type: Q4_0 = 2, Q6_K = 14
 shape.weights_rows = 1536; // multiple of 256
 shape.weights_cols = 2048; // multiple of 512; max 48 bands per call
 shape.inputs_vecs = 4;     // must match the fixed design
+shape.soft_cap = 0.0f;    // optional tanh softcap; 0 disables it
 
+std::vector<uint16_t> outputs(4 * shape.weights_cols);
 program.run(shape,
             raw_weights, raw_stride, 0,  // canonical quant bytes
             inputs,                      // bfloat16 bits, [4][weights_rows]
-            outputs, shape.weights_cols, 0);
+            outputs.data(), shape.weights_cols, 0);
 ```
 
 `raw_weights` uses the canonical quant block layout with `raw_stride` bytes
-per weights column.  `outputs` is a logical float matrix in
-`[inputs_vecs][outputs_cols]` order.
+per weights column.  `outputs` is `uint16_t` bfloat16 bits in
+`[inputs_vecs][outputs_cols]` order, the same layout as the next call's
+input:
+
+```cpp
+std::vector<uint16_t> outputs(4 * shape.weights_cols);
+program.run(shape, prepared, inputs, outputs.data(),
+            shape.weights_cols, 0);
+// outputs is valid bfloat16 bits in [4][shape.weights_cols] order.
+```
+
+The epilogue transposes the native mmul tile and writes bf16 with
+round-to-nearest-even.  With `soft_cap != 0` it applies
+`cap * tanh(x / cap)` using the native bf16 vtanh; the host passes `cap` and
+`1/cap` as bf16 hi/lo pairs so the device has no division.  That is an
+approximate, named reduced-precision mode.
 
 Repack once and reuse the weights across calls:
 
 ```cpp
 auto prepared = program.prepare(shape, raw_weights, raw_stride, 0);
 for (int step = 0; step < steps; ++step) {
-  program.run(shape, prepared, inputs, outputs, shape.weights_cols, 0);
+  program.run(shape, prepared, inputs, outputs.data(), shape.weights_cols, 0);
 }
 ```
 

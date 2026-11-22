@@ -12,6 +12,9 @@
 #ifndef PROGRAM_MAX_TILES
 #define PROGRAM_MAX_TILES 5
 #endif
+#ifndef PROGRAM_OUTPUT_TILE_ELEMS
+#define PROGRAM_OUTPUT_TILE_ELEMS 64
+#endif
 
 // Shared fused block body: assemble transport tiles from the streamed weights
 // and hand each complete tile to a format-specific policy. `run` is
@@ -81,6 +84,9 @@ inline bool assemble_one(const uint8_t* restrict block,
   return false;
 }
 
+// The block kernels accumulate into the private f32 accumulator at
+// `outputs + band * PROGRAM_OUTPUT_TILE_ELEMS`; the separate program_output
+// epilogue transposes, optionally softcaps, and stores bf16.
 using ApplyFn = void (*)(const uint8_t* tile,
                          const bfloat16* inputs,
                          float* outputs);
@@ -115,7 +121,7 @@ inline __attribute__((noinline)) void run(
       const bfloat16* row_inputs =
           reinterpret_cast<const bfloat16*>(inputs) +
           local_row * PROGRAM_INPUT_ELEMS;
-      apply(tile, row_inputs, outputs + band * 64);
+      apply(tile, row_inputs, outputs + band * PROGRAM_OUTPUT_TILE_ELEMS);
       ++tile_index;
     }
   }

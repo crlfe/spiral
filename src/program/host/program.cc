@@ -184,27 +184,25 @@ void fill_inputs(uint32_t* buf, int32_t format, int32_t tile_bytes,
                  float soft_cap) {
   write_config(buf, format, tile_bytes, rows_steps, cols_bands,
                weights_blocks, total_tiles, input_pad, weight_pad, soft_cap);
-  const int32_t groups =
-      (rows_steps + design::kInputGroupRows - 1) /
-      design::kInputGroupRows;
   auto* objects =
       reinterpret_cast<uint16_t*>(buf) + design::kInputGroupElems;
-  const int32_t cols_per_chunk = 8;
+  constexpr int32_t kColsPerChunk = 8;
   for (int32_t row = 0; row < rows_steps; ++row) {
     const int32_t group = row / design::kInputGroupRows;
     const int32_t within = row % design::kInputGroupRows;
     uint16_t* dst = objects + group * design::kInputGroupElems +
                     within * design::kInputElems;
-    for (int32_t chunk = 0; chunk < design::kRowsStep / cols_per_chunk;
+    for (int32_t chunk = 0; chunk < design::kRowsStep / kColsPerChunk;
          ++chunk) {
       for (int32_t vec = 0; vec < design::kInputsVecs; ++vec) {
-        for (int32_t col = 0; col < cols_per_chunk; ++col) {
-          const int64_t src =
-              static_cast<int64_t>(vec) * weights_rows +
-              row * design::kRowsStep + chunk * cols_per_chunk + col;
-          dst[chunk * design::kInputsVecs * cols_per_chunk +
-              vec * cols_per_chunk + col] = inputs[src];
-        }
+        const int64_t src =
+            static_cast<int64_t>(vec) * weights_rows +
+            row * design::kRowsStep + chunk * kColsPerChunk;
+        uint16_t* chunk_dst =
+            dst + chunk * design::kInputsVecs * kColsPerChunk +
+            vec * kColsPerChunk;
+        std::memcpy(chunk_dst, inputs + src,
+                    kColsPerChunk * sizeof(uint16_t));
       }
     }
   }
@@ -378,7 +376,7 @@ struct Program::Impl {
       inputs.emplace_back(loaded.device, design::kInputWords * sizeof(uint32_t),
                           xrt::bo::flags::host_only, kernel.group_id(4));
       outputs.emplace_back(loaded.device,
-                           design::kOutputFloats * sizeof(uint16_t),
+                           design::kMaxOutputElems * sizeof(uint16_t),
                            xrt::bo::flags::host_only, kernel.group_id(5));
     }
     busy.assign(static_cast<size_t>(depth), false);
@@ -462,7 +460,6 @@ PreparedWeights Program::prepare(const MatmulShape& shape,
   int32_t total_tiles = 0;
   int32_t weights_blocks = 0;
   check_shape(shape, rows_steps, cols_bands, total_tiles, weights_blocks);
-  const int32_t bytes = shape_tile_bytes(shape);
 
   std::vector<uint8_t> packed;
   if (!probe) {

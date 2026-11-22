@@ -1,13 +1,13 @@
 // Diagnostic mode: checksum one delivered L1 stream block.
 //
 // No assembly or carry: the block is treated as the transport unit.  The
-// checksum is written into the compute's output object at `index` so the host
-// can compare it with the bytes it packed.
+// checksum is written as a 32-bit word into the compute's bf16 output
+// object at `index` so the host can compare it with the bytes it packed.
 
 #include <stdint.h>
 
 extern "C" void program_raw_check(const uint8_t* restrict block,
-                                  float* restrict outputs,
+                                  uint8_t* restrict outputs,
                                   int32_t index,
                                   int32_t bytes) {
   const uint64_t* words = reinterpret_cast<const uint64_t*>(block);

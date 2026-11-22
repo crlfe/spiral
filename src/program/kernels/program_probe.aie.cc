@@ -1,6 +1,6 @@
 // No-op tile consumer: checksum the assembled tile and its input object.
 //
-// The result is written as a raw uint32 bit pattern into the float output
+// The result is written as a raw uint32 bit pattern into the bf16 output
 // object, so the host can compare it exactly.  This is the format-0 probe
 // used to validate the data flow independently of the quantization kernels.
 
@@ -23,7 +23,7 @@ using program::kTileSource;
 extern "C" void program_probe(const uint8_t* restrict block,
                               const uint8_t* restrict carry,
                               const uint16_t* restrict inputs,
-                              float* restrict outputs,
+                              uint8_t* restrict outputs,
                               int32_t* restrict state,
                               int32_t tile_bytes,
                               int32_t cols_bands) {

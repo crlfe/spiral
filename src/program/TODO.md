@@ -13,7 +13,7 @@ The design is functional and verified on device:
 
 - no-op, raw-block checksum, Q4_0, Q6_K, and cycle paths;
 - runtime-sized C++ fills and the static Python fixed-max test path;
-- the 27-case C++ golden matrix, including partition boundaries, padded
+- the 30-case C++ golden matrix, including partition boundaries, padded
   256-column cases, both large orientations, and the full 262144-column Q6_K
   head as 11 chunks;
 - prepared-weight reuse, weight/output column offsets, and one contiguous
@@ -52,8 +52,8 @@ over peak bandwidth.
       diagnostic kernels and cycle path.
 - [x] Loop idioms: vectorized `program_zero` (`vst`), pointer-increment carry
       copy (`lda/st [p],#8`), and attempt-loop unroll sweep (rejected; full
-      unroll overflows).  Production `.text` is now 11104 bytes; diagnostic is
-      14048.
+      unroll overflows).  Production `.text` is now 11872 bytes; diagnostic is
+      14880.
 - [x] Shared block loop: one non-template `program_block::run` with the
       `unpack_mmul` instantiation as the apply pointer.  Production `.text`
       12192 -> 11104 bytes; Q4_0 block 4368 -> 3232, Q6_K 5168 -> 4032.  No
@@ -133,6 +133,10 @@ over peak bandwidth.
       or stream change.
 - [ ] Use the production baseline in `NOTES.md` for comparisons: isolated
       cases, warm-up run, then median/min over repeated runs.
+- [x] Common bf16 tile epilogue (`program_output`): transpose the native tile
+      to `[vec][16]`, optional bf16 vtanh softcap, bf16 output, and a bf16
+      host overload that matches the next run's input layout.  See
+      `NOTES.md` under "Output layout" and "Performance history".
 
 ## Planned
 
@@ -219,8 +223,8 @@ over peak bandwidth.
   to 512, roughly doubling those columns' work.
 - **Head overhead**: the Q6_K head is 11 band chunks, up to 48 bands each
   (120 blocks maximum; the last chunk is 32 bands).
-- **Program memory**: diagnostic build is 14048 bytes per core (86% of
-  16 KiB); production is 11104 bytes (68%).  Recheck after adding code to a
+- **Program memory**: diagnostic build is 14880 bytes per core (91% of
+  16 KiB); production is 11872 bytes (73%).  Recheck after adding code to a
   kernel; full attempt-loop unroll already overflows.
 - **Buffer sizing**: the host weight BO is 32 MiB at 128 blocks; the host
   canonical packed tensor can be ~333 MB for the Q6_K head.

@@ -1,4 +1,4 @@
-// Clear one compute's output object before a call.
+// Clear one compute's f32 accumulator before a call.
 
 #include <stdint.h>
 
