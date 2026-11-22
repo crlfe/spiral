@@ -8,6 +8,7 @@ the same design for the C++ transaction path.
 
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 from aie import iron
@@ -32,14 +33,12 @@ from aie.iron import (
 from aie.iron.controlflow import range_
 from aie.iron.controlflow import yield_ as iron_yield
 from aie.iron.device import NPU2, Tile
-from ml_dtypes import bfloat16
 
 PROGRAM_DIR = Path(__file__).resolve().parent
 if str(PROGRAM_DIR) not in sys.path:
     sys.path.insert(0, str(PROGRAM_DIR))
 
 import design
-import pack
 
 KERNEL_DIR = PROGRAM_DIR / "kernels"
 QUANTS_ROOT = PROGRAM_DIR.parent
@@ -75,44 +74,37 @@ Q6_K_HEADERS = [
 # design.py and this runner are part of the JIT recipe: their content is
 # hashed with the kernel sources, so fixed constants and module-level helpers
 # invalidate the cache automatically.
-SOURCE_FILES = [
+COMMON_SOURCE_FILES = [
     Path(design.__file__).resolve(),
     Path(__file__).resolve(),
     BEGIN_SOURCE,
     ZERO_SOURCE,
     OUTPUT_SOURCE,
-    ASSEMBLE_SOURCE,
     BLOCK_SOURCE,
+    Q4_0_BLOCK_SOURCE,
+    Q6_K_BLOCK_SOURCE,
+    BLOCK_IMPL_HEADER,
+    STATE_HEADER,
+    *Q4_0_HEADERS,
+    *Q6_K_HEADERS,
+]
+DIAGNOSTIC_SOURCE_FILES = [
+    ASSEMBLE_SOURCE,
     PROBE_SOURCE,
     RAW_CHECK_SOURCE,
-    Q4_0_BLOCK_SOURCE,
-    Q6_K_BLOCK_SOURCE,
-    BLOCK_IMPL_HEADER,
-    STATE_HEADER,
-    *Q4_0_HEADERS,
-    *Q6_K_HEADERS,
 ]
-
+SOURCE_FILES = COMMON_SOURCE_FILES + DIAGNOSTIC_SOURCE_FILES
 # Production builds omit the diagnostic split path and timing probes.  Keep
 # this list separate from SOURCE_FILES so the JIT cache keys stay distinct.
-PRODUCTION_SOURCE_FILES = [
-    Path(design.__file__).resolve(),
-    Path(__file__).resolve(),
-    BEGIN_SOURCE,
-    ZERO_SOURCE,
-    OUTPUT_SOURCE,
-    BLOCK_SOURCE,
-    Q4_0_BLOCK_SOURCE,
-    Q6_K_BLOCK_SOURCE,
-    BLOCK_IMPL_HEADER,
-    STATE_HEADER,
-    *Q4_0_HEADERS,
-    *Q6_K_HEADERS,
-]
+PRODUCTION_SOURCE_FILES = COMMON_SOURCE_FILES
 
-# Transport tile sizes from the quant layouts.
-Q4_0_TILE_BYTES = 2304
-Q6_K_TILE_BYTES = 3392
+# Shared stream geometry, in 32-bit words where the shim DMA needs words.
+_INPUT_WORDS = design.INPUT_GROUP_ELEMS // 2
+_L1_WORDS = design.L1_STREAM_BYTES // 4
+_L2_WORDS = design.L2_STREAM_BYTES // 4
+_L1_LO = 512 if _L1_WORDS % 512 == 0 else 256
+_L1_HI = _L1_WORDS // _L1_LO
+_COMBINED = design.COMPUTES_PER_GROUP * _L1_HI
 
 
 def _factor_bd(objects):
@@ -125,98 +117,82 @@ def _factor_bd(objects):
     raise ValueError(f"{objects} objects do not factor into two BD dimensions")
 
 
-def _native_block(g, c, band, half):
-    """Block index in the production [N/8][vec][8] output layout."""
-    half_cols = design.COLS_TILE // 2
-    blocks_per_band = design.BAND_COLS // half_cols
-    blocks_per_compute = design.COLS_TILE // half_cols
-    blocks_per_group = design.COMPUTES_PER_GROUP * blocks_per_compute
-    return (
-        band * blocks_per_band
-        + g * blocks_per_group
-        + c * blocks_per_compute
-        + half
+def _fill_config(inputs_prod, config_buf, group):
+    """Fill the config object separately from the input-group objects."""
+    inputs_prod.fill(
+        config_buf,
+        offset=0,
+        sizes=[1, 1, 1, _INPUT_WORDS],
+        strides=[_INPUT_WORDS, 0, 0, 1],
+        transfer_len=_INPUT_WORDS,
+        group=group,
+        wait=True,
     )
 
 
-def _native_tile(actual, g, c, band):
-    """Gather one compute's native blocks into float [vec][16]."""
-    half_cols = design.COLS_TILE // 2
-    block_elems = design.INPUTS_VECS * half_cols
-    tile = np.zeros((design.INPUTS_VECS, design.COLS_TILE), dtype=np.float32)
-    for half in range(2):
-        start = _native_block(g, c, band, half) * block_elems
-        for vec in range(design.INPUTS_VECS):
-            tile[vec, half * half_cols : (half + 1) * half_cols] = (
-                np.asarray(actual[start + vec * half_cols :
-                                  start + (vec + 1) * half_cols],
-                           dtype=np.float32)
-            )
-    return tile
-
-
-def _native_compute_bits(bits, g, c):
-    """Invert the native group drain for one compute's flat output object."""
-    group_offset = (
-        g * design.COMPUTES_PER_GROUP * design.COLS_TILE *
-        design.INPUTS_VECS
-    )
-    compute_offset = c * design.COLS_TILE * design.INPUTS_VECS
-    band_stride = design.BAND_COLS * design.INPUTS_VECS
-    obj = np.zeros(design.OUTPUT_ELEMS, dtype=np.uint16)
-    for band in range(design.MAX_BANDS_PER_CHUNK):
-        src = group_offset + compute_offset + band * band_stride
-        dst = band * design.OUTPUT_TILE_ELEMS
-        obj[dst : dst + design.OUTPUT_TILE_ELEMS] = bits[
-            src : src + design.OUTPUT_TILE_ELEMS
-        ]
-    return obj
-
-
-def _real_error_metrics(actual, expected, cols_bands, rel=6e-3):
-    """Return (max abs error, worst error / per-column tolerance).
-
-    The device accumulates K terms in fp32, so the absolute error grows with
-    K and with the column's output scale.  The device also stores the epilogue
-    result as bf16 for direct chaining, which dominates the error.  The
-    pass/fail quantity is the element's error against
-    ``max(1e-3, 6e-3 * column_scale)``, where the column scale is the largest
-    expected magnitude in that output column over the four input vectors.
-    This mirrors host/test.cc.
-    """
-    max_error = 0.0
-    max_ratio = 0.0
+def _drain_outputs(outputs_conses, outputs_buf, group):
+    """Drain each group into the N-major [N/8][vec][8] layout."""
     for g in range(design.GROUPS):
-        for c in range(design.COMPUTES_PER_GROUP):
-            for band in range(cols_bands):
-                tile = _native_tile(actual, g, c, band)
-                reference = expected[g, c, band]
-                error = np.abs(tile - reference)
-                column_scale = np.abs(reference).max(axis=0)
-                tolerance = np.maximum(1e-3, rel * column_scale)
-                max_error = max(max_error, float(error.max()))
-                max_ratio = max(max_ratio, float((error / tolerance).max()))
-    return max_error, max_ratio
+        outputs_conses[g].drain(
+            outputs_buf,
+            offset=g * design.COMPUTES_PER_GROUP * design.COLS_TILE *
+            design.INPUTS_VECS,
+            sizes=[
+                design.COMPUTES_PER_GROUP,
+                design.MAX_BANDS_PER_CHUNK,
+                design.OUTPUT_TILE_ELEMS,
+            ],
+            strides=[
+                design.COLS_TILE * design.INPUTS_VECS,
+                design.BAND_COLS * design.INPUTS_VECS,
+                1,
+            ],
+            transfer_len=design.GROUP_OUTPUTS,
+            group=group,
+            wait=True,
+        )
 
 
-def _noop_mismatches(actual, expected, total_tiles, cols_bands):
-    mismatches = 0
-    first = None
-    bits = np.asarray(actual).view(np.uint16)
-    for g in range(design.GROUPS):
-        for c in range(design.COMPUTES_PER_GROUP):
-            obj = _native_compute_bits(bits, g, c).view(np.uint32)
-            for tile_index in range(total_tiles):
-                got = obj[tile_index]
-                want = expected[g, c, tile_index]
-                if got != want:
-                    mismatches += 1
-                    if first is None:
-                        first = (g, c, tile_index, int(got), int(want))
-    return mismatches, first
+class Fifos(NamedTuple):
+    """Object FIFOs: shared input/output streams and per-group weights."""
+
+    inputs_l2: object
+    inputs_l1: object
+    weights_l2: list
+    weights_l1: list
+    outputs_l2: list
+    outputs_l1: list
+
+
+class Kernels(NamedTuple):
+    """External kernels referenced by the worker and the host sequences."""
+
+    begin: object
+    zero: object
+    output: object
+    block_begin: object
+    q4_block: object
+    q6_block: object
+    assemble: object = None
+    probe: object = None
+    raw_check: object = None
+
+
+class ComputeBuffers(NamedTuple):
+    """Per-compute L1 buffers, indexed by g, c."""
+
+    carry: list
+    state: list
+    config: list
+    accum: list
+
+
+def _compute_index(group, compute):
+    return group * design.COMPUTES_PER_GROUP + compute
 
 
 def _make_kernels(production=False):
+    """Build the external kernels; production omits the diagnostic split."""
     begin = ExternalFunction(
         "program_begin",
         arg_types=[
@@ -341,20 +317,21 @@ def _make_kernels(production=False):
             source_file=str(RAW_CHECK_SOURCE),
             inline=False,
         )
-    return (
-        begin,
-        zero,
-        output,
-        assemble,
-        block_begin,
-        probe,
-        raw_check,
-        q4_0_block,
-        q6_k_block,
+    return Kernels(
+        begin=begin,
+        zero=zero,
+        output=output,
+        block_begin=block_begin,
+        q4_block=q4_0_block,
+        q6_block=q6_k_block,
+        assemble=assemble,
+        probe=probe,
+        raw_check=raw_check,
     )
 
 
 def _make_fifos(mem_tiles):
+    """Build the input, weight, and output object FIFOs."""
     inputs_l2 = ObjectFifo(
         design.l1_input_group_type, name="inputs_l2", depth=4
     )
@@ -414,10 +391,146 @@ def _make_fifos(mem_tiles):
         )
         for g in range(design.GROUPS)
     ]
-    return inputs_l2, inputs_l1, weights_l2, weights_l1, outputs_l2, outputs_l1
+    return Fifos(
+        inputs_l2=inputs_l2,
+        inputs_l1=inputs_l1,
+        weights_l2=weights_l2,
+        weights_l1=weights_l1,
+        outputs_l2=outputs_l2,
+        outputs_l1=outputs_l1,
+    )
+
+
+def _make_compute_buffers():
+    """Allocate the four per-compute L1 buffers in one place."""
+
+    def alloc(buffer_type, prefix):
+        return [
+            Buffer(
+                buffer_type,
+                name=f"{prefix}_{g}_{c}",
+            )
+            for g in range(design.GROUPS)
+            for c in range(design.COMPUTES_PER_GROUP)
+        ]
+
+    return ComputeBuffers(
+        carry=alloc(design.l1_carry_type, "carry"),
+        state=alloc(design.l1_state_type, "state"),
+        config=alloc(design.l1_config_out_type, "config"),
+        accum=alloc(design.l1_accum_type, "accum"),
+    )
+
+
+def _worker_kernel_list(kernels, production):
+    """Order the worker's kernels; diagnostic builds append the probes."""
+    common = [
+        kernels.begin,
+        kernels.zero,
+        kernels.output,
+        kernels.block_begin,
+        kernels.q4_block,
+        kernels.q6_block,
+    ]
+    if production:
+        return common
+    return common + [kernels.assemble, kernels.probe, kernels.raw_check]
+
+
+def _sequence_static(weights_buf, inputs_buf, config_buf, outputs_buf,
+                     weights_prods, inputs_prod, outputs_conses):
+    """Fixed-max host path used by the Python test runner."""
+    group_stride_words = design.MAX_WEIGHT_BLOCKS * _L2_WORDS
+    outer, inner = _factor_bd(design.MAX_WEIGHT_BLOCKS)
+    outer_in, inner_in = _factor_bd(design.MAX_INPUT_GROUPS)
+
+    tg = iron.TaskGroup()
+    config_tg = iron.TaskGroup()
+    _fill_config(inputs_prod, config_buf, config_tg)
+    config_tg.finish()
+
+    inputs_prod.fill(
+        inputs_buf,
+        offset=0,
+        sizes=[outer_in, inner_in, 1, _INPUT_WORDS],
+        strides=[inner_in * _INPUT_WORDS, _INPUT_WORDS, 0, 1],
+        transfer_len=inner_in * _INPUT_WORDS,
+        group=tg,
+        wait=False,
+    )
+
+    for g in range(design.GROUPS):
+        weights_prods[g].fill(
+            weights_buf,
+            offset=g * group_stride_words,
+            sizes=[outer, inner, _COMBINED, _L1_LO],
+            strides=[inner * _L2_WORDS, _L2_WORDS, _L1_LO, 1],
+            transfer_len=inner * _L2_WORDS,
+            group=tg,
+            wait=False,
+        )
+
+    _drain_outputs(outputs_conses, outputs_buf, tg)
+    tg.finish()
+
+
+def _sequence_dynamic(weights_buf, inputs_buf, config_buf, outputs_buf,
+                      weights_prods, inputs_prod, outputs_conses,
+                      input0, input1, input2, input3,
+                      weight0, weight1, group_stride_words):
+    """Runtime-sized host path used by the C++ production caller."""
+    i32 = IntegerType.get_signless(32)
+    i64 = IntegerType.get_signless(64)
+
+    def as_i64(value):
+        return arith.extsi(i64, value)
+
+    input_step = arith.constant(i32, _INPUT_WORDS)
+    weight_step = arith.constant(i32, _L2_WORDS)
+
+    tg = iron.TaskGroup()
+    config_tg = iron.TaskGroup()
+    _fill_config(inputs_prod, config_buf, config_tg)
+    config_tg.finish()
+
+    offset = arith.constant(i32, 0)
+    for part in (input0, input1, input2, input3):
+        inputs_prod.fill(
+            inputs_buf,
+            offset=offset,
+            sizes=[as_i64(part), 1, 1, _INPUT_WORDS],
+            strides=[_INPUT_WORDS, 0, 0, 1],
+            transfer_len=_INPUT_WORDS,
+            group=tg,
+            wait=False,
+        )
+        offset = arith.addi(offset, arith.muli(part, input_step))
+
+    for g in range(design.GROUPS):
+        offset = arith.muli(arith.constant(i32, g), group_stride_words)
+        for part in (weight0, weight1):
+            weights_prods[g].fill(
+                weights_buf,
+                offset=offset,
+                sizes=[as_i64(part), 1, _COMBINED, _L1_LO],
+                strides=[_L2_WORDS, _L2_WORDS, _L1_LO, 1],
+                transfer_len=_L2_WORDS,
+                group=tg,
+                wait=False,
+            )
+            offset = arith.addi(offset, arith.muli(part, weight_step))
+
+    _drain_outputs(outputs_conses, outputs_buf, tg)
+    tg.finish()
 
 
 def _make_program(dynamic, production=False):
+    """Build the fixed-max program.
+
+    Flow: tiles -> object FIFOs -> external kernels -> per-compute buffers ->
+    runtime sequence -> workers.  ``dynamic`` selects the runtime-sized host
+    sequence used by the C++ caller; production omits the diagnostic path.
+    """
     shim_tiles = [
         Tile(col=g, row=0, tile_type=AIETileType.ShimNOCTile)
         for g in range(design.GROUPS)
@@ -434,47 +547,9 @@ def _make_program(dynamic, production=False):
         for g in range(design.GROUPS)
     ]
 
-    (
-        inputs_l2,
-        inputs_l1,
-        weights_l2,
-        weights_l1,
-        outputs_l2,
-        outputs_l1,
-    ) = _make_fifos(mem_tiles)
-
-    (
-        begin,
-        zero,
-        output,
-        assemble,
-        block_begin,
-        probe,
-        raw_check,
-        q4_0_block,
-        q6_k_block,
-    ) = _make_kernels(production)
-
-    accum_buffers = [
-        Buffer(design.l1_accum_type, name=f"accum_{g}_{c}")
-        for g in range(design.GROUPS)
-        for c in range(design.COMPUTES_PER_GROUP)
-    ]
-    carry_buffers = [
-        Buffer(design.l1_carry_type, name=f"carry_{g}_{c}")
-        for g in range(design.GROUPS)
-        for c in range(design.COMPUTES_PER_GROUP)
-    ]
-    state_buffers = [
-        Buffer(design.l1_state_type, name=f"state_{g}_{c}")
-        for g in range(design.GROUPS)
-        for c in range(design.COMPUTES_PER_GROUP)
-    ]
-    config_buffers = [
-        Buffer(design.l1_config_out_type, name=f"config_{g}_{c}")
-        for g in range(design.GROUPS)
-        for c in range(design.COMPUTES_PER_GROUP)
-    ]
+    fifos = _make_fifos(mem_tiles)
+    kernels = _make_kernels(production)
+    bufs = _make_compute_buffers()
 
     def body(
         weights_cons,
@@ -494,6 +569,7 @@ def _make_program(dynamic, production=False):
         probe=None,
         raw_check=None,
     ):
+        """Per-compute worker: decode config, stream blocks, drain output."""
         config_buf = inputs_cons.acquire(1)
         begin(config_buf, config_out, state)
         inputs_cons.release(1)
@@ -502,24 +578,112 @@ def _make_program(dynamic, production=False):
         tile_bytes = config_out[design.CFG_TILE_BYTES]
         cols_bands = config_out[design.CFG_COLS_BANDS]
         weights_blocks = config_out[design.CFG_WEIGHTS_BLOCKS]
-        total_tiles = config_out[design.CFG_TOTAL_TILES]
         rows_steps = config_out[design.CFG_ROWS_STEPS]
 
         i32 = IntegerType.get_signless(32)
         zero_i32 = arith.constant(i32, 0)
         one_i32 = arith.constant(i32, 1)
         two_i32 = arith.constant(i32, 2)
-        three_i32 = arith.constant(i32, 3)
-        four_i32 = arith.constant(i32, 4)
+        group_rows_i32 = arith.constant(i32, design.INPUT_GROUP_ROWS)
         fmt_q4_i32 = arith.constant(i32, design.FORMAT_Q4_0)
-        fmt_q6_i32 = arith.constant(i32, design.FORMAT_Q6_K)
-        mode_fifo_i32 = arith.constant(i32, design.MODE_FIFO)
-        mode_raw_i32 = arith.constant(i32, design.MODE_RAW_CHECK)
+        if not production:
+            fmt_q6_i32 = arith.constant(i32, design.FORMAT_Q6_K)
+            mode_fifo_i32 = arith.constant(i32, design.MODE_FIFO)
+            mode_raw_i32 = arith.constant(i32, design.MODE_RAW_CHECK)
         num_groups = arith.divui(
-            arith.addi(rows_steps, three_i32), four_i32
+            arith.addi(rows_steps, arith.subi(group_rows_i32, one_i32)),
+            group_rows_i32,
         )
 
+        def group_rows(group):
+            """Rows covered after ``group`` has been consumed, clamped."""
+            next_group = arith.muli(
+                arith.addi(group, one_i32), group_rows_i32
+            )
+            return arith.select(
+                arith.cmpi(CmpIPredicate.sgt, next_group, rows_steps),
+                rows_steps,
+                next_group,
+            )
+
+        def emit_tile_dispatch(
+            active, active_block, active_input, active_limit, outputs_buf
+        ):
+            """Emit one tile of the streaming loop for the selected format."""
+            with if_(active):
+                with if_(
+                    arith.cmpi(CmpIPredicate.eq, fmt, fmt_q4_i32)
+                ) as is_q4:
+                    q4_0_block(
+                        active_block,
+                        carry,
+                        active_input,
+                        accum,
+                        state,
+                        tile_bytes,
+                        active_limit,
+                        cols_bands,
+                    )
+                with else_(is_q4):
+                    if production:
+                        q6_k_block(
+                            active_block,
+                            carry,
+                            active_input,
+                            accum,
+                            state,
+                            tile_bytes,
+                            active_limit,
+                            cols_bands,
+                        )
+                    else:
+                        with if_(
+                            arith.cmpi(
+                                CmpIPredicate.eq, fmt, fmt_q6_i32
+                            )
+                        ) as is_q6:
+                            q6_k_block(
+                                active_block,
+                                carry,
+                                active_input,
+                                accum,
+                                state,
+                                tile_bytes,
+                                active_limit,
+                                cols_bands,
+                            )
+                        with else_(is_q6):
+                            for _attempt in range_(
+                                design.MAX_TILES_PER_BLOCK
+                            ):
+                                assemble(
+                                    active_block,
+                                    carry,
+                                    state,
+                                    tile_bytes,
+                                    active_limit,
+                                )
+                                ready = arith.cmpi(
+                                    CmpIPredicate.ne,
+                                    state[design.STATE_READY],
+                                    zero_i32,
+                                )
+                                with if_(ready):
+                                    probe(
+                                        active_block,
+                                        carry,
+                                        active_input,
+                                        outputs_buf,
+                                        state,
+                                        tile_bytes,
+                                        cols_bands,
+                                    )
+
         def emit_loop():
+            """Stream every weight block and input group through the tiles."""
+            # The diagnostic split path stores tile checksums while streaming;
+            # the real-format path writes its only output after the loop.
+            outputs_buf = None
             if not production:
                 outputs_buf = outputs_prod.acquire(1)
             zero(
@@ -529,6 +693,8 @@ def _make_program(dynamic, production=False):
                     arith.constant(i32, design.OUTPUT_TILE_ELEMS),
                 ),
             )
+            # Two slack units let the final block and input group drain after
+            # their tile limit has been reached.
             max_units = arith.addi(
                 arith.addi(weights_blocks, num_groups), two_i32
             )
@@ -537,6 +703,8 @@ def _make_program(dynamic, production=False):
             input_group = inputs_cons.acquire(1)
             group0 = zero_i32
 
+            # Carried state: the current weight block, the current input
+            # group, and the group index that the input belongs to.
             for _unit, carried, _result in range_(
                 max_units,
                 iter_args=[block, input_group, group0],
@@ -544,20 +712,9 @@ def _make_program(dynamic, production=False):
             ):
                 current_block, current_input, current_group = carried
 
-                next_rows = arith.select(
-                    arith.cmpi(
-                        CmpIPredicate.sgt,
-                        arith.muli(
-                            arith.addi(current_group, one_i32), four_i32
-                        ),
-                        rows_steps,
-                    ),
-                    rows_steps,
-                    arith.muli(
-                        arith.addi(current_group, one_i32), four_i32
-                    ),
+                group_limit = arith.muli(
+                    group_rows(current_group), cols_bands
                 )
-                group_limit = arith.muli(next_rows, cols_bands)
 
                 advance = arith.andi(
                     arith.cmpi(
@@ -585,20 +742,9 @@ def _make_program(dynamic, production=False):
 
                 active_group = next_input.results[1]
                 active_input = next_input.results[0]
-                active_rows = arith.select(
-                    arith.cmpi(
-                        CmpIPredicate.sgt,
-                        arith.muli(
-                            arith.addi(active_group, one_i32), four_i32
-                        ),
-                        rows_steps,
-                    ),
-                    rows_steps,
-                    arith.muli(
-                        arith.addi(active_group, one_i32), four_i32
-                    ),
+                active_limit = arith.muli(
+                    group_rows(active_group), cols_bands
                 )
-                active_limit = arith.muli(active_rows, cols_bands)
 
                 need_block = arith.andi(
                     arith.cmpi(
@@ -635,74 +781,10 @@ def _make_program(dynamic, production=False):
                     ),
                 )
 
-                with if_(active):
-                    with if_(
-                        arith.cmpi(CmpIPredicate.eq, fmt, fmt_q4_i32)
-                    ) as is_q4:
-                        q4_0_block(
-                            active_block,
-                            carry,
-                            active_input,
-                            accum,
-                            state,
-                            tile_bytes,
-                            active_limit,
-                            cols_bands,
-                        )
-                    with else_(is_q4):
-                        if production:
-                            q6_k_block(
-                                active_block,
-                                carry,
-                                active_input,
-                                accum,
-                                state,
-                                tile_bytes,
-                                active_limit,
-                                cols_bands,
-                            )
-                        else:
-                            with if_(
-                                arith.cmpi(
-                                    CmpIPredicate.eq, fmt, fmt_q6_i32
-                                )
-                            ) as is_q6:
-                                q6_k_block(
-                                    active_block,
-                                    carry,
-                                    active_input,
-                                    accum,
-                                    state,
-                                    tile_bytes,
-                                    active_limit,
-                                    cols_bands,
-                                )
-                            with else_(is_q6):
-                                for _attempt in range_(
-                                    design.MAX_TILES_PER_BLOCK
-                                ):
-                                    assemble(
-                                        active_block,
-                                        carry,
-                                        state,
-                                        tile_bytes,
-                                        active_limit,
-                                    )
-                                    ready = arith.cmpi(
-                                        CmpIPredicate.ne,
-                                        state[design.STATE_READY],
-                                        zero_i32,
-                                    )
-                                    with if_(ready):
-                                        probe(
-                                            active_block,
-                                            carry,
-                                            active_input,
-                                            outputs_buf,
-                                            state,
-                                            tile_bytes,
-                                            cols_bands,
-                                        )
+                emit_tile_dispatch(
+                    active, active_block, active_input, active_limit,
+                    outputs_buf,
+                )
 
                 iron_yield(
                     [active_block, active_input, active_group]
@@ -734,9 +816,8 @@ def _make_program(dynamic, production=False):
                     )
             outputs_prod.release(1)
 
-        if production:
-            emit_loop()
-        else:
+        def emit_diagnostic_paths():
+            """Cycle and raw modes replace the compute loop in diag builds."""
             with if_(
                 arith.cmpi(CmpIPredicate.eq, fmt, mode_fifo_i32)
             ) as is_cycle:
@@ -771,55 +852,52 @@ def _make_program(dynamic, production=False):
                 with else_(is_raw):
                     emit_loop()
 
-        if dynamic:
-            input_pad = config_out[design.CFG_INPUT_PAD]
-            weight_pad = config_out[design.CFG_WEIGHT_PAD]
-            for _extra in range_(input_pad):
-                inputs_buf = inputs_cons.acquire(1)
-                inputs_cons.release(1)
-            for _extra in range_(weight_pad):
-                l1_block = weights_cons.acquire(1)
-                weights_cons.release(1)
+        def emit_padding():
+            """Drain host-filled objects that the live geometry did not use."""
+            if dynamic:
+                input_pad = config_out[design.CFG_INPUT_PAD]
+                weight_pad = config_out[design.CFG_WEIGHT_PAD]
+                for _extra in range_(input_pad):
+                    inputs_buf = inputs_cons.acquire(1)
+                    inputs_cons.release(1)
+                for _extra in range_(weight_pad):
+                    l1_block = weights_cons.acquire(1)
+                    weights_cons.release(1)
+            else:
+                extra_blocks = arith.subi(
+                    arith.constant(i32, design.MAX_WEIGHT_BLOCKS),
+                    weights_blocks,
+                )
+                for _extra in range_(extra_blocks):
+                    l1_block = weights_cons.acquire(1)
+                    weights_cons.release(1)
+
+                extra_inputs = arith.subi(
+                    arith.constant(i32, design.MAX_INPUT_GROUPS),
+                    num_groups,
+                )
+                for _extra in range_(extra_inputs):
+                    inputs_buf = inputs_cons.acquire(1)
+                    inputs_cons.release(1)
+
+        if production:
+            emit_loop()
         else:
-            extra_blocks = arith.subi(
-                arith.constant(i32, design.MAX_WEIGHT_BLOCKS),
-                weights_blocks,
-            )
-            for _extra in range_(extra_blocks):
-                l1_block = weights_cons.acquire(1)
-                weights_cons.release(1)
+            emit_diagnostic_paths()
+        emit_padding()
 
-            extra_inputs = arith.subi(
-                arith.constant(i32, design.MAX_INPUT_GROUPS),
-                num_groups,
-            )
-            for _extra in range_(extra_inputs):
-                inputs_buf = inputs_cons.acquire(1)
-                inputs_cons.release(1)
-
-
-    worker_kernels = [
-        begin,
-        zero,
-        output,
-        block_begin,
-        q4_0_block,
-        q6_k_block,
-    ]
-    if not production:
-        worker_kernels += [assemble, probe, raw_check]
-
+    worker_kernels = _worker_kernel_list(kernels, production)
     workers = [
         Worker(
             body,
             [
-                weights_l1[g][c].cons(),
-                inputs_l1.cons(),
-                outputs_l1[g][c].prod(),
-                config_buffers[g * design.COMPUTES_PER_GROUP + c],
-                carry_buffers[g * design.COMPUTES_PER_GROUP + c],
-                state_buffers[g * design.COMPUTES_PER_GROUP + c],
-                accum_buffers[g * design.COMPUTES_PER_GROUP + c],
+                fifos.weights_l1[g][c].cons(),
+                fifos.inputs_l1.cons(),
+                fifos.outputs_l1[g][c].prod(),
+                bufs.config[_compute_index(g, c)],
+                bufs.carry[_compute_index(g, c)],
+                bufs.state[_compute_index(g, c)],
+                bufs.accum[_compute_index(g, c)],
                 *worker_kernels,
             ],
             tile=compute_tiles[g][c],
@@ -829,210 +907,31 @@ def _make_program(dynamic, production=False):
         for c in range(design.COMPUTES_PER_GROUP)
     ]
 
-    def sequence_static(
-        weights_buf,
-        inputs_buf,
-        config_buf,
-        outputs_buf,
-        weights_prods,
-        inputs_prod,
-        outputs_conses,
-    ):
-        input_words = design.INPUT_GROUP_ELEMS // 2
-        l1_words = design.L1_STREAM_BYTES // 4
-        l2_words = design.L2_STREAM_BYTES // 4
-        group_stride_words = design.MAX_WEIGHT_BLOCKS * l2_words
-        l1_lo = 512 if l1_words % 512 == 0 else 256
-        l1_hi = l1_words // l1_lo
-        combined = design.COMPUTES_PER_GROUP * l1_hi
-        outer, inner = _factor_bd(design.MAX_WEIGHT_BLOCKS)
-        outer_in, inner_in = _factor_bd(design.MAX_INPUT_GROUPS)
-
-        tg = iron.TaskGroup()
-        config_tg = iron.TaskGroup()
-        inputs_prod.fill(
-            config_buf,
-            offset=0,
-            sizes=[1, 1, 1, input_words],
-            strides=[input_words, 0, 0, 1],
-            transfer_len=input_words,
-            group=config_tg,
-            wait=True,
-        )
-        config_tg.finish()
-        inputs_prod.fill(
-            inputs_buf,
-            offset=0,
-            sizes=[outer_in, inner_in, 1, input_words],
-            strides=[inner_in * input_words, input_words, 0, 1],
-            transfer_len=inner_in * input_words,
-            group=tg,
-            wait=False,
-        )
-
-        for g in range(design.GROUPS):
-            weights_prods[g].fill(
-                weights_buf,
-                offset=g * group_stride_words,
-                sizes=[outer, inner, combined, l1_lo],
-                strides=[
-                    inner * l2_words,
-                    l2_words,
-                    l1_lo,
-                    1,
-                ],
-                transfer_len=inner * l2_words,
-                group=tg,
-                wait=False,
-            )
-
-        for g in range(design.GROUPS):
-            outputs_conses[g].drain(
-                outputs_buf,
-                offset=g * design.COMPUTES_PER_GROUP * design.COLS_TILE *
-                design.INPUTS_VECS,
-                sizes=[
-                    design.COMPUTES_PER_GROUP,
-                    design.MAX_BANDS_PER_CHUNK,
-                    design.OUTPUT_TILE_ELEMS,
-                ],
-                strides=[
-                    design.COLS_TILE * design.INPUTS_VECS,
-                    design.BAND_COLS * design.INPUTS_VECS,
-                    1,
-                ],
-                transfer_len=design.GROUP_OUTPUTS,
-                group=tg,
-                wait=True,
-            )
-
-        tg.finish()
-
-    def sequence_dynamic(
-        weights_buf,
-        inputs_buf,
-        config_buf,
-        outputs_buf,
-        weights_prods,
-        inputs_prod,
-        outputs_conses,
-        input0,
-        input1,
-        input2,
-        input3,
-        weight0,
-        weight1,
-        group_stride_words,
-    ):
-        i32 = IntegerType.get_signless(32)
-        i64 = IntegerType.get_signless(64)
-
-        def as_i64(value):
-            return arith.extsi(i64, value)
-
-        input_words = design.INPUT_GROUP_ELEMS // 2
-        l1_words = design.L1_STREAM_BYTES // 4
-        l2_words = design.L2_STREAM_BYTES // 4
-        l1_lo = 512 if l1_words % 512 == 0 else 256
-        l1_hi = l1_words // l1_lo
-        combined = design.COMPUTES_PER_GROUP * l1_hi
-        input_step = arith.constant(i32, input_words)
-        weight_step = arith.constant(i32, l2_words)
-
-        tg = iron.TaskGroup()
-        config_tg = iron.TaskGroup()
-        inputs_prod.fill(
-            config_buf,
-            offset=0,
-            sizes=[1, 1, 1, input_words],
-            strides=[input_words, 0, 0, 1],
-            transfer_len=input_words,
-            group=config_tg,
-            wait=True,
-        )
-        config_tg.finish()
-
-        offset = arith.constant(i32, 0)
-        for part in (input0, input1, input2, input3):
-            inputs_prod.fill(
-                inputs_buf,
-                offset=offset,
-                sizes=[as_i64(part), 1, 1, input_words],
-                strides=[input_words, 0, 0, 1],
-                transfer_len=input_words,
-                group=tg,
-                wait=False,
-            )
-            offset = arith.addi(
-                offset, arith.muli(part, input_step)
-            )
-
-        for g in range(design.GROUPS):
-            offset = arith.muli(
-                arith.constant(i32, g), group_stride_words
-            )
-            for part in (weight0, weight1):
-                weights_prods[g].fill(
-                    weights_buf,
-                    offset=offset,
-                    sizes=[as_i64(part), 1, combined, l1_lo],
-                    strides=[l2_words, l2_words, l1_lo, 1],
-                    transfer_len=l2_words,
-                    group=tg,
-                    wait=False,
-                )
-                offset = arith.addi(
-                    offset, arith.muli(part, weight_step)
-                )
-
-        for g in range(design.GROUPS):
-            outputs_conses[g].drain(
-                outputs_buf,
-                offset=g * design.COMPUTES_PER_GROUP * design.COLS_TILE *
-                design.INPUTS_VECS,
-                sizes=[
-                    design.COMPUTES_PER_GROUP,
-                    design.MAX_BANDS_PER_CHUNK,
-                    design.OUTPUT_TILE_ELEMS,
-                ],
-                strides=[
-                    design.COLS_TILE * design.INPUTS_VECS,
-                    design.BAND_COLS * design.INPUTS_VECS,
-                    1,
-                ],
-                transfer_len=design.GROUP_OUTPUTS,
-                group=tg,
-                wait=True,
-            )
-
-        tg.finish()
-
     runtime_args = [
         design.l3_weights_type,
         design.l3_inputs_type,
         design.l3_config_type,
         design.l3_outputs_type,
         [
-            weights_l2[g].prod(tile=shim_tiles[g])
+            fifos.weights_l2[g].prod(tile=shim_tiles[g])
             for g in range(design.GROUPS)
         ],
-        inputs_l2.prod(tile=shim_tiles[0]),
+        fifos.inputs_l2.prod(tile=shim_tiles[0]),
         [
-            outputs_l2[g].cons(tile=shim_tiles[g])
+            fifos.outputs_l2[g].cons(tile=shim_tiles[g])
             for g in range(design.GROUPS)
         ],
     ]
     if dynamic:
         runtime_args += [np.int32] * 7
         rt = Runtime(
-            sequence_dynamic, runtime_args, strict_task_groups=False
+            _sequence_dynamic, runtime_args, strict_task_groups=False
         )
     else:
         rt = Runtime(
-            sequence_static, runtime_args, strict_task_groups=False
+            _sequence_static, runtime_args, strict_task_groups=False
         )
     return Program(NPU2(), rt, workers).resolve_program()
-
 
 @iron.jit(source_files=SOURCE_FILES)
 def program(
@@ -1041,6 +940,7 @@ def program(
     config: In,
     outputs: Out,
 ):
+    """Fixed-max program used by the Python test runner."""
     return _make_program(False)
 
 
@@ -1051,16 +951,8 @@ def dynamic_program(
     config: In,
     outputs: Out,
 ):
+    """Runtime-sized diagnostic program used by ``build.py``."""
     return _make_program(True)
-
-
-@iron.jit(source_files=PRODUCTION_SOURCE_FILES)
-def production_program(
-    weights: In,
-    inputs: In,
-    outputs: Out,
-):
-    return _make_program(False, production=True)
 
 
 @iron.jit(source_files=PRODUCTION_SOURCE_FILES)
@@ -1073,206 +965,7 @@ def production_dynamic_program(
     return _make_program(True, production=True)
 
 
-def run_case(rows_steps, cols_bands, tile_bytes, seed=1,
-             format=design.MODE_TILE_CHECK, soft_cap=0.0, rel=6e-3):
-    if format == design.MODE_TILE_CHECK:
-        case = pack.build_case(rows_steps, cols_bands, tile_bytes, seed)
-    elif format == design.MODE_RAW_CHECK:
-        case = pack.build_case(
-            rows_steps, cols_bands, tile_bytes, seed, format_id=format
-        )
-    elif format == design.FORMAT_Q4_0:
-        case = pack.build_q4_0_case(
-            rows_steps, cols_bands, seed, soft_cap=soft_cap
-        )
-    elif format == design.FORMAT_Q6_K:
-        case = pack.build_q6_k_case(rows_steps, cols_bands, seed)
-    else:
-        raise ValueError(f"unknown format {format}")
-    weights_blocks = case["weights_blocks"]
-    total_tiles = case["total_tiles"]
-    if weights_blocks > design.MAX_WEIGHT_BLOCKS:
-        raise ValueError(
-            f"case needs {weights_blocks} blocks, max is "
-            f"{design.MAX_WEIGHT_BLOCKS}"
-        )
-
-    weights_host = np.zeros(design.MAX_WEIGHT_WORDS, dtype=np.uint32)
-    actual_group_bytes = weights_blocks * design.L2_STREAM_BYTES
-    max_group_bytes = design.MAX_WEIGHT_BLOCKS * design.L2_STREAM_BYTES
-    weights_bytes = weights_host.view(np.uint8).reshape(
-        design.GROUPS, max_group_bytes
-    )
-    weights_bytes[:, :actual_group_bytes] = case["weights"].reshape(
-        design.GROUPS, actual_group_bytes
-    )
-
-    inputs_host = np.zeros(design.MAX_INPUT_WORDS, dtype=np.uint32)
-    inputs_words = inputs_host.view(np.uint16)
-    input_groups = (
-        rows_steps + design.INPUT_GROUP_ROWS - 1
-    ) // design.INPUT_GROUP_ROWS
-    input_objects = input_groups
-    inputs_words[: input_objects * design.INPUT_GROUP_ELEMS] = case[
-        "inputs"
-    ].reshape(-1)
-
-    config_host = np.zeros(design.INPUT_GROUP_ELEMS // 2, dtype=np.uint32)
-    config_host[: design.CONFIG_LEN] = case["config"].view(np.uint32)
-
-    weights_tensor = iron.tensor(weights_host, dtype=np.uint32)
-    inputs_tensor = iron.tensor(inputs_host, dtype=np.uint32)
-    config_tensor = iron.tensor(config_host, dtype=np.uint32)
-    outputs_tensor = iron.zeros(
-        design.MAX_OUTPUT_ELEMS, dtype=bfloat16
-    )
-
-    program(weights_tensor, inputs_tensor, config_tensor, outputs_tensor)
-
-    if format == design.MODE_RAW_CHECK:
-        blocks = weights_blocks
-        expected = (
-            case["weights"]
-            .reshape(
-                design.GROUPS,
-                blocks,
-                design.COMPUTES_PER_GROUP,
-                design.L1_STREAM_BYTES,
-            )
-            .view(np.uint32)
-            .sum(axis=3, dtype=np.uint64)
-            .astype(np.uint32)
-            .transpose(0, 2, 1)
-        )
-        bits = np.asarray(outputs_tensor).view(np.uint16)
-        actual = np.stack(
-            [
-                [
-                    _native_compute_bits(bits, g, c)
-                    for c in range(design.COMPUTES_PER_GROUP)
-                ]
-                for g in range(design.GROUPS)
-            ],
-            axis=0,
-        ).view(np.uint32)[:, :, :blocks]
-        mismatches = int(np.count_nonzero(actual != expected))
-        print(
-            f"raw rows_steps={rows_steps} cols_bands={cols_bands} "
-            f"blocks={blocks} mismatches={mismatches}"
-        )
-        return mismatches == 0
-
-    if format != design.MODE_TILE_CHECK:
-        max_error, max_ratio = _real_error_metrics(
-            np.asarray(outputs_tensor), case["expected"], cols_bands, rel
-        )
-        label = "q4_0" if format == design.FORMAT_Q4_0 else "q6_k"
-        print(
-            f"{label} rows_steps={rows_steps} cols_bands={cols_bands} "
-            f"tile={tile_bytes} blocks={weights_blocks} "
-            f"tiles={total_tiles} max_error={max_error:.6f} "
-            f"worst_tolerance={max_ratio:.3f}"
-        )
-        return max_ratio <= 1.0
-
-    mismatches, first = _noop_mismatches(
-        np.asarray(outputs_tensor),
-        case["expected"],
-        total_tiles,
-        cols_bands,
-    )
-    print(
-        f"rows_steps={rows_steps} cols_bands={cols_bands} "
-        f"tile={tile_bytes} blocks={weights_blocks} "
-        f"tiles={total_tiles} mismatches={mismatches}"
-    )
-    if first:
-        print(f"  first mismatch g,c,t got want: {first}")
-    return mismatches == 0
-
-
-def run_head_chunks(
-    rows_steps=6, total_bands=512, chunk_bands=design.MAX_BANDS_PER_CHUNK
-):
-    """Run the Q6_K output-head shape as disjoint band chunks."""
-    remaining = total_bands
-    chunk = 0
-    status = True
-    while remaining > 0:
-        bands = min(chunk_bands, remaining)
-        print(
-            f"head chunk {chunk}: bands {total_bands - remaining}"
-            f"..{total_bands - remaining + bands}"
-        )
-        status &= run_case(
-            rows_steps,
-            bands,
-            Q6_K_TILE_BYTES,
-            seed=100 + chunk,
-            format=design.FORMAT_Q6_K,
-        )
-        remaining -= bands
-        chunk += 1
-    print(
-        f"head: {chunk} chunks, {total_bands} bands, "
-        f"{total_bands * design.BAND_COLS} columns"
-    )
-    return status
-
-
-def main():
-    if "--head" in sys.argv:
-        return 0 if run_head_chunks() else 1
-
-    noop_cases = [
-        (1, 1, Q4_0_TILE_BYTES),
-        (4, 1, Q4_0_TILE_BYTES),
-        (4, 4, Q4_0_TILE_BYTES),
-        (1, 1, Q6_K_TILE_BYTES),
-        (6, 12, Q6_K_TILE_BYTES),
-        (5, 13, Q6_K_TILE_BYTES),
-        (48, 2, Q4_0_TILE_BYTES),
-        (48, 2, Q6_K_TILE_BYTES),
-        (16, 5, Q6_K_TILE_BYTES),
-    ]
-    q4_0_cases = [
-        (1, 1),
-        (4, 1),
-        (4, 4),
-        (48, 3),
-        (6, 12),
-    ]
-    q6_k_cases = [
-        (1, 1),
-        (6, 12),
-        (6, 24),
-    ]
-    raw_cases = [
-        (1, 1, Q4_0_TILE_BYTES),
-        (4, 4, Q4_0_TILE_BYTES),
-        (6, 12, Q6_K_TILE_BYTES),
-    ]
-
-    status = True
-    for rows_steps, cols_bands, tile_bytes in noop_cases:
-        status &= run_case(rows_steps, cols_bands, tile_bytes)
-    for rows_steps, cols_bands in q4_0_cases:
-        status &= run_case(
-            rows_steps, cols_bands, Q4_0_TILE_BYTES, format=design.FORMAT_Q4_0
-        )
-    for rows_steps, cols_bands in q6_k_cases:
-        status &= run_case(
-            rows_steps, cols_bands, Q6_K_TILE_BYTES, format=design.FORMAT_Q6_K
-        )
-    for rows_steps, cols_bands, tile_bytes in raw_cases:
-        status &= run_case(
-            rows_steps,
-            cols_bands,
-            tile_bytes,
-            format=design.MODE_RAW_CHECK,
-        )
-    return 0 if status else 1
-
-
 if __name__ == "__main__":
+    from tests import main
+
     raise SystemExit(main())
