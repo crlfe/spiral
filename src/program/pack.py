@@ -11,6 +11,8 @@ from design import (
     CFG_COLS_BANDS,
     CFG_FORMAT,
     CFG_ROWS_STEPS,
+    CFG_SOFT_CAP_HI_LO,
+    CFG_SOFT_INV_HI_LO,
     CFG_TILE_BYTES,
     CFG_TOTAL_TILES,
     FORMAT_Q4_0,
@@ -28,6 +30,7 @@ from design import (
     L1_STREAM_BYTES,
     MAX_BANDS_PER_CHUNK,
     MAX_ROWS_STEPS,
+    OUTPUT_ELEMS,
     ROWS_STEP,
     TILES_PER_BAND,
 )
@@ -56,8 +59,28 @@ def _blocks_for(rows_steps, cols_bands, tile_bytes):
     ) // L1_STREAM_BYTES
 
 
+def _bf16_bits(value):
+    return int(np.array([value], dtype=bfloat16).view(np.uint16)[0])
+
+
+def _softcap_words(soft_cap):
+    """Split cap and 1/cap into bf16 hi/lo pairs, packed two per word."""
+    if not soft_cap:
+        return 0, 0
+    cap = np.float32(soft_cap)
+    cap_hi = bfloat16(cap)
+    cap_lo = bfloat16(cap - np.float32(cap_hi))
+    inv = np.float32(1.0) / cap
+    inv_hi = bfloat16(inv)
+    inv_lo = bfloat16(inv - np.float32(inv_hi))
+    cap_word = _bf16_bits(cap_hi) | (_bf16_bits(cap_lo) << 16)
+    inv_word = _bf16_bits(inv_hi) | (_bf16_bits(inv_lo) << 16)
+    return cap_word, inv_word
+
+
 def _make_config(
-    format_id, tile_bytes, rows_steps, cols_bands, weights_blocks, total_tiles
+    format_id, tile_bytes, rows_steps, cols_bands, weights_blocks, total_tiles,
+    soft_cap=0.0,
 ):
     config = np.zeros(CONFIG_LEN, dtype=np.int32)
     config[CFG_FORMAT] = format_id
@@ -66,6 +89,13 @@ def _make_config(
     config[CFG_COLS_BANDS] = cols_bands
     config[CFG_WEIGHTS_BLOCKS] = weights_blocks
     config[CFG_TOTAL_TILES] = total_tiles
+    cap_word, inv_word = _softcap_words(soft_cap)
+    config[CFG_SOFT_CAP_HI_LO] = np.array(
+        [cap_word], dtype=np.uint32
+    ).view(np.int32)[0]
+    config[CFG_SOFT_INV_HI_LO] = np.array(
+        [inv_word], dtype=np.uint32
+    ).view(np.int32)[0]
     return config
 
 
@@ -135,6 +165,10 @@ def build_case(rows_steps, cols_bands, tile_bytes, seed=1,
 
     total_tiles = rows_steps * cols_bands
     weights_blocks = _blocks_for(rows_steps, cols_bands, tile_bytes)
+    # Diagnostic checksums are 32-bit values written into the bf16 output
+    # object, so the tile count must stay within OUTPUT_ELEMS / 2 words.
+    if total_tiles * 2 > OUTPUT_ELEMS:
+        raise ValueError("diagnostic case exceeds the output checksum space")
     config = _make_config(
         format_id, tile_bytes, rows_steps, cols_bands, weights_blocks,
         total_tiles
@@ -203,6 +237,7 @@ def _build_quants_case(
     format_id,
     weights_cols_real=None,
     inputs_matrix=None,
+    soft_cap=0.0,
 ):
     """Build a real quantized case and its NumPy reference.
 
@@ -251,6 +286,7 @@ def _build_quants_case(
         cols_bands,
         weights_blocks,
         total_tiles,
+        soft_cap=soft_cap,
     )
 
     if inputs_matrix is None:
@@ -294,6 +330,11 @@ def _build_quants_case(
         .astype(np.float32)
     )
     expected_full = inputs.astype(np.float32) @ weights_matrix
+    if soft_cap:
+        expected_full = (
+            np.float32(soft_cap)
+            * np.tanh(expected_full / np.float32(soft_cap))
+        )
     expected = np.zeros(
         (
             GROUPS,
@@ -331,11 +372,12 @@ def _build_quants_case(
         "raw": raw,
         "raw_stride": raw_stride,
         "inputs_matrix": inputs,
+        "soft_cap": soft_cap,
     }
 
 
 def build_q4_0_case(
-    rows_steps, cols_bands, seed=1, weights_cols_real=None
+    rows_steps, cols_bands, seed=1, weights_cols_real=None, soft_cap=0.0
 ):
     return _build_quants_case(
         rows_steps,
@@ -344,6 +386,7 @@ def build_q4_0_case(
         "q4_0",
         FORMAT_Q4_0,
         weights_cols_real=weights_cols_real,
+        soft_cap=soft_cap,
     )
 
 

@@ -41,13 +41,19 @@ def _tool(*args):
     )
 
 
+def _build_q4_0_softcap(rows_steps, cols_bands):
+    return pack.build_q4_0_case(rows_steps, cols_bands, soft_cap=30.0)
+
+
 GOLDEN_CASES = (
     ("q4_0_1536x512", pack.build_q4_0_case, 6, 1),
     ("q4_0_1536x2048", pack.build_q4_0_case, 6, 4),
     ("q4_0_1536x4096", pack.build_q4_0_case, 6, 8),
     ("q4_0_1536x6144", pack.build_q4_0_case, 6, 12),
     ("q4_0_1536x12288", pack.build_q4_0_case, 6, 24),
+    ("q4_0_1536x512_sc30", _build_q4_0_softcap, 6, 1),
     ("q4_0_2048x1536", pack.build_q4_0_case, 8, 3),
+    ("q4_0_2048x2048", pack.build_q4_0_case, 8, 4),
     ("q4_0_4096x1536", pack.build_q4_0_case, 16, 3),
     ("q4_0_6144x1536", pack.build_q4_0_case, 24, 3),
     ("q4_0_12288x1536", pack.build_q4_0_case, 48, 3),
@@ -64,6 +70,7 @@ GOLDEN_CASES = (
     ("q6_k_1792x5632", pack.build_q6_k_case, 7, 11),
     ("q6_k_1792x11264", pack.build_q6_k_case, 7, 22),
     ("q6_k_1536x2048", pack.build_q6_k_case, 6, 4),
+    ("q6_k_2048x2048", pack.build_q6_k_case, 8, 4),
     ("q6_k_1536x4096", pack.build_q6_k_case, 6, 8),
     ("q6_k_1536x6144", pack.build_q6_k_case, 6, 12),
 )
@@ -114,6 +121,9 @@ def _emit_design_meta():
         "kCfgTotalTiles": design.CFG_TOTAL_TILES,
         "kCfgInputPad": design.CFG_INPUT_PAD,
         "kCfgWeightPad": design.CFG_WEIGHT_PAD,
+        "kCfgSoftCapHiLo": design.CFG_SOFT_CAP_HI_LO,
+        "kCfgSoftInvHiLo": design.CFG_SOFT_INV_HI_LO,
+        "kConfigLen": design.CONFIG_LEN,
         "kFormatQ4_0": design.FORMAT_Q4_0,
         "kFormatQ6K": design.FORMAT_Q6_K,
         "kModeBase": design.MODE_BASE,
@@ -175,6 +185,11 @@ def _write_golden(golden_dir, name, case, extra_meta=None):
         "raw_bytes": raw.size,
         "inputs_elems": inputs.size,
         "expected_count": expected.size,
+        "soft_cap_bits": int(
+            np.array([case.get("soft_cap", 0.0)], dtype=np.float32).view(
+                np.int32
+            )[0]
+        ),
     }
     if extra_meta:
         meta.update(extra_meta)

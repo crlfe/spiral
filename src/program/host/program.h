@@ -13,6 +13,9 @@ struct MatmulShape {
   int32_t weights_cols = 0;  // multiple of 512
   int32_t inputs_vecs = 4;   // must match the fixed design
   int32_t tile_bytes = 0;    // diagnostic modes only; ignored for quant formats
+  // Optional tanh softcap applied to the tile epilogue: cap * tanh(x / cap).
+  // Zero disables it.  The epilogue is all-bf16 after the f32 accumulator.
+  float soft_cap = 0.0f;
 };
 
 // One weight block used to build a wider prepared tensor.  The segments are
@@ -47,7 +50,7 @@ struct RunTimings {
 struct RunTicket {
   int32_t slot = -1;
   int32_t cols_bands = 0;
-  float* outputs = nullptr;
+  uint16_t* outputs = nullptr;
   int32_t outputs_cols = 0;
   int32_t outputs_col_offset = 0;
   RunTimings timings;
@@ -105,10 +108,11 @@ class Program {
   // Run one matmul with already prepared weights.
   //
   // Inputs are bfloat16 bit patterns in [inputs_vecs][weights_rows] order.
-  // outputs is a float matrix in [inputs_vecs][outputs_cols] order; the result
-  // for this call starts at column `outputs_col_offset`.
+  // outputs is bfloat16 in [inputs_vecs][outputs_cols] order; the result for
+  // this call starts at column `outputs_col_offset`.  The layout matches the
+  // next run's input, so the buffer can be chained without conversion.
   void run(const MatmulShape& shape, const PreparedWeights& weights,
-           const uint16_t* inputs, float* outputs, int32_t outputs_cols,
+           const uint16_t* inputs, uint16_t* outputs, int32_t outputs_cols,
            int32_t outputs_col_offset, RunTimings* timings = nullptr);
 
   // Number of calls that can be in flight at once (>= 1).
@@ -121,7 +125,7 @@ class Program {
   // pipeline_slots() tickets may be outstanding.  `inputs` may be reused as
   // soon as submit() returns; `outputs` is written by finish().
   RunTicket submit(const MatmulShape& shape, const PreparedWeights& weights,
-                   const uint16_t* inputs, float* outputs,
+                   const uint16_t* inputs, uint16_t* outputs,
                    int32_t outputs_cols, int32_t outputs_col_offset);
 
   // Wait for a submitted call, unpack it, and release its slot.
@@ -134,7 +138,7 @@ class Program {
   // of the chunk.
   void run(const MatmulShape& shape, const uint8_t* raw_weights,
            int64_t raw_stride, int32_t weights_col_offset,
-           const uint16_t* inputs, float* outputs, int32_t outputs_cols,
+           const uint16_t* inputs, uint16_t* outputs, int32_t outputs_cols,
            int32_t outputs_col_offset, RunTimings* timings = nullptr);
 
  private:

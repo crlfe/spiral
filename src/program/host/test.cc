@@ -31,6 +31,7 @@ struct Golden {
   size_t raw_bytes = 0;
   size_t inputs_elems = 0;
   size_t expected_count = 0;
+  float soft_cap = 0.0f;
   std::vector<uint8_t> raw;
   std::vector<uint16_t> inputs;
   std::vector<float> expected;
@@ -83,6 +84,11 @@ Golden load_golden(const std::string& name) {
   if (chunk != values.end()) {
     golden.chunk_bands = static_cast<int32_t>(chunk->second);
   }
+  auto soft_cap = values.find("soft_cap_bits");
+  if (soft_cap != values.end()) {
+    const uint32_t bits = static_cast<uint32_t>(soft_cap->second);
+    std::memcpy(&golden.soft_cap, &bits, sizeof(golden.soft_cap));
+  }
   golden.raw_bytes = static_cast<size_t>(values.at("raw_bytes"));
   golden.inputs_elems = static_cast<size_t>(values.at("inputs_elems"));
   golden.expected_count = static_cast<size_t>(values.at("expected_count"));
@@ -107,15 +113,12 @@ bool check_outputs(const std::string& name, const Golden& golden,
     outputs_cols = golden.weights_cols;
   }
 
-  // The device accumulates the K terms in fp32, so the absolute error grows
-  // with K (~1.2e-7 * K mean) and with the column's own output scale.  A fixed
-  // absolute tolerance therefore cannot fit every shape.  Bound each element
-  // against its output column: an absolute floor for near-zero columns plus a
-  // relative term on that column's largest expected magnitude.  This is the
-  // same shape as src/quants/tests/mmul.py; the worst observed ratio across the
-  // golden set is ~0.39.  See NOTES.md, "Golden verification tolerance".
+  // The device now stores the epilogue result as bf16 (for direct chaining),
+  // so the f32 wrapper output is the bf16-rounded value.  bf16 has a 2^-9
+  // half-ulp relative bound, which dominates the fp32 accumulation error.
+  // Keep a per-column policy with enough headroom for the sum of the two.
   constexpr double kAbsFloor = 1e-3;
-  constexpr double kRel = 2e-5;
+  const double kRel = golden.soft_cap != 0.0f ? 5e-2 : 6e-3;
 
   std::vector<double> column_scale(static_cast<size_t>(outputs_cols), 0.0);
   for (int32_t g = 0; g < design::kGroups; ++g) {
@@ -225,16 +228,38 @@ bool check_outputs(const std::string& name, const Golden& golden,
   return ok;
 }
 
+float bf16_bits_to_float(uint16_t bits) {
+  uint32_t wide = static_cast<uint32_t>(bits) << 16;
+  float value;
+  std::memcpy(&value, &wide, sizeof(value));
+  return value;
+}
+
+// The device API is bf16; widen only for the f32 golden comparison so the
+// timed unpack path is the real chaining path.
+bool check_outputs(const std::string& name, const Golden& golden,
+                   const std::vector<uint16_t>& outputs,
+                   int32_t outputs_cols = 0,
+                   int32_t outputs_col_offset = 0) {
+  std::vector<float> widened(outputs.size());
+  for (size_t i = 0; i < outputs.size(); ++i) {
+    widened[i] = bf16_bits_to_float(outputs[i]);
+  }
+  return check_outputs(name, golden, widened, outputs_cols,
+                       outputs_col_offset);
+}
+
 bool run_golden(spiral::Program& program, const std::string& name) {
   Golden golden = load_golden(name);
-  std::vector<float> outputs(
+  std::vector<uint16_t> outputs(
       static_cast<size_t>(design::kInputsVecs) * golden.weights_cols,
-      std::numeric_limits<float>::quiet_NaN());
+      0);
 
   spiral::MatmulShape shape;
   shape.format = golden.format;
   shape.weights_rows = golden.weights_rows;
   shape.weights_cols = golden.weights_cols;
+  shape.soft_cap = golden.soft_cap;
   shape.inputs_vecs = design::kInputsVecs;
   program.run(shape, golden.raw.data(), golden.raw_stride, 0,
               golden.inputs.data(), outputs.data(), golden.weights_cols, 0);
@@ -247,9 +272,9 @@ bool run_head(spiral::Program& program, const std::string& name) {
   if (golden.chunk_bands <= 0) {
     throw std::runtime_error(name + " has no chunk_bands");
   }
-  std::vector<float> outputs(
+  std::vector<uint16_t> outputs(
       static_cast<size_t>(design::kInputsVecs) * golden.weights_cols,
-      std::numeric_limits<float>::quiet_NaN());
+      0);
 
   for (int32_t start = 0; start < golden.cols_bands;
        start += golden.chunk_bands) {
@@ -275,9 +300,9 @@ bool run_head_timing(spiral::Program& program, const std::string& name,
   if (golden.chunk_bands <= 0) {
     throw std::runtime_error(name + " has no chunk_bands");
   }
-  std::vector<float> outputs(
+  std::vector<uint16_t> outputs(
       static_cast<size_t>(design::kInputsVecs) * golden.weights_cols,
-      std::numeric_limits<float>::quiet_NaN());
+      0);
   spiral::RunTimings total;
   int chunks = 0;
   for (int32_t start = 0; start < golden.cols_bands;
@@ -325,14 +350,15 @@ bool run_prepared(spiral::Program& program, const std::string& name) {
   shape.format = golden.format;
   shape.weights_rows = golden.weights_rows;
   shape.weights_cols = golden.weights_cols;
+  shape.soft_cap = golden.soft_cap;
   shape.inputs_vecs = design::kInputsVecs;
 
   auto prepared =
       program.prepare(shape, golden.raw.data(), golden.raw_stride, 0);
   for (int pass = 0; pass < 2; ++pass) {
-    std::vector<float> outputs(
+    std::vector<uint16_t> outputs(
         static_cast<size_t>(design::kInputsVecs) * golden.weights_cols,
-        std::numeric_limits<float>::quiet_NaN());
+        0);
     program.run(shape, prepared, golden.inputs.data(), outputs.data(),
                 golden.weights_cols, 0);
     if (!check_outputs(name + " prepared", golden, outputs)) {
@@ -349,13 +375,14 @@ bool run_timing(spiral::Program& program, const std::string& name,
   shape.format = golden.format;
   shape.weights_rows = golden.weights_rows;
   shape.weights_cols = golden.weights_cols;
+  shape.soft_cap = golden.soft_cap;
   shape.inputs_vecs = design::kInputsVecs;
 
   auto prepared =
       program.prepare(shape, golden.raw.data(), golden.raw_stride, 0);
-  std::vector<float> outputs(
+  std::vector<uint16_t> outputs(
       static_cast<size_t>(design::kInputsVecs) * golden.weights_cols,
-      std::numeric_limits<float>::quiet_NaN());
+      0);
   // Warm up the pipeline and prepared weights before measuring.  Five warm-up
   // passes match the head-timing path; the default measurement is five warm-up
   // runs followed by twenty timed iterations.
@@ -392,6 +419,7 @@ bool run_cold_timing(spiral::Program& program, const std::string& name,
   shape.format = golden.format;
   shape.weights_rows = golden.weights_rows;
   shape.weights_cols = golden.weights_cols;
+  shape.soft_cap = golden.soft_cap;
   shape.inputs_vecs = design::kInputsVecs;
   // Distinct resident BOs so consecutive calls cannot keep the weights hot
   // in the last-level cache.  More than two also exercises IOMMU/TLB spread.
@@ -414,9 +442,9 @@ bool run_cold_timing(spiral::Program& program, const std::string& name,
     prepared.push_back(
         program.prepare(shape, golden.raw.data(), golden.raw_stride, 0));
   }
-  std::vector<float> outputs(
+  std::vector<uint16_t> outputs(
       static_cast<size_t>(design::kInputsVecs) * golden.weights_cols,
-      std::numeric_limits<float>::quiet_NaN());
+      0);
   int gap_us = 0;
   if (const char* env = std::getenv("SPIRAL_COLD_GAP_US")) {
     gap_us = std::atoi(env);
@@ -456,12 +484,13 @@ bool run_steady_timing(spiral::Program& program, const std::string& name,
   shape.format = golden.format;
   shape.weights_rows = golden.weights_rows;
   shape.weights_cols = golden.weights_cols;
+  shape.soft_cap = golden.soft_cap;
   shape.inputs_vecs = design::kInputsVecs;
   auto prepared =
       program.prepare(shape, golden.raw.data(), golden.raw_stride, 0);
-  std::vector<float> outputs(
+  std::vector<uint16_t> outputs(
       static_cast<size_t>(design::kInputsVecs) * golden.weights_cols,
-      std::numeric_limits<float>::quiet_NaN());
+      0);
   // Warm-up run uploads and flushes the prepared weights.
   program.run(shape, prepared, golden.inputs.data(), outputs.data(),
               golden.weights_cols, 0);
@@ -522,9 +551,9 @@ bool run_combined_timing(spiral::Program& program, const std::string& label,
   auto prepared =
       program.prepare(shape, segments.data(),
                       static_cast<int32_t>(segments.size()));
-  std::vector<float> outputs(
+  std::vector<uint16_t> outputs(
       static_cast<size_t>(design::kInputsVecs) * total_cols,
-      std::numeric_limits<float>::quiet_NaN());
+      0);
   program.run(shape, prepared, first.inputs.data(), outputs.data(),
               total_cols, 0);
   spiral::RunTimings total;
@@ -586,9 +615,9 @@ bool run_pipeline_timing(spiral::Program& program, const std::string& name,
                                      golden.raw_stride, chunk.col_offset);
     chunks.push_back(std::move(chunk));
   }
-  std::vector<float> outputs(
+  std::vector<uint16_t> outputs(
       static_cast<size_t>(design::kInputsVecs) * golden.weights_cols,
-      std::numeric_limits<float>::quiet_NaN());
+      0);
   auto pass = [&](double* kernel_sum) {
     std::vector<spiral::RunTicket> pending;
     const int32_t slots = program.pipeline_slots();
@@ -660,13 +689,14 @@ bool run_probe_timing(spiral::Program& program, const std::string& name,
   shape.format = format;
   shape.weights_rows = golden.weights_rows;
   shape.weights_cols = golden.weights_cols;
+  shape.soft_cap = golden.soft_cap;
   shape.inputs_vecs = design::kInputsVecs;
   shape.tile_bytes = golden.tile_bytes;
 
   auto prepared = program.prepare(shape, nullptr, 0, 0);
-  std::vector<float> outputs(
+  std::vector<uint16_t> outputs(
       static_cast<size_t>(design::kInputsVecs) * golden.weights_cols,
-      std::numeric_limits<float>::quiet_NaN());
+      0);
   // Match the real-kernel timing measurement: five warm-up passes.
   for (int i = 0; i < 5; ++i) {
     program.run(shape, prepared, golden.inputs.data(), outputs.data(),

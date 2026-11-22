@@ -36,7 +36,6 @@ INPUT_GROUP_ELEMS = INPUT_GROUP_ROWS * INPUT_ELEMS
 OUTPUT_TILE_ELEMS = INPUTS_VECS * COLS_TILE
 OUTPUT_ELEMS = MAX_BANDS_PER_CHUNK * OUTPUT_TILE_ELEMS
 GROUP_OUTPUTS = COMPUTES_PER_GROUP * OUTPUT_ELEMS
-CONFIG_LEN = 8
 STATE_WORDS = 8
 
 # Format ids follow ggml_type for quant formats.  Values 0xF0-0xFF are
@@ -58,6 +57,11 @@ CFG_WEIGHTS_BLOCKS = 4
 CFG_TOTAL_TILES = 5
 CFG_INPUT_PAD = 6
 CFG_WEIGHT_PAD = 7
+CFG_SOFT_CAP_HI_LO = 8    # two bf16 bits: cap hi, cap lo
+CFG_SOFT_INV_HI_LO = 9    # two bf16 bits: 1/cap hi, 1/cap lo
+
+# Config words are copied as int32; round the object up to a 64-byte line.
+CONFIG_LEN = 16
 
 # State word indices.
 STATE_CARRY_LEN = 0
@@ -77,9 +81,10 @@ l1_inputs_type = np.ndarray[(INPUT_ELEMS,), np.dtype[bfloat16]]
 l1_input_group_type = np.ndarray[
     (INPUT_GROUP_ELEMS,), np.dtype[bfloat16]
 ]
-l1_outputs_type = np.ndarray[(OUTPUT_ELEMS,), np.dtype[np.float32]]
+l1_accum_type = np.ndarray[(OUTPUT_ELEMS,), np.dtype[np.float32]]
+l1_outputs_type = np.ndarray[(OUTPUT_ELEMS,), np.dtype[bfloat16]]
 l2_outputs_type = np.ndarray[
-    (GROUP_OUTPUTS,), np.dtype[np.float32]
+    (GROUP_OUTPUTS,), np.dtype[bfloat16]
 ]
 l1_config_out_type = np.ndarray[(CONFIG_LEN,), np.dtype[np.int32]]
 
@@ -98,5 +103,5 @@ l3_inputs_type = np.ndarray[
     (MAX_INPUT_WORDS,), np.dtype[np.uint32]
 ]
 l3_outputs_type = np.ndarray[
-    (MAX_OUTPUT_ELEMS,), np.dtype[np.float32]
+    (MAX_OUTPUT_ELEMS,), np.dtype[bfloat16]
 ]

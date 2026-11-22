@@ -92,10 +92,26 @@ int32_t tile_bytes(int32_t format) {
              : spiral::quants::q6_k::kPackedTransportTileBytes;
 }
 
+uint16_t float_to_bf16_bits(float value) {
+  uint32_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  const uint32_t lsb = (bits >> 16) & 1u;
+  bits += 0x7fffu + lsb;
+  return static_cast<uint16_t>(bits >> 16);
+}
+
+float bf16_bits_to_float(uint16_t bits) {
+  const uint32_t wide = static_cast<uint32_t>(bits) << 16;
+  float value;
+  std::memcpy(&value, &wide, sizeof(value));
+  return value;
+}
+
 void write_config(uint32_t* buf, int32_t format, int32_t tile_bytes,
                   int32_t rows_steps, int32_t cols_bands,
                   int32_t weights_blocks, int32_t total_tiles,
-                  int32_t input_pad, int32_t weight_pad) {
+                  int32_t input_pad, int32_t weight_pad, float soft_cap) {
+  std::memset(buf, 0, design::kConfigLen * sizeof(uint32_t));
   buf[design::kCfgFormat] = static_cast<uint32_t>(format);
   buf[design::kCfgTileBytes] = static_cast<uint32_t>(tile_bytes);
   buf[design::kCfgRowsSteps] = static_cast<uint32_t>(rows_steps);
@@ -104,6 +120,20 @@ void write_config(uint32_t* buf, int32_t format, int32_t tile_bytes,
   buf[design::kCfgTotalTiles] = static_cast<uint32_t>(total_tiles);
   buf[design::kCfgInputPad] = static_cast<uint32_t>(input_pad);
   buf[design::kCfgWeightPad] = static_cast<uint32_t>(weight_pad);
+  if (soft_cap != 0.0f) {
+    const uint16_t cap_hi = float_to_bf16_bits(soft_cap);
+    const uint16_t cap_lo = float_to_bf16_bits(
+        soft_cap - bf16_bits_to_float(cap_hi));
+    const float inv = 1.0f / soft_cap;
+    const uint16_t inv_hi = float_to_bf16_bits(inv);
+    const uint16_t inv_lo = float_to_bf16_bits(inv - bf16_bits_to_float(inv_hi));
+    buf[design::kCfgSoftCapHiLo] =
+        static_cast<uint32_t>(cap_hi) |
+        (static_cast<uint32_t>(cap_lo) << 16);
+    buf[design::kCfgSoftInvHiLo] =
+        static_cast<uint32_t>(inv_hi) |
+        (static_cast<uint32_t>(inv_lo) << 16);
+  }
 }
 
 // Copy repacked transport tiles into the block-major host layout:
@@ -150,9 +180,10 @@ void fill_inputs(uint32_t* buf, int32_t format, int32_t tile_bytes,
                  int32_t rows_steps, int32_t cols_bands,
                  int32_t weights_blocks, int32_t total_tiles,
                  int32_t input_pad, int32_t weight_pad,
-                 int32_t weights_rows, const uint16_t* inputs) {
+                 int32_t weights_rows, const uint16_t* inputs,
+                 float soft_cap) {
   write_config(buf, format, tile_bytes, rows_steps, cols_bands,
-               weights_blocks, total_tiles, input_pad, weight_pad);
+               weights_blocks, total_tiles, input_pad, weight_pad, soft_cap);
   const int32_t groups =
       (rows_steps + design::kInputGroupRows - 1) /
       design::kInputGroupRows;
@@ -179,11 +210,11 @@ void fill_inputs(uint32_t* buf, int32_t format, int32_t tile_bytes,
   }
 }
 
-// Convert the kernel's [col_half][vec][8 cols] tiles to logical
-// [inputs_vecs][weights_cols] rows.
-void unpack_outputs(const float* raw, float* outputs, int32_t cols_bands,
+// Convert the kernel's [vec][16 cols] bf16 tiles to a logical output matrix.
+// The device tile order is already [inputs_vecs][weights_cols] within a tile,
+// matching the next run's input layout.
+void unpack_outputs(const uint16_t* raw, uint16_t* outputs, int32_t cols_bands,
                     int32_t outputs_cols, int32_t outputs_col_offset) {
-  const int32_t half_cols = design::kColsTile / 2;
   const int32_t compute_stride = design::kOutputElems;
   for (int32_t g = 0; g < design::kGroups; ++g) {
     for (int32_t c = 0; c < design::kComputesPerGroup; ++c) {
@@ -194,18 +225,14 @@ void unpack_outputs(const float* raw, float* outputs, int32_t cols_bands,
         const int32_t col_base =
             band * design::kBandCols +
             (g * design::kComputesPerGroup + c) * design::kColsTile;
-        for (int32_t half = 0; half < 2; ++half) {
-          for (int32_t vec = 0; vec < design::kInputsVecs; ++vec) {
-            for (int32_t col = 0; col < half_cols; ++col) {
-              const int32_t raw_index =
-                  raw_base + half * design::kInputsVecs * half_cols +
-                  vec * half_cols + col;
-              const int32_t col_index =
-                  outputs_col_offset + col_base + half * half_cols + col;
-              outputs[static_cast<int64_t>(vec) * outputs_cols + col_index] =
-                  raw[raw_index];
-            }
-          }
+        for (int32_t vec = 0; vec < design::kInputsVecs; ++vec) {
+          const int32_t raw_index = raw_base + vec * design::kColsTile;
+          const int64_t out_index =
+              static_cast<int64_t>(vec) * outputs_cols +
+              outputs_col_offset + col_base;
+          std::memcpy(outputs + out_index, raw + raw_index,
+                      static_cast<size_t>(design::kColsTile) *
+                          sizeof(uint16_t));
         }
       }
     }
@@ -350,7 +377,8 @@ struct Program::Impl {
                           xrt::bo::flags::cacheable, kernel.group_id(1));
       inputs.emplace_back(loaded.device, design::kInputWords * sizeof(uint32_t),
                           xrt::bo::flags::host_only, kernel.group_id(4));
-      outputs.emplace_back(loaded.device, design::kOutputFloats * sizeof(float),
+      outputs.emplace_back(loaded.device,
+                           design::kOutputFloats * sizeof(uint16_t),
                            xrt::bo::flags::host_only, kernel.group_id(5));
     }
     busy.assign(static_cast<size_t>(depth), false);
@@ -610,7 +638,7 @@ int32_t Program::max_outstanding() const {
 
 RunTicket Program::submit(const MatmulShape& shape,
                           const PreparedWeights& weights,
-                          const uint16_t* inputs, float* outputs,
+                          const uint16_t* inputs, uint16_t* outputs,
                           int32_t outputs_cols, int32_t outputs_col_offset) {
   if (!impl_) {
     throw std::runtime_error("Program is not initialized");
@@ -703,7 +731,7 @@ RunTicket Program::submit(const MatmulShape& shape,
               shape.format, prepared.tile_bytes, prepared.rows_steps,
               prepared.cols_bands, prepared.weights_blocks,
               prepared.total_tiles, prepared.input_pad, prepared.weight_pad,
-              shape.weights_rows, inputs);
+              shape.weights_rows, inputs, shape.soft_cap);
   const int32_t input_groups =
       (prepared.rows_steps + design::kInputGroupRows - 1) /
       design::kInputGroupRows;
@@ -742,8 +770,8 @@ void Program::finish(RunTicket& ticket) {
   timings.kernel_us = timings.start_us + timings.wait_us + timings.sync_us;
 
   stage = Clock::now();
-  unpack_outputs(impl_->outputs[slot].map<const float*>(), ticket.outputs,
-                 ticket.cols_bands, ticket.outputs_cols,
+  unpack_outputs(impl_->outputs[slot].map<const uint16_t*>(),
+                 ticket.outputs, ticket.cols_bands, ticket.outputs_cols,
                  ticket.outputs_col_offset);
   timings.unpack_us = elapsed_us(stage);
   timings.total_us = now_us() - ticket.start_time;
@@ -756,7 +784,7 @@ void Program::finish(RunTicket& ticket) {
 }
 
 void Program::run(const MatmulShape& shape, const PreparedWeights& weights,
-                  const uint16_t* inputs, float* outputs,
+                  const uint16_t* inputs, uint16_t* outputs,
                   int32_t outputs_cols, int32_t outputs_col_offset,
                   RunTimings* timings) {
   RunTicket ticket =
@@ -769,7 +797,7 @@ void Program::run(const MatmulShape& shape, const PreparedWeights& weights,
 
 void Program::run(const MatmulShape& shape, const uint8_t* raw_weights,
                   int64_t raw_stride, int32_t weights_col_offset,
-                  const uint16_t* inputs, float* outputs,
+                  const uint16_t* inputs, uint16_t* outputs,
                   int32_t outputs_cols, int32_t outputs_col_offset,
                   RunTimings* timings) {
   const auto start = Clock::now();

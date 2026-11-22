@@ -32,6 +32,7 @@ from aie.iron import (
 from aie.iron.controlflow import range_
 from aie.iron.controlflow import yield_ as iron_yield
 from aie.iron.device import NPU2, Tile
+from ml_dtypes import bfloat16
 
 PROGRAM_DIR = Path(__file__).resolve().parent
 if str(PROGRAM_DIR) not in sys.path:
@@ -45,6 +46,7 @@ QUANTS_ROOT = PROGRAM_DIR.parent
 CONFIG_SOURCE = KERNEL_DIR / "program_config.aie.cc"
 INIT_SOURCE = KERNEL_DIR / "program_init.aie.cc"
 ZERO_SOURCE = KERNEL_DIR / "program_zero.aie.cc"
+OUTPUT_SOURCE = KERNEL_DIR / "program_output.aie.cc"
 ASSEMBLE_SOURCE = KERNEL_DIR / "program_assemble.aie.cc"
 BLOCK_SOURCE = KERNEL_DIR / "program_block.aie.cc"
 PROBE_SOURCE = KERNEL_DIR / "program_probe.aie.cc"
@@ -80,6 +82,7 @@ SOURCE_FILES = [
     CONFIG_SOURCE,
     INIT_SOURCE,
     ZERO_SOURCE,
+    OUTPUT_SOURCE,
     ASSEMBLE_SOURCE,
     BLOCK_SOURCE,
     PROBE_SOURCE,
@@ -100,6 +103,7 @@ PRODUCTION_SOURCE_FILES = [
     CONFIG_SOURCE,
     INIT_SOURCE,
     ZERO_SOURCE,
+    OUTPUT_SOURCE,
     BLOCK_SOURCE,
     Q4_0_BLOCK_SOURCE,
     Q6_K_BLOCK_SOURCE,
@@ -125,23 +129,22 @@ def _factor_bd(objects):
 
 
 def _unpack_output_tile(raw):
-    """Map the kernel's [col_half][vec][8 cols] tile into [vec][16]."""
-    half = design.COLS_TILE // 2
-    return (
-        raw.reshape(2, design.INPUTS_VECS, half)
-        .transpose(1, 0, 2)
-        .reshape(design.INPUTS_VECS, design.COLS_TILE)
+    """Map the kernel's [vec][16 cols] tile into float [vec][16]."""
+    return np.asarray(raw, dtype=np.float32).reshape(
+        design.INPUTS_VECS, design.COLS_TILE
     )
 
 
-def _real_error_metrics(actual, expected, cols_bands):
+def _real_error_metrics(actual, expected, cols_bands, rel=6e-3):
     """Return (max abs error, worst error / per-column tolerance).
 
     The device accumulates K terms in fp32, so the absolute error grows with
-    K and with the column's output scale.  The pass/fail quantity is the
-    element's error against ``max(1e-3, 2e-5 * column_scale)``, where the
-    column scale is the largest expected magnitude in that output column over
-    the four input vectors.  This mirrors host/test.cc.
+    K and with the column's output scale.  The device also stores the epilogue
+    result as bf16 for direct chaining, which dominates the error.  The
+    pass/fail quantity is the element's error against
+    ``max(1e-3, 6e-3 * column_scale)``, where the column scale is the largest
+    expected magnitude in that output column over the four input vectors.
+    This mirrors host/test.cc.
     """
     max_error = 0.0
     max_ratio = 0.0
@@ -159,7 +162,7 @@ def _real_error_metrics(actual, expected, cols_bands):
                 reference = expected[g, c, band]
                 error = np.abs(tile - reference)
                 column_scale = np.abs(reference).max(axis=0)
-                tolerance = np.maximum(1e-3, 2e-5 * column_scale)
+                tolerance = np.maximum(1e-3, rel * column_scale)
                 max_error = max(max_error, float(error.max()))
                 max_ratio = max(max_ratio, float((error / tolerance).max()))
     return max_error, max_ratio
@@ -168,12 +171,14 @@ def _real_error_metrics(actual, expected, cols_bands):
 def _noop_mismatches(actual, expected, total_tiles):
     mismatches = 0
     first = None
+    # `actual` is a uint32 view of a bf16 output object, so element offsets
+    # are in 32-bit words (two bf16 elements each).
     for g in range(design.GROUPS):
         for c in range(design.COMPUTES_PER_GROUP):
             compute_base = (
                 g * design.GROUP_OUTPUTS
                 + c * design.OUTPUT_ELEMS
-            )
+            ) // 2
             for tile_index in range(total_tiles):
                 got = actual[compute_base + tile_index]
                 want = expected[g, c, tile_index]
@@ -188,6 +193,7 @@ def _make_kernels(production=False):
     config = ExternalFunction(
         "program_config_decode",
         arg_types=[design.l1_input_group_type, design.l1_config_out_type],
+        compile_flags=[f"-DPROGRAM_CONFIG_LEN={design.CONFIG_LEN}"],
         source_file=str(CONFIG_SOURCE),
         inline=False,
     )
@@ -199,8 +205,20 @@ def _make_kernels(production=False):
     )
     zero = ExternalFunction(
         "program_zero",
-        arg_types=[design.l1_outputs_type, np.int32],
+        arg_types=[design.l1_accum_type, np.int32],
         source_file=str(ZERO_SOURCE),
+        inline=False,
+    )
+    output = ExternalFunction(
+        "program_output",
+        arg_types=[
+            design.l1_accum_type,
+            design.l1_outputs_type,
+            np.int32,
+            np.int32,
+            np.int32,
+        ],
+        source_file=str(OUTPUT_SOURCE),
         inline=False,
     )
     assemble = None
@@ -232,7 +250,7 @@ def _make_kernels(production=False):
         design.l1_stream_type,
         design.l1_carry_type,
         design.l1_input_group_type,
-        design.l1_outputs_type,
+        design.l1_accum_type,
         design.l1_state_type,
         np.int32,
         np.int32,
@@ -294,6 +312,7 @@ def _make_kernels(production=False):
         config,
         init,
         zero,
+        output,
         assemble,
         block_begin,
         probe,
@@ -396,6 +415,7 @@ def _make_program(dynamic, production=False):
         config,
         init,
         zero,
+        output,
         assemble,
         block_begin,
         probe,
@@ -404,6 +424,11 @@ def _make_program(dynamic, production=False):
         q6_k_block,
     ) = _make_kernels(production)
 
+    accum_buffers = [
+        Buffer(design.l1_accum_type, name=f"accum_{g}_{c}")
+        for g in range(design.GROUPS)
+        for c in range(design.COMPUTES_PER_GROUP)
+    ]
     carry_buffers = [
         Buffer(design.l1_carry_type, name=f"carry_{g}_{c}")
         for g in range(design.GROUPS)
@@ -427,9 +452,11 @@ def _make_program(dynamic, production=False):
         config_out,
         carry,
         state,
+        accum,
         init,
         decode,
         zero,
+        output,
         block_begin,
         q4_0_block,
         q6_k_block,
@@ -466,7 +493,7 @@ def _make_program(dynamic, production=False):
         def emit_loop():
             outputs_buf = outputs_prod.acquire(1)
             zero(
-                outputs_buf,
+                accum,
                 arith.muli(
                     cols_bands,
                     arith.constant(i32, design.OUTPUT_TILE_ELEMS),
@@ -586,7 +613,7 @@ def _make_program(dynamic, production=False):
                             active_block,
                             carry,
                             active_input,
-                            outputs_buf,
+                            accum,
                             state,
                             tile_bytes,
                             active_limit,
@@ -598,7 +625,7 @@ def _make_program(dynamic, production=False):
                                 active_block,
                                 carry,
                                 active_input,
-                                outputs_buf,
+                                accum,
                                 state,
                                 tile_bytes,
                                 active_limit,
@@ -614,7 +641,7 @@ def _make_program(dynamic, production=False):
                                     active_block,
                                     carry,
                                     active_input,
-                                    outputs_buf,
+                                    accum,
                                     state,
                                     tile_bytes,
                                     active_limit,
@@ -653,6 +680,18 @@ def _make_program(dynamic, production=False):
 
             weights_cons.release(1)
             inputs_cons.release(1)
+            is_real = arith.ori(
+                arith.cmpi(CmpIPredicate.eq, fmt, fmt_q4_i32),
+                arith.cmpi(CmpIPredicate.eq, fmt, fmt_q6_i32),
+            )
+            with if_(is_real):
+                output(
+                    accum,
+                    outputs_buf,
+                    cols_bands,
+                    config_out[design.CFG_SOFT_CAP_HI_LO],
+                    config_out[design.CFG_SOFT_INV_HI_LO],
+                )
             outputs_prod.release(1)
 
         if production:
@@ -723,6 +762,7 @@ def _make_program(dynamic, production=False):
         init,
         config,
         zero,
+        output,
         block_begin,
         q4_0_block,
         q6_k_block,
@@ -740,6 +780,7 @@ def _make_program(dynamic, production=False):
                 config_buffers[g * design.COMPUTES_PER_GROUP + c],
                 carry_buffers[g * design.COMPUTES_PER_GROUP + c],
                 state_buffers[g * design.COMPUTES_PER_GROUP + c],
+                accum_buffers[g * design.COMPUTES_PER_GROUP + c],
                 *worker_kernels,
             ],
             tile=compute_tiles[g][c],
@@ -957,7 +998,7 @@ def production_dynamic_program(
 
 
 def run_case(rows_steps, cols_bands, tile_bytes, seed=1,
-             format=design.MODE_TILE_CHECK):
+             format=design.MODE_TILE_CHECK, soft_cap=0.0, rel=6e-3):
     if format == design.MODE_TILE_CHECK:
         case = pack.build_case(rows_steps, cols_bands, tile_bytes, seed)
     elif format == design.MODE_RAW_CHECK:
@@ -965,7 +1006,9 @@ def run_case(rows_steps, cols_bands, tile_bytes, seed=1,
             rows_steps, cols_bands, tile_bytes, seed, format_id=format
         )
     elif format == design.FORMAT_Q4_0:
-        case = pack.build_q4_0_case(rows_steps, cols_bands, seed)
+        case = pack.build_q4_0_case(
+            rows_steps, cols_bands, seed, soft_cap=soft_cap
+        )
     elif format == design.FORMAT_Q6_K:
         case = pack.build_q6_k_case(rows_steps, cols_bands, seed)
     else:
@@ -1001,7 +1044,7 @@ def run_case(rows_steps, cols_bands, tile_bytes, seed=1,
     weights_tensor = iron.tensor(weights_host, dtype=np.uint32)
     inputs_tensor = iron.tensor(inputs_host, dtype=np.uint32)
     outputs_tensor = iron.zeros(
-        design.MAX_OUTPUT_ELEMS, dtype=np.float32
+        design.MAX_OUTPUT_ELEMS, dtype=bfloat16
     )
 
     program(weights_tensor, inputs_tensor, outputs_tensor)
@@ -1027,8 +1070,8 @@ def run_case(rows_steps, cols_bands, tile_bytes, seed=1,
                 design.GROUPS,
                 design.COMPUTES_PER_GROUP,
                 design.OUTPUT_ELEMS,
-            )[:, :, :blocks]
-            .view(np.uint32)
+            )
+            .view(np.uint32)[:, :, :blocks]
         )
         mismatches = int(np.count_nonzero(actual != expected))
         print(
@@ -1039,7 +1082,7 @@ def run_case(rows_steps, cols_bands, tile_bytes, seed=1,
 
     if format != design.MODE_TILE_CHECK:
         max_error, max_ratio = _real_error_metrics(
-            np.asarray(outputs_tensor), case["expected"], cols_bands
+            np.asarray(outputs_tensor), case["expected"], cols_bands, rel
         )
         label = "q4_0" if format == design.FORMAT_Q4_0 else "q6_k"
         print(
