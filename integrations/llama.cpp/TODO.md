@@ -545,7 +545,7 @@ improve the head).
 
 Profiling is available through:
 
-- `SPIRAL_PROFILE=1`: totals at backend free.
+- `SPIRAL_PROFILE=1`: totals at backend free (includes `fused_softcap=`).
 - `SPIRAL_PROFILE_GRAPH=1`: per-graph wall/CPU/NPU/pack/gather.
 - `SPIRAL_PROFILE_NODES=1`: one line per MUL_MAT with shape and time.
 
@@ -577,9 +577,13 @@ The largest remaining wins are therefore:
 
 1. **Fewer calls** (~19 ms/token of fixed cost): head chunk reduction, and
    cross-gap schemes only with compute-buffer alias safety.
-2. **The softcap on the NPU** (5.1 ms/token): a single-pass
-   `SCALE -> TANH -> SCALE` removes the CPU tanh, worth ~9% at the current
-   token time.
+2. **The softcap on the NPU** (5.1 ms/token): **resolved** — the backend
+   matches `MUL_MAT -> SCALE(1/cap) -> TANH -> SCALE(cap)` and runs the
+   softcap in the bf16 tile epilogue.  `SPIRAL_NO_SOFTCAP_FUSE=1` restores the
+   CPU fallback.  Measured on Gemma 4 E2B Q4_0, 29 decode runs: ~50.4 ms/token
+   fused vs ~53.7 ms unfused (about 3.3 ms/token, 6%); the same 40-token greedy
+   text is produced.  The fused value uses the approximate bf16 vtanh, so the
+   `q4_0_1536x512_sc30` golden keeps its own `5e-2` policy (worst 0.725).
 3. **Streaming rate and the head** (~3 ms at 48 -> 55 GB/s; head ~7 ms).
 4. CPU fallback beyond the softcap is small; do not optimize it first.
 

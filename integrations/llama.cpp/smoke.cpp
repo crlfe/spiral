@@ -35,6 +35,7 @@ struct Golden {
     size_t raw_bytes = 0;
     size_t inputs_elems = 0;
     size_t expected_count = 0;
+    float soft_cap = 0.0f;
     std::vector<uint8_t> raw;
     std::vector<uint16_t> inputs;
     std::vector<float> expected;
@@ -84,6 +85,11 @@ Golden load_golden(const std::string & name) {
     golden.raw_bytes = static_cast<size_t>(values.at("raw_bytes"));
     golden.inputs_elems = static_cast<size_t>(values.at("inputs_elems"));
     golden.expected_count = static_cast<size_t>(values.at("expected_count"));
+    auto soft_cap = values.find("soft_cap_bits");
+    if (soft_cap != values.end()) {
+        const uint32_t bits = static_cast<uint32_t>(soft_cap->second);
+        std::memcpy(&golden.soft_cap, &bits, sizeof(golden.soft_cap));
+    }
 
     golden.raw = read_file(dir + ".raw");
     golden.inputs = read_words<uint16_t>(dir + ".inputs", golden.inputs_elems);
@@ -94,44 +100,75 @@ Golden load_golden(const std::string & name) {
     return golden;
 }
 
+std::vector<float> widen_bf16(const std::vector<uint16_t> & bits) {
+    std::vector<float> out(bits.size());
+    ggml_bf16_to_fp32_row(reinterpret_cast<const ggml_bf16_t *>(bits.data()),
+                          out.data(), static_cast<int64_t>(bits.size()));
+    return out;
+}
+
 double check_outputs(const Golden & golden, const std::vector<float> & outputs) {
-    double max_error = 0.0;
-    for (int32_t g = 0; g < design::kGroups; ++g) {
-        for (int32_t c = 0; c < design::kComputesPerGroup; ++c) {
-            for (int32_t band = 0; band < golden.cols_bands; ++band) {
-                const size_t exp_base =
-                    ((static_cast<size_t>(g) * design::kComputesPerGroup + c) *
-                         golden.cols_bands +
-                     band) *
-                    design::kOutputTileElems;
-                const int32_t col_base =
-                    band * design::kBandCols +
-                    (g * design::kComputesPerGroup + c) * design::kColsTile;
-                for (int32_t half = 0; half < 2; ++half) {
-                    for (int32_t vec = 0; vec < design::kInputsVecs; ++vec) {
-                        for (int32_t col = 0; col < design::kColsTile / 2; ++col) {
-                            const size_t exp_index =
-                                exp_base + vec * design::kColsTile +
-                                half * (design::kColsTile / 2) + col;
-                            const int32_t col_index =
-                                col_base + half * (design::kColsTile / 2) + col;
-                            const float got =
-                                outputs[static_cast<size_t>(vec) *
-                                            golden.weights_cols +
-                                        col_index];
-                            const double diff =
-                                std::fabs(static_cast<double>(got) -
-                                          static_cast<double>(golden.expected[exp_index]));
-                            if (diff > max_error) {
-                                max_error = diff;
+    // bf16 output is the dominant error; use the same per-column bound as
+    // src/program host/test.cc.  Returns the worst error/tolerance ratio.
+    constexpr double kAbsFloor = 1e-3;
+    const double kRel = golden.soft_cap != 0.0f ? 5e-2 : 6e-3;
+    std::vector<double> column_scale(
+        static_cast<size_t>(golden.weights_cols), 0.0);
+
+    auto visit = [&](auto && fn) {
+        for (int32_t g = 0; g < design::kGroups; ++g) {
+            for (int32_t c = 0; c < design::kComputesPerGroup; ++c) {
+                for (int32_t band = 0; band < golden.cols_bands; ++band) {
+                    const size_t exp_base =
+                        ((static_cast<size_t>(g) * design::kComputesPerGroup + c) *
+                             golden.cols_bands +
+                         band) *
+                        design::kOutputTileElems;
+                    const int32_t col_base =
+                        band * design::kBandCols +
+                        (g * design::kComputesPerGroup + c) * design::kColsTile;
+                    for (int32_t half = 0; half < 2; ++half) {
+                        for (int32_t vec = 0; vec < design::kInputsVecs; ++vec) {
+                            for (int32_t col = 0; col < design::kColsTile / 2; ++col) {
+                                const size_t exp_index =
+                                    exp_base + vec * design::kColsTile +
+                                    half * (design::kColsTile / 2) + col;
+                                const int32_t col_index =
+                                    col_base + half * (design::kColsTile / 2) + col;
+                                fn(exp_index, col_index, vec);
                             }
                         }
                     }
                 }
             }
         }
-    }
-    return max_error;
+    };
+
+    visit([&](size_t exp_index, int32_t col_index, int32_t) {
+        const double magnitude =
+            std::fabs(static_cast<double>(golden.expected[exp_index]));
+        auto & scale = column_scale[static_cast<size_t>(col_index)];
+        if (magnitude > scale) {
+            scale = magnitude;
+        }
+    });
+
+    double max_ratio = 0.0;
+    visit([&](size_t exp_index, int32_t col_index, int32_t vec) {
+        const float got =
+            outputs[static_cast<size_t>(vec) * golden.weights_cols + col_index];
+        const double diff =
+            std::fabs(static_cast<double>(got) -
+                      static_cast<double>(golden.expected[exp_index]));
+        const double tolerance =
+            std::max(kAbsFloor,
+                     kRel * column_scale[static_cast<size_t>(col_index)]);
+        const double ratio = diff / tolerance;
+        if (ratio > max_ratio) {
+            max_ratio = ratio;
+        }
+    });
+    return max_ratio;
 }
 
 bool run_case(spiral::Program & program, const std::string & name) {
@@ -142,10 +179,10 @@ bool run_case(spiral::Program & program, const std::string & name) {
     shape.weights_rows = golden.weights_rows;
     shape.weights_cols = golden.weights_cols;
     shape.inputs_vecs = design::kInputsVecs;
+    shape.soft_cap = golden.soft_cap;
 
-    std::vector<float> outputs(
-        static_cast<size_t>(design::kInputsVecs) * golden.weights_cols,
-        std::numeric_limits<float>::quiet_NaN());
+    std::vector<uint16_t> outputs(
+        static_cast<size_t>(design::kInputsVecs) * golden.weights_cols, 0);
 
     const auto start = std::chrono::steady_clock::now();
     program.run(shape, golden.raw.data(), golden.raw_stride, 0,
@@ -154,11 +191,11 @@ bool run_case(spiral::Program & program, const std::string & name) {
     const double elapsed_us =
         std::chrono::duration<double, std::micro>(end - start).count();
 
-    const double max_error = check_outputs(golden, outputs);
-    const double tolerance = golden.format == GGML_TYPE_Q4_0 ? 1e-2 : 2e-2;
-    std::printf("%-22s %8.1f us  max_error %.6f  %s\n", name.c_str(),
-                elapsed_us, max_error, max_error <= tolerance ? "ok" : "FAIL");
-    return max_error <= tolerance;
+    const std::vector<float> widened = widen_bf16(outputs);
+    const double worst = check_outputs(golden, widened);
+    std::printf("%-22s %8.1f us  worst_tolerance %.3f  %s\n", name.c_str(),
+                elapsed_us, worst, worst <= 1.0 ? "ok" : "FAIL");
+    return worst <= 1.0;
 }
 
 bool run_q6_slice_case(const std::string & path) {
@@ -278,6 +315,7 @@ bool run_residency_case(spiral::Program & program) {
         shape.weights_rows = g.weights_rows;
         shape.weights_cols = g.weights_cols;
         shape.inputs_vecs = design::kInputsVecs;
+        shape.soft_cap = g.soft_cap;
         return shape;
     };
     const auto sa = shape_of(a);
@@ -287,17 +325,18 @@ bool run_residency_case(spiral::Program & program) {
 
     auto run_and_check = [&](const Golden & g, const spiral::MatmulShape & shape,
                              const spiral::PreparedWeights & prepared) {
-        std::vector<float> out(static_cast<size_t>(design::kInputsVecs) * g.weights_cols);
+        std::vector<uint16_t> out(static_cast<size_t>(design::kInputsVecs) * g.weights_cols);
         program.run(shape, prepared, g.inputs.data(), out.data(), g.weights_cols, 0);
-        const double err = check_outputs(g, out);
+        const std::vector<float> widened = widen_bf16(out);
+        const double err = check_outputs(g, widened);
         return err;
     };
 
     const double e1 = run_and_check(a, sa, pa);
     const double e2 = run_and_check(b, sb, pb);
     const double e3 = run_and_check(a, sa, pa);
-    const double tolerance_a = 1e-2;
-    const double tolerance_b = 2e-2;
+    const double tolerance_a = 1.0;
+    const double tolerance_b = 1.0;
     const bool ok = e1 <= tolerance_a && e2 <= tolerance_b && e3 <= tolerance_a;
     std::printf("residency path          a %.6f  b %.6f  a-again %.6f  %s\n",
                 e1, e2, e3, ok ? "ok" : "FAIL");
@@ -325,7 +364,15 @@ bool run_buffer_case(const std::string & name, int32_t override_cols = 0) {
 
     ggml_tensor * w = ggml_new_tensor_2d(ctx, weight_type, K, N);
     ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, design::kInputsVecs);
-    ggml_tensor * y = ggml_mul_mat(ctx, w, x);
+    ggml_tensor * mat = ggml_mul_mat(ctx, w, x);
+    ggml_tensor * soft_scale = nullptr;
+    ggml_tensor * soft_tanh = nullptr;
+    ggml_tensor * y = mat;
+    if (golden.soft_cap > 0.0f) {
+        soft_scale = ggml_scale(ctx, mat, 1.0f / golden.soft_cap);
+        soft_tanh = ggml_tanh(ctx, soft_scale);
+        y = ggml_scale(ctx, soft_tanh, golden.soft_cap);
+    }
 
     ggml_backend_buffer_type_t wbuft = ggml_backend_spiral_weights_buffer_type();
     ggml_backend_buffer_t wbuf =
@@ -337,11 +384,28 @@ bool run_buffer_case(const std::string & name, int32_t override_cols = 0) {
     ggml_backend_buffer_t ybuf =
         ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(),
                                        ggml_nbytes(y));
-    if (wbuf == nullptr || xbuf == nullptr || ybuf == nullptr) {
+    ggml_backend_buffer_t s1buf = soft_scale
+        ? ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(),
+                                         ggml_nbytes(soft_scale))
+        : nullptr;
+    ggml_backend_buffer_t tbuf = soft_tanh
+        ? ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(),
+                                         ggml_nbytes(soft_tanh))
+        : nullptr;
+    ggml_backend_buffer_t matbuf = soft_scale
+        ? ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(),
+                                         ggml_nbytes(mat))
+        : nullptr;
+    if (wbuf == nullptr || xbuf == nullptr || ybuf == nullptr ||
+        (soft_scale != nullptr && (s1buf == nullptr || matbuf == nullptr)) ||
+        (soft_tanh != nullptr && tbuf == nullptr)) {
         std::fprintf(stderr, "spiral-smoke: buffer allocation failed\n");
         if (wbuf) ggml_backend_buffer_free(wbuf);
         if (xbuf) ggml_backend_buffer_free(xbuf);
         if (ybuf) ggml_backend_buffer_free(ybuf);
+        if (s1buf) ggml_backend_buffer_free(s1buf);
+        if (tbuf) ggml_backend_buffer_free(tbuf);
+        if (matbuf) ggml_backend_buffer_free(matbuf);
         ggml_free(ctx);
         return false;
     }
@@ -356,11 +420,30 @@ bool run_buffer_case(const std::string & name, int32_t override_cols = 0) {
     ok = ok && ggml_backend_tensor_alloc(ybuf, y,
                                          ggml_backend_buffer_get_base(ybuf)) ==
                    GGML_STATUS_SUCCESS;
+    if (soft_scale != nullptr) {
+        ok = ok && ggml_backend_tensor_alloc(
+                       matbuf, mat,
+                       ggml_backend_buffer_get_base(matbuf)) ==
+                       GGML_STATUS_SUCCESS;
+        ok = ok && ggml_backend_tensor_alloc(
+                       s1buf, soft_scale,
+                       ggml_backend_buffer_get_base(s1buf)) ==
+                       GGML_STATUS_SUCCESS;
+    }
+    if (soft_tanh != nullptr) {
+        ok = ok && ggml_backend_tensor_alloc(
+                       tbuf, soft_tanh,
+                       ggml_backend_buffer_get_base(tbuf)) ==
+                       GGML_STATUS_SUCCESS;
+    }
     if (!ok) {
         std::fprintf(stderr, "spiral-smoke: tensor allocation failed\n");
         ggml_backend_buffer_free(wbuf);
         ggml_backend_buffer_free(xbuf);
         ggml_backend_buffer_free(ybuf);
+        if (s1buf) ggml_backend_buffer_free(s1buf);
+        if (tbuf) ggml_backend_buffer_free(tbuf);
+        if (matbuf) ggml_backend_buffer_free(matbuf);
         ggml_free(ctx);
         return false;
     }
@@ -383,6 +466,9 @@ bool run_buffer_case(const std::string & name, int32_t override_cols = 0) {
         ggml_backend_buffer_free(wbuf);
         ggml_backend_buffer_free(xbuf);
         ggml_backend_buffer_free(ybuf);
+        if (s1buf) ggml_backend_buffer_free(s1buf);
+        if (tbuf) ggml_backend_buffer_free(tbuf);
+        if (matbuf) ggml_backend_buffer_free(matbuf);
         ggml_free(ctx);
         return false;
     }
@@ -401,17 +487,19 @@ bool run_buffer_case(const std::string & name, int32_t override_cols = 0) {
                             static_cast<size_t>(vec) * N,
                         static_cast<size_t>(N) * sizeof(float));
         }
-        const double max_error = check_outputs(golden, outputs);
-        const double tolerance = golden.format == GGML_TYPE_Q4_0 ? 1e-2 : 2e-2;
-        std::printf("%-22s buffer path  max_error %.6f  %s\n", name.c_str(),
-                    max_error, max_error <= tolerance ? "ok" : "FAIL");
-        ok = max_error <= tolerance;
+        const double worst = check_outputs(golden, outputs);
+        std::printf("%-22s buffer path  worst_tolerance %.3f  %s\n",
+                    name.c_str(), worst, worst <= 1.0 ? "ok" : "FAIL");
+        ok = worst <= 1.0;
     }
 
     ggml_backend_free(backend);
     ggml_backend_buffer_free(wbuf);
     ggml_backend_buffer_free(xbuf);
     ggml_backend_buffer_free(ybuf);
+    if (s1buf) ggml_backend_buffer_free(s1buf);
+    if (tbuf) ggml_backend_buffer_free(tbuf);
+    if (matbuf) ggml_backend_buffer_free(matbuf);
     ggml_free(ctx);
     return ok;
 }
@@ -588,6 +676,7 @@ int main(int argc, char ** argv) {
         ok = run_buffer_case("q4_0_1536x512") && ok;
         ok = run_buffer_case("q6_k_512x1536") && ok;
         ok = run_buffer_case("q4_0_1536x256p512", 256) && ok;
+        ok = run_buffer_case("q4_0_1536x512_sc30") && ok;
         ok = run_residency_case(program) && ok;
         ok = run_chain_case() && ok;
         if (run_head) {

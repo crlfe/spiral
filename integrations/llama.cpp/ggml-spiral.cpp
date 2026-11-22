@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -151,7 +152,7 @@ struct ggml_backend_spiral {
     ggml_backend_spiral_device * dev;
     ggml_backend_t cpu = nullptr;
     std::vector<uint16_t> input_staging;
-    std::vector<float> output_staging;
+    std::vector<uint16_t> output_staging;
     std::vector<spiral_weight_chain> weight_chains;
 
     bool profile = false;
@@ -163,6 +164,7 @@ struct ggml_backend_spiral {
     uint64_t stats_cpu_batches = 0;
     uint64_t stats_mul_mats = 0;
     uint64_t stats_chains = 0;
+    uint64_t stats_softcap_fused = 0;
     uint64_t stats_row_chunks = 0;
     uint64_t stats_col_chunks = 0;
     double stats_wall_us = 0.0;
@@ -665,13 +667,18 @@ ggml_backend_spiral_device & spiral_device(ggml_backend_reg_t reg) {
     return device;
 }
 
-bool spiral_run_mul_mat(ggml_backend_spiral * backend, ggml_tensor * node) {
+bool spiral_run_mul_mat(ggml_backend_spiral * backend, ggml_tensor * node,
+                        ggml_tensor * out = nullptr,
+                        float soft_cap = 0.0f) {
     const auto * src0 = node->src[0];
     const auto * src1 = node->src[1];
     if (src0 == nullptr || src1 == nullptr || src0->buffer == nullptr ||
         src0->buffer->buft != &backend->dev->weights_buffer_type.base) {
         GGML_LOG_ERROR("spiral: MUL_MAT %s has no Spiral weight buffer\n", node->name);
         return false;
+    }
+    if (out == nullptr) {
+        out = node;
     }
     auto * weight_buffer =
         static_cast<ggml_backend_spiral_buffer *>(src0->buffer->context);
@@ -690,6 +697,13 @@ bool spiral_run_mul_mat(ggml_backend_spiral * backend, ggml_tensor * node) {
                        node->name, (long long) src1->ne[0], (long long) weights_cols,
                        (long long) rows, (long long) node->ne[0], (long long) node->ne[1],
                        (long long) node->ne[2], (long long) node->ne[3]);
+        return false;
+    }
+    if (out->type != GGML_TYPE_F32 || !ggml_is_contiguous(out) ||
+        out->ne[0] != node->ne[0] || out->ne[1] != node->ne[1] ||
+        out->ne[2] != node->ne[2] || out->ne[3] != node->ne[3]) {
+        GGML_LOG_ERROR("spiral: MUL_MAT %s bad output node %s\n",
+                       node->name, out->name);
         return false;
     }
 
@@ -714,7 +728,7 @@ bool spiral_run_mul_mat(ggml_backend_spiral * backend, ggml_tensor * node) {
     int node_col_chunks = 0;
 
     const auto * x = static_cast<const float *>(src1->data);
-    auto * y = static_cast<float *>(node->data);
+    auto * y = static_cast<float *>(out->data);
 
     struct PendingCall {
         spiral::RunTicket ticket;
@@ -752,11 +766,12 @@ bool spiral_run_mul_mat(ggml_backend_spiral * backend, ggml_tensor * node) {
         if (copy_cols > 0) {
             const double gather_start = spiral_now_us();
             for (int32_t r = 0; r < call.chunk_rows; ++r) {
-                std::memcpy(
+                ggml_bf16_to_fp32_row(
+                    reinterpret_cast<const ggml_bf16_t *>(
+                        backend->output_staging.data() +
+                        static_cast<size_t>(r) * call.chunk_cols),
                     y + (call.first + r) * weights_cols + call.col_start,
-                    backend->output_staging.data() +
-                        static_cast<size_t>(r) * call.chunk_cols,
-                    static_cast<size_t>(copy_cols) * sizeof(float));
+                    copy_cols);
             }
             node_gather_us += spiral_now_us() - gather_start;
         }
@@ -781,6 +796,10 @@ bool spiral_run_mul_mat(ggml_backend_spiral * backend, ggml_tensor * node) {
         for (size_t chunk = 0; chunk < weight_buffer->prepared.size(); ++chunk) {
             const auto & shape = weight_buffer->shapes[chunk];
             const int32_t chunk_cols = shape.weights_cols;
+            spiral::MatmulShape run_shape = shape;
+            if (soft_cap != 0.0f) {
+                run_shape.soft_cap = soft_cap;
+            }
             if (static_cast<int32_t>(pending.size()) >= pipeline_slots) {
                 finish_one();
             }
@@ -790,7 +809,7 @@ bool spiral_run_mul_mat(ggml_backend_spiral * backend, ggml_tensor * node) {
             call.chunk_cols = chunk_cols;
             call.col_start = col_start;
             call.ticket = backend->dev->program->submit(
-                shape, weight_buffer->prepared[chunk],
+                run_shape, weight_buffer->prepared[chunk],
                 backend->input_staging.data(),
                 backend->output_staging.data(), chunk_cols, 0);
             pending.push_back(call);
@@ -1043,12 +1062,12 @@ bool spiral_run_chain(ggml_backend_spiral * backend, ggml_tensor ** nodes,
             const auto * buffer = chain.buffers[i];
             auto * y = static_cast<float *>(nodes[i]->data);
             for (int32_t r = 0; r < call.chunk_rows; ++r) {
-                const float * row =
+                const auto * row = reinterpret_cast<const ggml_bf16_t *>(
                     backend->output_staging.data() +
-                    static_cast<size_t>(r) * chain.padded_cols + col_offset;
-                std::memcpy(y + (call.first + r) * buffer->weights_cols, row,
-                            static_cast<size_t>(buffer->weights_cols) *
-                                sizeof(float));
+                    static_cast<size_t>(r) * chain.padded_cols + col_offset);
+                ggml_bf16_to_fp32_row(
+                    row, y + (call.first + r) * buffer->weights_cols,
+                    buffer->weights_cols);
             }
             col_offset += buffer->padded_cols;
         }
@@ -1122,6 +1141,81 @@ ggml_cgraph spiral_graph_view(ggml_cgraph * cgraph, int i0, int i1) {
     view.grads = nullptr;
     view.grad_accs = nullptr;
     return view;
+}
+
+// Match MUL_MAT -> SCALE(1/cap) -> UNARY(TANH) -> SCALE(cap), the final-logit
+// softcap emitted by the Gemma-family graphs.  Only fuse when every
+// intermediate has a single consumer and the two scales are reciprocal; a
+// different pre-scale (Grok's attention multiplier) deliberately falls back.
+bool spiral_softcap_pattern(const ggml_cgraph * cgraph, int32_t i, float * cap) {
+    if (i + 3 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * mm = cgraph->nodes[i];
+    const ggml_tensor * s1 = cgraph->nodes[i + 1];
+    const ggml_tensor * t  = cgraph->nodes[i + 2];
+    const ggml_tensor * s2 = cgraph->nodes[i + 3];
+    if (mm->op != GGML_OP_MUL_MAT || mm->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (s1->op != GGML_OP_SCALE || s1->src[0] != mm || s1->src[1] != nullptr) {
+        return false;
+    }
+    if (t->op != GGML_OP_UNARY || ggml_get_unary_op(t) != GGML_UNARY_OP_TANH ||
+        t->src[0] != s1 || t->src[1] != nullptr) {
+        return false;
+    }
+    if (s2->op != GGML_OP_SCALE || s2->src[0] != t || s2->src[1] != nullptr) {
+        return false;
+    }
+    if (s1->type != GGML_TYPE_F32 || t->type != GGML_TYPE_F32 ||
+        s2->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_is_contiguous(s1) || !ggml_is_contiguous(t) ||
+        !ggml_is_contiguous(s2)) {
+        return false;
+    }
+    if (s1->view_src != nullptr || t->view_src != nullptr ||
+        s2->view_src != nullptr) {
+        return false;
+    }
+    for (int32_t d = 0; d < GGML_MAX_DIMS; ++d) {
+        if (s1->ne[d] != mm->ne[d] || t->ne[d] != mm->ne[d] ||
+            s2->ne[d] != mm->ne[d]) {
+            return false;
+        }
+    }
+
+    float p1[2] = {};
+    float p2[2] = {};
+    std::memcpy(p1, s1->op_params, sizeof(p1));
+    std::memcpy(p2, s2->op_params, sizeof(p2));
+    if (p1[1] != 0.0f || p2[1] != 0.0f) {
+        return false;
+    }
+    if (!(p2[0] > 0.0f) || std::fabs(p1[0] * p2[0] - 1.0f) > 1e-3f) {
+        return false;
+    }
+
+    for (int32_t j = 0; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        for (int32_t k = 0; k < GGML_MAX_SRC; ++k) {
+            const ggml_tensor * src = n->src[k];
+            if (src == mm && n != s1) {
+                return false;
+            }
+            if (src == s1 && n != t) {
+                return false;
+            }
+            if (src == t && n != s2) {
+                return false;
+            }
+        }
+    }
+
+    *cap = p2[0];
+    return true;
 }
 
 enum ggml_status spiral_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
@@ -1303,11 +1397,12 @@ enum ggml_status spiral_graph_compute(ggml_backend_t backend, ggml_cgraph * cgra
             self->stats_npu_us += node_us;
             auto * y = static_cast<float *>(node->data);
             for (int32_t r = 0; r < call.chunk_rows; ++r) {
-                std::memcpy(
-                    y + static_cast<int64_t>(r) * call.weights_cols,
+                const auto * row = reinterpret_cast<const ggml_bf16_t *>(
                     self->output_staging.data() +
-                        static_cast<size_t>(r) * call.ticket.outputs_cols,
-                    static_cast<size_t>(call.weights_cols) * sizeof(float));
+                    static_cast<size_t>(r) * call.ticket.outputs_cols);
+                ggml_bf16_to_fp32_row(
+                    row, y + static_cast<int64_t>(r) * call.weights_cols,
+                    call.weights_cols);
             }
             if (self->profile_nodes) {
                 GGML_LOG_INFO(
@@ -1327,6 +1422,18 @@ enum ggml_status spiral_graph_compute(ggml_backend_t backend, ggml_cgraph * cgra
         }
 
         if (spiral_supports_mul_mat(self->dev, node)) {
+            static const bool softcap_fuse =
+                std::getenv("SPIRAL_NO_SOFTCAP_FUSE") == nullptr;
+            float soft_cap = 0.0f;
+            if (softcap_fuse && spiral_softcap_pattern(cgraph, i, &soft_cap)) {
+                if (!spiral_run_mul_mat(self, node, cgraph->nodes[i + 3],
+                                        soft_cap)) {
+                    return GGML_STATUS_FAILED;
+                }
+                self->stats_softcap_fused++;
+                i += 4;
+                continue;
+            }
             const int32_t remaining = cgraph->n_nodes - i;
             const int32_t length = spiral_chain_length(
                 self->dev, cgraph->nodes + i,
@@ -1417,11 +1524,12 @@ enum ggml_status spiral_graph_compute(ggml_backend_t backend, ggml_cgraph * cgra
                               timings.kernel_us + timings.unpack_us;
         auto * y = static_cast<float *>(call.node->data);
         for (int32_t r = 0; r < call.chunk_rows; ++r) {
-            std::memcpy(
-                y + static_cast<int64_t>(r) * call.weights_cols,
+            const auto * row = reinterpret_cast<const ggml_bf16_t *>(
                 self->output_staging.data() +
-                    static_cast<size_t>(r) * call.ticket.outputs_cols,
-                static_cast<size_t>(call.weights_cols) * sizeof(float));
+                static_cast<size_t>(r) * call.ticket.outputs_cols);
+            ggml_bf16_to_fp32_row(
+                row, y + static_cast<int64_t>(r) * call.weights_cols,
+                call.weights_cols);
         }
     }
     deferred.clear();
@@ -1451,7 +1559,7 @@ void spiral_backend_free(ggml_backend_t backend) {
         GGML_LOG_INFO(
             "spiral profile: graphs=%llu wall=%.3f ms\n"
             "  cpu fallback: %.3f ms  nodes=%llu batches=%llu\n"
-            "  npu mulmat:   %.3f ms  calls=%llu chains=%llu row_chunks=%llu col_chunks=%llu max_slots=%d\n"
+            "  npu mulmat:   %.3f ms  calls=%llu chains=%llu fused_softcap=%llu row_chunks=%llu col_chunks=%llu max_slots=%d\n"
             "  npu stages:   txn=%.3f input=%.3f kernel=%.3f unpack=%.3f ms\n"
             "  host:         pack=%.3f gather=%.3f ms\n"
             "  weight prep:  %.3f ms  tensors=%llu\n",
@@ -1463,6 +1571,7 @@ void spiral_backend_free(ggml_backend_t backend) {
             self->stats_npu_us / 1000.0,
             (unsigned long long) self->stats_mul_mats,
             (unsigned long long) self->stats_chains,
+            (unsigned long long) self->stats_softcap_fused,
             (unsigned long long) self->stats_row_chunks,
             (unsigned long long) self->stats_col_chunks,
             self->dev->program ? self->dev->program->max_outstanding() : 0,

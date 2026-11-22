@@ -10,6 +10,16 @@ Read [`TODO.md`](TODO.md) for the backend's design notes, measurements, build
 recipes and rejected experiments; [`../../src/program/NOTES.md`](../../src/program/NOTES.md)
 covers the device program itself.
 
+## Softcap fusion
+
+The backend recognizes the final-logit chain
+`MUL_MAT -> SCALE(1/cap) -> TANH -> SCALE(cap)` and applies it in the bf16 tile
+epilogue instead of the CPU fallback.  The matcher requires reciprocal scales,
+zero bias, a single consumer for each intermediate, and a contiguous F32 final
+node.  `SPIRAL_NO_SOFTCAP_FUSE=1` disables it for A/B or fallback.  The fused
+result uses the approximate bf16 vtanh; `spiral-smoke` includes the
+`q4_0_1536x512_sc30` case with the `5e-2` softcap verification policy.
+
 ## Layout
 
 ```
