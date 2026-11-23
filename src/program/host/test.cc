@@ -249,6 +249,12 @@ bool check_outputs(const std::string& name, const Golden& golden,
                        outputs_col_offset);
 }
 
+void set_epilogue(spiral::MatmulShape& shape, float soft_cap) {
+  shape.soft_cap = soft_cap;
+  shape.epilogue = soft_cap != 0.0f ? spiral::kEpilogueSoftcap
+                                   : spiral::kEpilogueNone;
+}
+
 bool run_golden(spiral::Program& program, const std::string& name) {
   Golden golden = load_golden(name);
   std::vector<uint16_t> outputs(
@@ -259,7 +265,7 @@ bool run_golden(spiral::Program& program, const std::string& name) {
   shape.format = golden.format;
   shape.weights_rows = golden.weights_rows;
   shape.weights_cols = golden.weights_cols;
-  shape.soft_cap = golden.soft_cap;
+  set_epilogue(shape, golden.soft_cap);
   shape.inputs_vecs = design::kInputsVecs;
   program.run(shape, golden.raw.data(), golden.raw_stride, 0,
               golden.inputs.data(), outputs.data(), golden.weights_cols, 0);
@@ -350,7 +356,7 @@ bool run_prepared(spiral::Program& program, const std::string& name) {
   shape.format = golden.format;
   shape.weights_rows = golden.weights_rows;
   shape.weights_cols = golden.weights_cols;
-  shape.soft_cap = golden.soft_cap;
+  set_epilogue(shape, golden.soft_cap);
   shape.inputs_vecs = design::kInputsVecs;
 
   auto prepared =
@@ -375,7 +381,7 @@ bool run_timing(spiral::Program& program, const std::string& name,
   shape.format = golden.format;
   shape.weights_rows = golden.weights_rows;
   shape.weights_cols = golden.weights_cols;
-  shape.soft_cap = golden.soft_cap;
+  set_epilogue(shape, golden.soft_cap);
   shape.inputs_vecs = design::kInputsVecs;
 
   auto prepared =
@@ -419,7 +425,7 @@ bool run_cold_timing(spiral::Program& program, const std::string& name,
   shape.format = golden.format;
   shape.weights_rows = golden.weights_rows;
   shape.weights_cols = golden.weights_cols;
-  shape.soft_cap = golden.soft_cap;
+  set_epilogue(shape, golden.soft_cap);
   shape.inputs_vecs = design::kInputsVecs;
   // Distinct resident BOs so consecutive calls cannot keep the weights hot
   // in the last-level cache.  More than two also exercises IOMMU/TLB spread.
@@ -484,7 +490,7 @@ bool run_steady_timing(spiral::Program& program, const std::string& name,
   shape.format = golden.format;
   shape.weights_rows = golden.weights_rows;
   shape.weights_cols = golden.weights_cols;
-  shape.soft_cap = golden.soft_cap;
+  set_epilogue(shape, golden.soft_cap);
   shape.inputs_vecs = design::kInputsVecs;
   auto prepared =
       program.prepare(shape, golden.raw.data(), golden.raw_stride, 0);
@@ -689,7 +695,7 @@ bool run_probe_timing(spiral::Program& program, const std::string& name,
   shape.format = format;
   shape.weights_rows = golden.weights_rows;
   shape.weights_cols = golden.weights_cols;
-  shape.soft_cap = golden.soft_cap;
+  set_epilogue(shape, golden.soft_cap);
   shape.inputs_vecs = design::kInputsVecs;
   shape.tile_bytes = golden.tile_bytes;
 

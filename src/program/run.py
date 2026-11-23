@@ -221,10 +221,14 @@ def _make_kernels(production=False):
             np.int32,
             np.int32,
             np.int32,
+            np.int32,
         ],
         compile_flags=[
             f"-DPROGRAM_OUTPUT_TILE_ELEMS={design.OUTPUT_TILE_ELEMS}",
             f"-DPROGRAM_COLS_TILE={design.COLS_TILE}",
+            f"-DPROGRAM_EPILOGUE_NONE={design.EPILOGUE_NONE}",
+            f"-DPROGRAM_EPILOGUE_SOFTCAP={design.EPILOGUE_SOFTCAP}",
+            f"-DPROGRAM_EPILOGUE_GEGLU={design.EPILOGUE_GEGLU}",
         ],
         source_file=str(OUTPUT_SOURCE),
         inline=False,
@@ -800,6 +804,7 @@ def _make_program(dynamic, production=False):
                     cols_bands,
                     config_out[design.CFG_SOFT_CAP_HI_LO],
                     config_out[design.CFG_SOFT_INV_HI_LO],
+                    config_out[design.CFG_EPILOGUE],
                 )
             else:
                 is_real = arith.ori(
@@ -813,6 +818,7 @@ def _make_program(dynamic, production=False):
                         cols_bands,
                         config_out[design.CFG_SOFT_CAP_HI_LO],
                         config_out[design.CFG_SOFT_INV_HI_LO],
+                        config_out[design.CFG_EPILOGUE],
                     )
             outputs_prod.release(1)
 

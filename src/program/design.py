@@ -60,6 +60,14 @@ CFG_INPUT_PAD = 6
 CFG_WEIGHT_PAD = 7
 CFG_SOFT_CAP_HI_LO = 8    # two bf16 bits: cap hi, cap lo
 CFG_SOFT_INV_HI_LO = 9    # two bf16 bits: 1/cap hi, 1/cap lo
+CFG_EPILOGUE = 10         # EPILOGUE_* selector
+
+# Tile epilogue selector.  The value is a single exclusive kind; a separate
+# flags word will be added when layout-preserving modifiers (scale/add/clamp)
+# gain their operands.
+EPILOGUE_NONE = 0
+EPILOGUE_SOFTCAP = 1
+EPILOGUE_GEGLU = 2
 
 # Config words are copied as int32; round the object up to a 64-byte line.
 CONFIG_LEN = 16

@@ -799,6 +799,7 @@ bool spiral_run_mul_mat(ggml_backend_spiral * backend, ggml_tensor * node,
             spiral::MatmulShape run_shape = shape;
             if (soft_cap != 0.0f) {
                 run_shape.soft_cap = soft_cap;
+                run_shape.epilogue = spiral::kEpilogueSoftcap;
             }
             if (static_cast<int32_t>(pending.size()) >= pipeline_slots) {
                 finish_one();

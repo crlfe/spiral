@@ -125,6 +125,25 @@ over peak bandwidth.
       ~95 us; the device job lifecycle is at most ~2.6 ms.
 - [x] `tests/poc/iter_args.py` device regression for carried memrefs and
       conditional acquire/release.
+- [x] GEGLU tile epilogue (`CFG_EPILOGUE=2`) with an explicit exclusive kind:
+      0 = none, 1 = softcap (using the cap words), 2 = GEGLU.  A two-segment
+      gate+up call pairs accumulator bands, computes `gelu(gate) * up` in bf16
+      (AIE2P emulates f32 vector math with bf16 products, so f32 was 4x the
+      code for no accuracy gain), and stores the gate bands in place so the
+      down matmul reads the packed activation at output offset 0.
+      `program_output` 688 -> 1360 B, core `.text` 11872 -> 12544 B (77% of
+      16 KiB), no stack frame.  `tests/poc/txn_concat` chains
+      `q4_0_1536x12288` gate+up into `q4_0_6144x1536`: 385.8 vs 454.7 us
+      (1.18x), intermediate 5.3e-3 and final 5.5e-3 global relative vs the
+      host-GELU two-launch path, and the epilogue is below the run noise
+      (interleaved none/GEGLU).  Production `Program::run` validates two
+      equal-width segments, even bands, and no softcap, and unpacks the gate
+      half for a standalone call.  The `sc30` softcap golden and the llama.cpp
+      Gemma run (`fused_softcap=21`, `The capital of France is Paris.`) pass
+      with the explicit kinds.
+- [ ] Production FFN chain: backend matcher for `gate+up -> GLU -> down` and
+      the `Program` chain API.  The device link above works in the prototype;
+      the backend still issues separate calls.
 
 ## Active
 
@@ -201,6 +220,91 @@ over peak bandwidth.
    the NPU path is closer to competitive, ideally at a 50/50 split on a much
    larger model.  The per-call, per-tensor interface is kept for that.
 
+## Chain length: TXN concatenation and overlays
+
+Launch consolidation is no longer an open design question.  `tests/poc/txn_concat`
+builds multiple fixed-program matmuls into one TXN and chains each output into
+the next input; `tests/poc/overlay.md` shows the program-memory tail can be
+swapped or broadcast while the cores run.  The optimization metric is **ops per
+TXN and host boundaries per token**, not launches per token.
+
+- **Dispatch floor:** an empty TXN is ~44 us on XRT; N matmuls in one TXN pay
+  it once.  A 286-op token-shaped matmul stream runs in **29.7 ms** in one
+  command versus 55.8 ms per-call (memory bound 25.1 ms).
+- **Layout:** the native output drain already emits `[N/8][vec][8]`, which is
+  the next matmul's packed input, so an identity chain is bit-identical and
+  needs no pack kernel.
+- **Activation:** the GEGLU epilogue is the first non-identity link (see the
+  Done entry).  It needs no patch-policy change: op0 uses the epilogue mode,
+  op1 uses `input_from_output`.
+- **Program memory:** the GEGLU epilogue brings production `.text` to 14144 B
+  (86% of 16 KiB); later stages belong in the overlay tail or a split image.
+
+### What still breaks a token chain
+
+A measured Gemma 4 E2B Q4_0 decode graph is 268 dispatches, 234 host spans,
+and 1202 CPU nodes between them.  The host ops that force a boundary:
+
+| host op | count | why it cannot stay on the host |
+| :-- | --: | :-- |
+| `GLU` (GEGLU) | 34 | feeds `ffn_down`; **now an epilogue link** |
+| `RMS_NORM` + `MUL` | 235 | feeds the next matmul |
+| `FLASH_ATTN_EXT` | 34 | only remaining real compute island |
+| `ROPE` | 48 | between Q/K norm and attention |
+| `VIEW`/`PERMUTE`/`RESHAPE` | 367 | attention layout; needs a layout decision |
+| `SET_ROWS`/`GET_ROWS` | 28/24 | KV append and per-layer embedding rows |
+| Q6_K head | 11 links | already in-stream; throughput only |
+
+Reproduce with `SPIRAL_PROFILE_CPU=1 SPIRAL_PROFILE_NODES=1` and `-v` on
+`llama-completion`; the backend logs at INFO, which the default log level hides.
+
+### Links to add, in dependency order
+
+- [x] **GEGLU epilogue** (Done entry above): the FFN activation link.
+- [ ] **RMS norm** with the norm weight folded in.  The hidden width is 1536,
+  and every compute sees the full activation (it needs all K for its own
+  columns), so the reduction can be replicated per compute; no cross-group
+  barrier.  Pre-norm reads the residual, post-norm reads the distributed down
+  output (32 x 3 KiB redundant reads per block) and adds the graph's second
+  operand, which in Gemma is `pe_in`, not the residual.
+- [ ] **RoPE** for Q/K, after the QK norm.
+- [ ] **KV append + attention as one link.**  Cache in host DDR, stable
+  addresses in the token TXN; context length, GQA, and sliding window as config
+  words.  Reuse the mlir-aie `llama_3_2_1b` patterns.
+- [ ] **Hoist token-start gathers** into the input BO (token row, 24 per-layer
+  rows, F16 `per_layer_model_proj`).  Keep sampling host-side; it is the
+  natural TXN boundary.
+- [ ] **Production FFN chain:** backend matcher for `gate+up -> GLU -> down`
+  and a `Program` chain API (the prototype has the mechanics).
+- [ ] **Head throughput only:** the 11 chunks are already in-stream; the
+  one-launch expansion is a streaming optimization.
+
+### Chain-length milestones
+
+| state | NPU commands/token | host boundaries | needs |
+| :-- | --: | --: | :-- |
+| today (per-call) | 268 | 234 | - |
+| concat probe (measured) | 1 | 1 | concat, real weights, no glue |
+| FFN block (gate+up+down) | ~233 | ~199 | GEGLU link (done), chain API |
+| whole layer | ~35 | ~35 | norms, RoPE, attention |
+| whole token | 1 | prologue + sampling | all links, gathers hoisted |
+
+- [ ] Record commands/token, ops per command, host boundaries, wall, kernel
+  time, instruction bytes, and the per-stage numeric policy for every
+  milestone, with the temperature/fan context from `NOTES.md`.
+
+### New risks
+
+- **Per-stage numerics.** Chained bf16 intermediates need an oracle and a
+  tolerance; GEGLU shows ~5e-3 global relative from the bf16 vtanh alone.
+- **Instruction/config growth.** 1.10 MB at 286 ops is in the good region;
+  per-copy cost regresses above ~1 MB and each link adds 8 KiB of config.
+- **Cross-compute ordering** is provided by the TXN's TCT waits, not a lock;
+  verify any stage that reads data written by other computes (post-norm,
+  attention).
+- **Attention adds array compute** the 29.7 ms zero-data simulation did not
+  include.
+
 ## Open risks
 
 - **Hangs**: almost always a mismatch between configured counts, host
@@ -223,9 +327,13 @@ over peak bandwidth.
   to 512, roughly doubling those columns' work.
 - **Head overhead**: the Q6_K head is 11 band chunks, up to 48 bands each
   (120 blocks maximum; the last chunk is 32 bands).
-- **Program memory**: diagnostic build is 14880 bytes per core (91% of
-  16 KiB); production is 11872 bytes (73%).  Recheck after adding code to a
-  kernel; full attempt-loop unroll already overflows.
+- **Program memory**: production `.text` is now 12544 bytes (77% of 16 KiB)
+  after the GEGLU epilogue; `program_output` alone is 1360 B with no stack
+  frame, leaving ~3.9 KiB of resident headroom.  Put later activation/norm
+  stages in the overlay tail or split them; recheck with `objdump -h` on
+  `program_output.o` and the core ELF.  Keep vector activation math in bf16:
+  AIE2P emulates f32 vector arithmetic with several bf16 products and
+  conversions, and the f32 GELU was 4x the code for the same final error.
 - **Buffer sizing**: the host weight BO is 32 MiB at 128 blocks; the host
   canonical packed tensor can be ~333 MB for the Q6_K head.
 

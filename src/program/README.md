@@ -108,6 +108,7 @@ shape.weights_rows = 1536; // multiple of 256
 shape.weights_cols = 2048; // multiple of 512; max 48 bands per call
 shape.inputs_vecs = 4;     // must match the fixed design
 shape.soft_cap = 0.0f;    // optional tanh softcap; 0 disables it
+shape.epilogue = spiral::kEpilogueNone;  // or kEpilogueSoftcap / kEpilogueGeglu
 
 std::vector<uint16_t> outputs(4 * shape.weights_cols);
 program.run(shape,
@@ -129,10 +130,24 @@ program.run(shape, prepared, inputs, outputs.data(),
 ```
 
 The epilogue transposes the native mmul tile and writes bf16 with
-round-to-nearest-even.  With `soft_cap != 0` it applies
-`cap * tanh(x / cap)` using the native bf16 vtanh; the host passes `cap` and
-`1/cap` as bf16 hi/lo pairs so the device has no division.  That is an
-approximate, named reduced-precision mode.
+round-to-nearest-even.  `shape.epilogue` selects the kind: `kEpilogueNone`
+(plain bf16), `kEpilogueSoftcap` (`cap * tanh(x / cap)` using `shape.soft_cap`
+and the native bf16 vtanh), or `kEpilogueGeglu`.  The softcap host passes `cap`
+and `1/cap` as bf16 hi/lo pairs so the device has no division; it is an
+approximate, named reduced-precision mode.  The kinds are exclusive:
+`kEpilogueSoftcap` requires a nonzero `soft_cap`, and the other kinds require
+zero.
+
+`shape.epilogue = spiral::kEpilogueGeglu` selects the gate+up activation for a
+two-segment `prepare`: the first half of `weights_cols` is the gate and the
+second half is up.  The epilogue narrows both to bf16 (the native AIE2P vector
+width) and computes `gelu(gate) * up` with the native bf16 vtanh, then stores
+the gate bands.  The output is `[4][weights_cols / 2]` (the gate half); the
+call requires exactly two equal-width segments, an even number of bands, and
+`soft_cap == 0`.  In a chained TXN the gate half is the down matmul's packed
+input at output offset 0, so no host pack is needed.  The activation is
+approximate: see `NOTES.md` under "GEGLU epilogue" for the measured error and
+tolerance.
 
 Repack once and reuse the weights across calls:
 

@@ -120,6 +120,7 @@ are used.  It is copied into a per-compute buffer and decoded by the worker.
 | 7 | `weight_pad` (extra weight blocks drained by the dynamic path) |
 | 8 | softcap hi/lo: two bf16 bits (`cap_hi | cap_lo << 16`); 0 disables |
 | 9 | softcap reciprocal hi/lo: two bf16 bits (`inv_hi | inv_lo << 16`) |
+| 10 | tile epilogue kind: 0 = none, 1 = softcap (words 8-9), 2 = GEGLU pair |
 
 `weights_blocks` covers the whole continuous stream:
 `ceil(total_tiles * tile_bytes / 8192)`.  Padding exists only for the final
@@ -128,6 +129,17 @@ partial block.
 The host splits `cap` and `1/cap` into bf16 hi/lo pairs; the epilogue adds
 `hi + lo` back in f32.  This removes the device division while keeping about
 16 bits of reciprocal precision.
+
+GEGLU is for a two-segment gate+up call: `cols_bands` covers the combined
+width, the first `cols_bands / 2` bands are the gate and the second half is
+up.  The epilogue reads both bands from the same compute's accumulator,
+computes `gelu(gate) * up` in bf16 with the native bf16 `vtanh`, and stores
+only the gate bands.  The drain still writes `cols_bands` bands, so the gate
+half is the packed next-matmul input at offset 0.  The softcap is now an
+explicit kind too (word 10 = 1) rather than being inferred from a nonzero cap
+word, so the three modes cannot be combined accidentally.  This is the first
+activation link in a chained TXN; `Program::run` requires exactly two
+equal-width segments and no softcap for GEGLU.
 
 ## Data flow
 
@@ -234,6 +246,53 @@ bf16-only; a caller that needs f32 widens the result itself.
 The softcap is a named
 reduced-precision mode: the bf16 vtanh is approximate, so its verification
 policy is `max(1e-3, 5e-2 * column_scale)`, not the normal bf16 policy.
+
+### GEGLU epilogue
+
+`program_output` takes a tile-epilogue selector.  GEGLU is the first activation
+link for a chained gate+up -> down TXN:
+
+```text
+accumulator: [gate bands][up bands] f32, gate_bands = cols_bands / 2
+gate b pairs with up b + gate_bands in the same compute (same 16 columns)
+narrow both to bf16; out band b = gelu_bf16(gate) * up, only gate bands stored
+```
+
+Both gate and up are narrowed to bf16 in the epilogue, matching the two-launch
+path, which also rounds them to bf16 before the host activation.  The native
+bf16 `vtanh` is the only approximation, and the measured error is unchanged
+from the f32-operand version.  Because the drain writes `cols_bands` bands in
+band-major order, the gate half is the packed next-matmul input at output
+offset 0; the down op retargets its input patches to the output argument and
+the gate half is exactly its `K`.  No pack stage is needed for this link.
+
+AIE2P emulates f32 vector arithmetic with multiple bf16 products and
+conversions, so the GELU polynomial is computed in bf16 (the native width) and
+widened only for the native tanh argument.  The output is bf16 anyway, and the
+measured error is unchanged.  This shrinks the GEGLU loop body from 1152 B to
+288 B and the epilogue cost from a few microseconds to below the run noise.
+
+Measured on `q4_0_1536x12288` gate+up (24 bands, FFN 6144) followed by
+`q4_0_6144x1536` (`tests/poc/txn_concat`, 40 iterations, plain/GEGLU
+interleaved):
+
+| item | value |
+| :-- | --: |
+| epilogue delta (same weights, none vs GEGLU) | < 1 us (noise) |
+| chained GEGLU vs host-GEGLU two-launch | 385.8 vs 454.7 us (1.18x) |
+| intermediate vs host f32 GELU (global relative) | 5.3e-3 |
+| final down output vs two-launch path | 5.5e-3 |
+| `program_output` `.text` | 688 -> 1360 B |
+| core `.text` | 11872 -> 12544 B (77% of 16 KiB) |
+| `program_output` stack frame | none |
+
+The 5.3e-3 / 5.5e-3 are bf16-level and dominated by the vtanh approximation.
+The GEGLU body is a loop over the two 32-element halves with unrolling
+disabled; the unrolled form added 704 B of program memory for no speed.  The
+resident image has ~3.9 KiB of headroom, so the next stages (RMS norm, RoPE,
+attention) still need the overlay tail or code splitting.  The GEGLU bands are
+exact only for a gate-then-up combined call; the host validates two
+equal-width segments and no softcap.
 
 ## Golden and test layout
 

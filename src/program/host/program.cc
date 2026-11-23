@@ -110,7 +110,8 @@ float bf16_bits_to_float(uint16_t bits) {
 void write_config(uint32_t* buf, int32_t format, int32_t tile_bytes,
                   int32_t rows_steps, int32_t cols_bands,
                   int32_t weights_blocks, int32_t total_tiles,
-                  int32_t input_pad, int32_t weight_pad, float soft_cap) {
+                  int32_t input_pad, int32_t weight_pad, float soft_cap,
+                  int32_t epilogue) {
   std::memset(buf, 0, design::kConfigLen * sizeof(uint32_t));
   buf[design::kCfgFormat] = static_cast<uint32_t>(format);
   buf[design::kCfgTileBytes] = static_cast<uint32_t>(tile_bytes);
@@ -120,6 +121,7 @@ void write_config(uint32_t* buf, int32_t format, int32_t tile_bytes,
   buf[design::kCfgTotalTiles] = static_cast<uint32_t>(total_tiles);
   buf[design::kCfgInputPad] = static_cast<uint32_t>(input_pad);
   buf[design::kCfgWeightPad] = static_cast<uint32_t>(weight_pad);
+  buf[design::kCfgEpilogue] = static_cast<uint32_t>(epilogue);
   if (soft_cap != 0.0f) {
     const uint16_t cap_hi = float_to_bf16_bits(soft_cap);
     const uint16_t cap_lo = float_to_bf16_bits(
@@ -427,6 +429,8 @@ struct PreparedWeights::Impl {
   int32_t input_pad = 0;
   int32_t weight_pad = 0;
   int32_t group_bytes = 0;
+  int32_t segments = 1;
+  bool equal_segments = true;
   std::unique_ptr<xrt::bo> weights_bo;
   std::vector<uint8_t> weights;
   std::vector<uint32_t> txn;
@@ -555,11 +559,20 @@ PreparedWeights Program::prepare(const MatmulShape& shape,
     }
     pair_offset += seg_pairs;
   }
-  return prepare_packed(shape, std::move(combined));
+  PreparedWeights prepared =
+      prepare_packed(shape, std::move(combined), segment_count);
+  bool equal_segments = true;
+  for (int32_t i = 1; i < segment_count; ++i) {
+    equal_segments =
+        equal_segments && segments[i].weights_cols == segments[0].weights_cols;
+  }
+  prepared.impl_->equal_segments = equal_segments;
+  return prepared;
 }
 
 PreparedWeights Program::prepare_packed(const MatmulShape& shape,
-                                          std::vector<uint8_t> packed) {
+                                          std::vector<uint8_t> packed,
+                                          int32_t segment_count) {
   int32_t rows_steps = 0;
   int32_t cols_bands = 0;
   int32_t total_tiles = 0;
@@ -579,6 +592,7 @@ PreparedWeights Program::prepare_packed(const MatmulShape& shape,
   impl.total_tiles = total_tiles;
   impl.weights_blocks = weights_blocks;
   impl.tile_bytes = bytes;
+  impl.segments = segment_count;
   impl.group_bytes = weights_blocks * design::kL2StreamBytes;
   impl.weights.assign(
       design::kGroups * static_cast<size_t>(impl.group_bytes), 0);
@@ -661,8 +675,35 @@ RunTicket Program::submit(const MatmulShape& shape,
       shape.weights_cols != prepared.shape.weights_cols) {
     throw std::invalid_argument("shape does not match prepared weights");
   }
+  if (shape.epilogue != kEpilogueNone &&
+      shape.epilogue != kEpilogueSoftcap &&
+      shape.epilogue != kEpilogueGeglu) {
+    throw std::invalid_argument("unknown tile epilogue");
+  }
+  if (shape.epilogue == kEpilogueSoftcap) {
+    if (shape.soft_cap == 0.0f) {
+      throw std::invalid_argument(
+          "softcap epilogue requires a nonzero soft_cap");
+    }
+  } else if (shape.soft_cap != 0.0f) {
+    throw std::invalid_argument(
+        "soft_cap is only valid with the softcap epilogue");
+  }
+  if (shape.epilogue == kEpilogueGeglu) {
+    if (prepared.segments != 2 || !prepared.equal_segments) {
+      throw std::invalid_argument(
+          "GEGLU epilogue needs two equal-width segments (gate, up)");
+    }
+    if (shape.weights_cols % (2 * design::kBandCols) != 0) {
+      throw std::invalid_argument(
+          "GEGLU epilogue needs an even number of bands");
+    }
+  }
+  const int32_t out_cols = shape.epilogue == kEpilogueGeglu
+                               ? shape.weights_cols / 2
+                               : shape.weights_cols;
   if (outputs_col_offset < 0 ||
-      outputs_cols < outputs_col_offset + shape.weights_cols) {
+      outputs_cols < outputs_col_offset + out_cols) {
     throw std::invalid_argument("output buffer is too small");
   }
 
@@ -686,7 +727,9 @@ RunTicket Program::submit(const MatmulShape& shape,
 
   RunTicket ticket;
   ticket.slot = slot;
-  ticket.cols_bands = prepared.cols_bands;
+  ticket.cols_bands = shape.epilogue == kEpilogueGeglu
+                          ? prepared.cols_bands / 2
+                          : prepared.cols_bands;
   ticket.outputs = outputs;
   ticket.outputs_cols = outputs_cols;
   ticket.outputs_col_offset = outputs_col_offset;
@@ -735,7 +778,8 @@ RunTicket Program::submit(const MatmulShape& shape,
   write_config(config_buf, shape.format, prepared.tile_bytes,
                prepared.rows_steps, prepared.cols_bands,
                prepared.weights_blocks, prepared.total_tiles,
-               prepared.input_pad, prepared.weight_pad, shape.soft_cap);
+               prepared.input_pad, prepared.weight_pad, shape.soft_cap,
+               shape.epilogue);
   impl_->configs[static_cast<size_t>(slot)].sync(
       XCL_BO_SYNC_BO_TO_DEVICE,
       design::kInputGroupElems * sizeof(uint16_t), 0);

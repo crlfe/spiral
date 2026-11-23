@@ -13,9 +13,23 @@ struct MatmulShape {
   int32_t weights_cols = 0;  // multiple of 512
   int32_t inputs_vecs = 4;   // must match the fixed design
   int32_t tile_bytes = 0;    // diagnostic modes only; ignored for quant formats
-  // Optional tanh softcap applied to the tile epilogue: cap * tanh(x / cap).
-  // Zero disables it.  The epilogue is all-bf16 after the f32 accumulator.
+  // Tanh softcap parameter: cap * tanh(x / cap).  Used only when epilogue is
+  // kEpilogueSoftcap; it must be zero for the other kinds.
   float soft_cap = 0.0f;
+  // Tile epilogue selector.  The kind is exclusive; modifier flags will get
+  // their own field when the kernel has the operands for them.
+  //   kEpilogueNone    plain bf16
+  //   kEpilogueSoftcap cap * tanh(x / cap), using soft_cap
+  //   kEpilogueGeglu   paired gate/up bands, gelu(gate) * up; requires a
+  //                    two-segment prepare with equal widths, stores the gate
+  //                    half at output offset 0
+  int32_t epilogue = 0;
+};
+
+enum : int32_t {
+  kEpilogueNone = 0,
+  kEpilogueSoftcap = 1,
+  kEpilogueGeglu = 2,
 };
 
 // One weight block used to build a wider prepared tensor.  The segments are
@@ -143,7 +157,8 @@ class Program {
 
  private:
   PreparedWeights prepare_packed(const MatmulShape& shape,
-                                 std::vector<uint8_t> packed);
+                                 std::vector<uint8_t> packed,
+                                 int32_t segment_count = 1);
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
