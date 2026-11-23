@@ -148,9 +148,14 @@ over peak bandwidth.
       output is identical, CPU fallback 93.7 -> 63.8 ms per 32 graphs,
       `SPIRAL_NO_GEGLU_FUSE=1` for A/B, and `SPIRAL_GEGLU_CHECK=1` reports
       5e-4 to 3e-3 device-vs-host error with real weights.
-- [ ] In-TXN FFN chain: `Program` chain API and the down input retargeted to
-      the GEGLU output instead of the host.  The device link and the backend
-      matcher are in place.
+- [x] In-TXN FFN chain: `Program::prepare_chain`/`run_chain`, one weight BO
+      with per-op streams at offsets, one config per op, concatenated TXN
+      bodies via `host/txn_concat.h`, and the backend runs the chain at the
+      down node.  Gemma E2B 64-token greedy is byte-identical to the
+      host-mediated path; 51.64 -> 47.81 ms/token (median, 3 alternating
+      runs), 19.37 -> 20.91 t/s.  `SPIRAL_NO_FFN_CHAIN=1` restores the
+      host-mediated GEGLU.  The chain BO duplicates ~32 MB per 12288 FFN block
+      and costs ~30 ms of first-graph preparation.
 
 ## Active
 
@@ -284,8 +289,11 @@ Reproduce with `SPIRAL_PROFILE_CPU=1 SPIRAL_PROFILE_NODES=1` and `-v` on
 - [x] **Backend FFN matcher (host-mediated):** recognizes
   `gate+up -> GLU(GEGLU) -> down`, runs the pair with the GEGLU epilogue at
   the GLU node, and skips the CPU GLU.  The down remains a separate launch.
-- [ ] **In-TXN FFN chain:** add the `Program` chain API and retarget the down
-  input to the GEGLU output, removing the host crossing and one dispatch.
+- [x] **In-TXN FFN chain:** `Program` chain API (promoted `txn_concat`),
+  multi-stream weight BO, in-place GEGLU -> down; the backend runs it at the
+  down node.  One dispatch and the host crossing removed per FFN block.
+- [ ] **RMS norm link**, then RoPE and KV/attention; the chain API is the
+  template.
 - [ ] **Head throughput only:** the 11 chunks are already in-stream; the
   one-launch expansion is a streaming optimization.
 

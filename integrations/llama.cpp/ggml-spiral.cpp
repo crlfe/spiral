@@ -147,6 +147,18 @@ struct spiral_weight_chain {
     std::vector<spiral::MatmulShape> shapes;
 };
 
+// gate+up (GEGLU) -> down in one TXN.  The PreparedChain references the
+// per-op prepared weights, so keep the gate chain and the down buffer alive.
+struct spiral_ffn_chain {
+    ggml_backend_spiral_buffer * gate = nullptr;
+    ggml_backend_spiral_buffer * up = nullptr;
+    ggml_backend_spiral_buffer * down = nullptr;
+    uint64_t gate_epoch = 0;
+    uint64_t up_epoch = 0;
+    uint64_t down_epoch = 0;
+    spiral::PreparedChain chain;
+};
+
 struct ggml_backend_spiral {
     ggml_backend base;
     ggml_backend_spiral_device * dev;
@@ -154,6 +166,7 @@ struct ggml_backend_spiral {
     std::vector<uint16_t> input_staging;
     std::vector<uint16_t> output_staging;
     std::vector<spiral_weight_chain> weight_chains;
+    std::vector<spiral_ffn_chain> ffn_chains;
 
     bool profile = false;
     bool profile_graph = false;
@@ -166,6 +179,7 @@ struct ggml_backend_spiral {
     uint64_t stats_chains = 0;
     uint64_t stats_softcap_fused = 0;
     uint64_t stats_geglu_fused = 0;
+    uint64_t stats_ffn_chains = 0;
     uint64_t stats_row_chunks = 0;
     uint64_t stats_col_chunks = 0;
     double stats_wall_us = 0.0;
@@ -1309,6 +1323,145 @@ bool spiral_run_geglu_pair(ggml_backend_spiral * backend, ggml_tensor * gate,
     return true;
 }
 
+spiral_ffn_chain * spiral_prepare_ffn_chain(
+    ggml_backend_spiral * backend, ggml_backend_spiral_buffer * gate,
+    ggml_backend_spiral_buffer * up, ggml_backend_spiral_buffer * down) {
+    for (auto & cached : backend->ffn_chains) {
+        if (cached.gate == gate && cached.up == up && cached.down == down &&
+            cached.gate_epoch == gate->epoch &&
+            cached.up_epoch == up->epoch &&
+            cached.down_epoch == down->epoch) {
+            return &cached;
+        }
+    }
+    if (!gate->ensure_prepared() || !up->ensure_prepared() ||
+        !down->ensure_prepared()) {
+        return nullptr;
+    }
+    ggml_backend_spiral_buffer * pair[2] = {gate, up};
+    spiral_weight_chain * gate_chain =
+        spiral_prepare_chain(backend, pair, 2);
+    if (gate_chain == nullptr || gate_chain->prepared.empty() ||
+        gate_chain->shapes.empty() || down->prepared.empty() ||
+        down->shapes.empty()) {
+        return nullptr;
+    }
+
+    spiral::ChainOp ops[2];
+    ops[0].shape = gate_chain->shapes[0];
+    ops[0].shape.epilogue = spiral::kEpilogueGeglu;
+    ops[0].shape.soft_cap = 0.0f;
+    ops[0].weights = &gate_chain->prepared[0];
+    ops[1].shape = down->shapes[0];
+    ops[1].shape.epilogue = spiral::kEpilogueNone;
+    ops[1].shape.soft_cap = 0.0f;
+    ops[1].weights = &down->prepared[0];
+
+    spiral_ffn_chain cached;
+    cached.gate = gate;
+    cached.up = up;
+    cached.down = down;
+    cached.gate_epoch = gate->epoch;
+    cached.up_epoch = up->epoch;
+    cached.down_epoch = down->epoch;
+    const double prepare_start = spiral_now_us();
+    try {
+        cached.chain = backend->dev->program->prepare_chain(ops, 2);
+    } catch (const std::exception & error) {
+        GGML_LOG_ERROR("spiral: FFN chain preparation failed: %s\n",
+                       error.what());
+        return nullptr;
+    }
+    backend->dev->prepare_us += spiral_now_us() - prepare_start;
+    backend->ffn_chains.push_back(std::move(cached));
+    return &backend->ffn_chains.back();
+}
+
+bool spiral_run_ffn_chain(ggml_backend_spiral * backend,
+                          spiral_ffn_chain & chain, ggml_tensor * gate,
+                          ggml_tensor * down) {
+    const auto * src1 = gate->src[1];
+    if (src1 == nullptr) {
+        return false;
+    }
+    const int32_t weights_rows = src1->ne[0];
+    const int32_t final_cols = down->ne[0];
+    const int64_t rows = src1->ne[1] * src1->ne[2] * src1->ne[3];
+    if (rows <= 0 || final_cols <= 0) {
+        return false;
+    }
+
+    backend->input_staging.resize(
+        static_cast<size_t>(kSpiralInputsVecs) * weights_rows);
+    backend->output_staging.resize(
+        static_cast<size_t>(kSpiralInputsVecs) * final_cols);
+
+    const auto * x = static_cast<const float *>(src1->data);
+    auto * y = static_cast<float *>(down->data);
+    const double node_start = spiral_now_us();
+    double node_npu_us = 0.0;
+    double node_pack_us = 0.0;
+    double node_gather_us = 0.0;
+    int32_t node_chunks = 0;
+
+    for (int64_t first = 0; first < rows; first += kSpiralInputsVecs) {
+        const int32_t chunk_rows = static_cast<int32_t>(
+            std::min<int64_t>(kSpiralInputsVecs, rows - first));
+        const double pack_start = spiral_now_us();
+        std::fill(backend->input_staging.begin(),
+                  backend->input_staging.end(), 0);
+        for (int32_t r = 0; r < chunk_rows; ++r) {
+            ggml_fp32_to_bf16_row(
+                x + (first + r) * weights_rows,
+                reinterpret_cast<ggml_bf16_t *>(backend->input_staging.data()) +
+                    static_cast<size_t>(r) * weights_rows,
+                weights_rows);
+        }
+        node_pack_us += spiral_now_us() - pack_start;
+
+        spiral::RunTimings timings;
+        backend->dev->program->run_chain(
+            chain.chain, backend->input_staging.data(),
+            backend->output_staging.data(), final_cols, 0, &timings);
+        node_npu_us += timings.txn_us + timings.input_us + timings.kernel_us +
+                       timings.unpack_us;
+        backend->stats_npu_txn_us += timings.txn_us;
+        backend->stats_npu_input_us += timings.input_us;
+        backend->stats_npu_kernel_us += timings.kernel_us;
+        backend->stats_npu_unpack_us += timings.unpack_us;
+
+        const double gather_start = spiral_now_us();
+        for (int32_t r = 0; r < chunk_rows; ++r) {
+            const auto * row = reinterpret_cast<const ggml_bf16_t *>(
+                backend->output_staging.data() +
+                static_cast<size_t>(r) * final_cols);
+            ggml_bf16_to_fp32_row(
+                row, y + (first + r) * final_cols, final_cols);
+        }
+        node_gather_us += spiral_now_us() - gather_start;
+        ++node_chunks;
+    }
+
+    backend->stats_ffn_chains++;
+    backend->stats_chains++;
+    backend->stats_mul_mats += 3;
+    backend->stats_row_chunks +=
+        3 * ((rows + kSpiralInputsVecs - 1) / kSpiralInputsVecs);
+    backend->stats_col_chunks += node_chunks;
+    backend->stats_npu_us += node_npu_us;
+    backend->stats_pack_us += node_pack_us;
+    backend->stats_gather_us += node_gather_us;
+    if (backend->profile_nodes) {
+        GGML_LOG_INFO(
+            "spiral ffn chain %-28s K=%-6d N=%-7d rows=%-3lld chunks=%-3d "
+            "npu=%8.1f us pack=%7.1f gather=%7.1f total=%7.1f\n",
+            down->name, weights_rows, final_cols, (long long) rows,
+            node_chunks, node_npu_us, node_pack_us, node_gather_us,
+            spiral_now_us() - node_start);
+    }
+    return true;
+}
+
 ggml_cgraph spiral_graph_view(ggml_cgraph * cgraph, int i0, int i1) {
     ggml_cgraph view = *cgraph;
     view.nodes = cgraph->nodes + i0;
@@ -1619,8 +1772,15 @@ enum ggml_status spiral_graph_compute(ggml_backend_t backend, ggml_cgraph * cgra
     ggml_tensor * geglu_up = nullptr;
     ggml_tensor * geglu_out = nullptr;
     spiral_weight_chain * geglu_chain = nullptr;
+    ggml_tensor * ffn_gate = nullptr;
+    ggml_tensor * ffn_up = nullptr;
+    ggml_tensor * ffn_glu = nullptr;
+    ggml_tensor * ffn_down = nullptr;
+    spiral_ffn_chain * ffn_chain = nullptr;
     static const bool geglu_fuse =
         std::getenv("SPIRAL_NO_GEGLU_FUSE") == nullptr;
+    static const bool ffn_chain_enabled =
+        std::getenv("SPIRAL_NO_FFN_CHAIN") == nullptr;
     while (i < cgraph->n_nodes) {
         ggml_tensor * node = cgraph->nodes[i];
 
@@ -1668,8 +1828,30 @@ enum ggml_status spiral_graph_compute(ggml_backend_t backend, ggml_cgraph * cgra
             continue;
         }
 
-        // The gate+up pair was consumed at its position; run it now, at the
-        // GLU node, so the activation is written when its lifetime starts.
+        // The whole FFN chain was detected at the gate node; run it now, at
+        // the down node, so the down output is written when its lifetime
+        // starts.
+        if (ffn_chain != nullptr) {
+            if (node != ffn_down) {
+                GGML_LOG_ERROR(
+                    "spiral: expected FFN down node %s, got %s (%s)\n",
+                    ffn_down->name, node->name, ggml_op_name(node->op));
+                return GGML_STATUS_FAILED;
+            }
+            if (!spiral_run_ffn_chain(self, *ffn_chain, ffn_gate, ffn_down)) {
+                GGML_LOG_ERROR("spiral: FFN chain for %s failed\n",
+                               ffn_down->name);
+                return GGML_STATUS_FAILED;
+            }
+            ffn_gate = nullptr;
+            ffn_up = nullptr;
+            ffn_glu = nullptr;
+            ffn_down = nullptr;
+            ffn_chain = nullptr;
+            ++i;
+            continue;
+        }
+
         if (geglu_out != nullptr) {
             if (node != geglu_out) {
                 GGML_LOG_ERROR(
@@ -1704,6 +1886,29 @@ enum ggml_status spiral_graph_compute(ggml_backend_t backend, ggml_cgraph * cgra
                 self->stats_softcap_fused++;
                 i += 4;
                 continue;
+            }
+            if (ffn_chain_enabled) {
+                ggml_tensor * glu = nullptr;
+                if (spiral_geglu_pattern(self->dev, cgraph, i, &glu)) {
+                    auto * b0 = spiral_weight_buffer_of(self->dev, node);
+                    auto * b1 = spiral_weight_buffer_of(
+                        self->dev, cgraph->nodes[i + 1]);
+                    auto * bd = spiral_weight_buffer_of(
+                        self->dev, cgraph->nodes[i + 3]);
+                    if (b0 != nullptr && b1 != nullptr && bd != nullptr) {
+                        spiral_ffn_chain * chain =
+                            spiral_prepare_ffn_chain(self, b0, b1, bd);
+                        if (chain != nullptr) {
+                            ffn_gate = node;
+                            ffn_up = cgraph->nodes[i + 1];
+                            ffn_glu = glu;
+                            ffn_down = cgraph->nodes[i + 3];
+                            ffn_chain = chain;
+                            i += 3;
+                            continue;
+                        }
+                    }
+                }
             }
             if (geglu_fuse) {
                 ggml_tensor * glu = nullptr;
@@ -1851,7 +2056,7 @@ void spiral_backend_free(ggml_backend_t backend) {
         GGML_LOG_INFO(
             "spiral profile: graphs=%llu wall=%.3f ms\n"
             "  cpu fallback: %.3f ms  nodes=%llu batches=%llu\n"
-            "  npu mulmat:   %.3f ms  calls=%llu chains=%llu fused_softcap=%llu fused_geglu=%llu row_chunks=%llu col_chunks=%llu max_slots=%d\n"
+            "  npu mulmat:   %.3f ms  calls=%llu chains=%llu fused_softcap=%llu fused_geglu=%llu ffn_chains=%llu row_chunks=%llu col_chunks=%llu max_slots=%d\n"
             "  npu stages:   txn=%.3f input=%.3f kernel=%.3f unpack=%.3f ms\n"
             "  host:         pack=%.3f gather=%.3f ms\n"
             "  weight prep:  %.3f ms  tensors=%llu\n",
@@ -1865,6 +2070,7 @@ void spiral_backend_free(ggml_backend_t backend) {
             (unsigned long long) self->stats_chains,
             (unsigned long long) self->stats_softcap_fused,
             (unsigned long long) self->stats_geglu_fused,
+            (unsigned long long) self->stats_ffn_chains,
             (unsigned long long) self->stats_row_chunks,
             (unsigned long long) self->stats_col_chunks,
             self->dev->program ? self->dev->program->max_outstanding() : 0,

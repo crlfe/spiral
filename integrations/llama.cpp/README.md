@@ -23,17 +23,23 @@ result uses the approximate bf16 vtanh; `spiral-smoke` includes the
 ## GEGLU fusion
 
 The FFN chain `gate+up -> GLU(GEGLU, split) -> ffn_down` runs the activation in
-the device epilogue while the gate+up and down matmuls stay separate launches.
-The matcher requires a single consumer for the gate, up, and GLU, a contiguous
-F32 GLU output, and a supported down matmul.  The backend skips the gate and up
-nodes, runs the combined gate+up call at the GLU node's graph position with
-`kEpilogueGeglu`, and the down matmul reads the activation as a normal host
-tensor.  `SPIRAL_NO_GEGLU_FUSE=1` restores the CPU GLU for A/B;
-`SPIRAL_GEGLU_CHECK=1` runs the same pair without the epilogue and logs the
-device-vs-host GELU error.  On Gemma 4 E2B Q4_0 the 64-token greedy output is
-identical to the CPU-GLU path, CPU fallback drops from 93.7 to 63.8 ms per 32
-graphs, and the device error is 5e-4 to 3e-3 global relative per layer.  This is
-not an NPU chain: two launches remain and the activation crosses the host.
+the device epilogue.  By default the whole block is one chained TXN:
+`gate+up -> GEGLU -> down` executes at the down node's graph position, so the
+activation never reaches the host and the block pays one dispatch instead of
+two.  The matcher requires a single consumer for the gate, up, and GLU, a
+contiguous F32 GLU output, and a supported down matmul.
+
+`SPIRAL_NO_FFN_CHAIN=1` falls back to the host-mediated form (gate+up with the
+GEGLU epilogue at the GLU node, then the down matmul as a separate launch);
+`SPIRAL_NO_GEGLU_FUSE=1` restores the CPU GLU.  `SPIRAL_GEGLU_CHECK=1` runs the
+pair without the epilogue and logs the device-vs-host GELU error.
+
+On Gemma 4 E2B Q4_0 the 64-token greedy output is identical across all three
+paths.  CPU fallback drops from 93.7 to 63.8 ms per 32 graphs; decode is
+51.65 ms/token with the CPU GLU, 51.64 with the host-mediated GEGLU, and
+**47.81 (20.91 t/s) with the chained TXN**.  The device error is 5e-4 to 3e-3
+global relative per layer.  The chain duplicates the per-op weight streams
+(~32 MB per 12288 block) and costs ~30 ms of first-graph preparation.
 
 ## Layout
 

@@ -523,38 +523,45 @@ are not chained; the multi-segment path currently benefits gate+up only.  The
 three-segment smoke check exists to keep that path working for models where
 the projections are contiguous.
 
-### Host-mediated GEGLU fusion (no TXN chaining)
+### GEGLU fusion: host-mediated and chained TXN
 
-The FFN activation now runs in the device epilogue while the gate+up and down
-matmuls remain separate launches.  A matcher recognizes
+The FFN activation runs in the device epilogue.  A matcher recognizes
 `gate+up -> GLU(GEGLU, split) -> down` with a single consumer per intermediate,
-an F32 contiguous GLU output, and a supported down matmul.  The gate+up nodes
-are skipped; the combined gate+up call runs at the GLU node's graph position
-with `kEpilogueGeglu`, so the activation is written when its lifetime starts
-(no early-write aliasing).  The down matmul then reads the GLU output as a
-normal host tensor.
+an F32 contiguous GLU output, and a supported down matmul.  Two execution
+paths share the matcher:
 
-- [x] Matcher, execution at the GLU position, and the `SPIRAL_NO_GEGLU_FUSE=1`
-      fallback to the CPU GLU.
-- [x] `SPIRAL_GEGLU_CHECK=1` diagnostic: runs the same pair without the
-      epilogue and compares the device GEGLU against a host GELU.  Real Gemma
-      weights: 5e-4 to 3e-3 global relative per layer.
-- [ ] In-TXN chain: retarget the down input to the GEGLU output instead of
-      crossing the host (needs the production chain API).
-- [ ] Pipeline the GEGLU row chunks; decode has one chunk, and the current
-      path runs one chunk at a time because the output staging is shared.
+- **chained TXN (default):** skip gate, up, and GLU, and run
+  `gate+up -> GEGLU -> down` as one `Program::run_chain` at the down node's
+  graph position.  The activation never reaches the host.
+- **host-mediated (`SPIRAL_NO_FFN_CHAIN=1`):** run the gate+up pair with the
+  GEGLU epilogue at the GLU node, then the down matmul as a separate launch.
+- **CPU GLU (`SPIRAL_NO_GEGLU_FUSE=1`):** the original path.
+
+- [x] Matcher and all three paths.
+- [x] `SPIRAL_GEGLU_CHECK=1` diagnostic: runs the pair without the epilogue and
+      compares the device GEGLU against a host GELU.  Real Gemma weights:
+      5e-4 to 3e-3 global relative per layer.
+- [x] Chained TXN: `Program::prepare_chain`/`run_chain`, one weight BO with
+      per-op streams, one config per op, in-place output.  Gemma E2B
+      64-token greedy is byte-identical across all paths.
+- [ ] Pipeline the chain row chunks; decode has one chunk, and the chain runs
+      synchronously because the output staging is shared.
+- [ ] Share the per-op weight streams with the chain BO; the chain currently
+      duplicates ~32 MB per 12288 FFN block and costs ~30 ms of first-graph
+      preparation.
 
 64-token greedy A/B, 3 alternating runs, `-n 64`, `temp 0`:
 
-| mode | output | cpu fallback | eval (median) | prompt eval |
-| :-- | :-- | --: | --: | --: |
-| CPU GLU (`SPIRAL_NO_GEGLU_FUSE=1`) | `Paris.` | 93.7 ms / 32 graphs | 51.65 ms/token | 76.7 ms |
-| device GEGLU | identical | 63.8 ms / 32 graphs | 51.31 ms/token | 73.3 ms |
+| mode | output | cpu fallback | eval (median) |
+| :-- | :-- | --: | --: |
+| CPU GLU (`SPIRAL_NO_GEGLU_FUSE=1`) | `Paris.` | 93.7 ms / 32 graphs | 51.65 ms/token |
+| host-mediated GEGLU (`SPIRAL_NO_FFN_CHAIN=1`) | identical | 63.8 ms / 32 graphs | 51.64 ms/token |
+| chained TXN | identical | 63.8 ms / 32 graphs | **47.81 ms/token (20.91 t/s)** |
 
-The CPU fallback drops by ~0.9 ms/token (the GLU); wall time gains ~0.3 ms
-because part of the old CPU work overlapped with other host work.  `fused_geglu`
-counts one per FFN block (35 per graph).  No NPU chaining, no dispatch saving,
-and the intermediate still crosses the host.
+The chain removes one dispatch and the host crossing of the activation per FFN
+block; ~35 blocks/token account for the 3.8 ms/token difference.  The
+host-mediated path had already removed the CPU GLU.  `ffn_chains` counts one
+per FFN block.
 
 ### Pipelined NPU submissions
 
