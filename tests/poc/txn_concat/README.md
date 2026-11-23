@@ -13,7 +13,8 @@ native output layout, the separate config BO, and the bf16 epilogue.
 
 ## Result
 
-Every case is **bit-identical** to the independent two-launch path:
+Every identity case is **bit-identical** to the independent two-launch path;
+the GEGLU case differs only by the bf16 vtanh approximation (see item 6).
 
 | case | chain | independent | speedup |
 | :-- | --: | --: | --: |
@@ -24,6 +25,7 @@ Every case is **bit-identical** to the independent two-launch path:
 | same square pair, 8 ops | 695.7 us (87.0 us/op) | 1095.1 us (136.9 us/op) | 1.57x |
 | `q6_k_512x1536 -> q6_k_1536x2048` (2 ops) | 144.7 us | 193.8 us | 1.34x |
 | `q4_0_1536x2048 -> q6_k_2048x2048` (mixed, 2 ops) | 193.4 us | 260.1 us | 1.34x |
+| `q4_0_1536x12288` gate+up (GEGLU) -> `q4_0_6144x1536` | 385.8 us | 454.7 us | 1.18x |
 
 Host context: Tctl 43.5-49.2 C over the run, chassis fan 0 RPM, `amdgpu`
 edge 41.0-43.0 C.  These are medians over 20 iterations from a representative
@@ -92,6 +94,38 @@ the floor is paid once.
    The earlier `PROGRAM_OUTPUT_BF16` block-kernel changes are not needed.  The
    production `program_output` converts the f32 accumulator to bf16 after the
    optional softcap.  Do not reapply the per-record bf16 block changes.
+
+6. **The GEGLU activation is now an epilogue kind.**
+   Config word 10 is an exclusive kind: 0 = none, 1 = softcap, 2 = GEGLU.
+   For a two-segment gate+up call GEGLU pairs band `b` with
+   `b + cols_bands/2` in the same compute, computes `gelu(gate) * up` in bf16
+   with the native bf16 `vtanh`, and stores only the gate bands.  The drain
+   still writes `cols_bands` bands, so the packed gate half is the down
+   matmul's input at offset 0.  No pack kernel is involved and the chain patch
+   policy is unchanged: op0 uses kind 2, op1 uses `input_from_output`.
+
+   bf16 matters here: AIE2P emulates f32 vector arithmetic with multiple bf16
+   products and conversions.  The f32-operand version had a 1152 B loop body
+   and cost a few microseconds; the bf16 version is 288 B, has no stack frame,
+   and the epilogue delta is below the run noise.  The measured error is
+   unchanged because the output and the two-launch reference are bf16 anyway.
+
+   Measured (`q4_0_1536x12288` gate+up -> `q4_0_6144x1536`, 40 iterations,
+   plain/GEGLU interleaved):
+
+   | item | value |
+   | :-- | --: |
+   | epilogue delta (none vs GEGLU) | < 1 us (noise) |
+   | chained vs host-GELU two-launch | 385.8 vs 454.7 us (1.18x) |
+   | GEGLU intermediate vs host f32 | 5.3e-3 global relative |
+   | final down output vs two-launch | 5.5e-3 global relative |
+
+   The errors are bf16-level and dominated by the vtanh approximation.  The
+   prototype now runs this as the `geglu` case (`./txn_concat ... geglu`), and
+   the production `Program` path as the `program` case: `prepare(segments)` with
+   two equal halves, `MatmulShape::epilogue = kEpilogueGeglu`, and a half-width
+   output check/unpack.  Both produce the same device result
+   (12,116 bit mismatches, 5.3e-3 relative).
 
 ## Why concatenate
 
@@ -350,17 +384,18 @@ A chained stream needs a per-stage oracle in addition to the final check: the
 intermediate activation is bf16-rounded and the next matmul's column scales
 differ.  This prototype uses the strongest available check for identity
 chains: the chained output must match the independent two-launch path
-bit-for-bit.
+bit-for-bit.  The GEGLU case cannot be bit-exact because the device uses the
+bf16 vtanh; it reports the global relative error against the host f32 GELU
+(5.3e-3 intermediate, 5.5e-3 final) and fails above 2e-2 / 1e-2.
 
 ## Full implementation checklist
 
-1. **Pack / activation glue.**  The remaining missing piece.  Between matmuls,
-   apply the real activation/quantisation and produce the packed input
-   objects.  Decide the contract first: bf16 output then bf16 matmul, or f32
-   output then an on-device quantise-to-int8 path.  Options are a new
-   tile-local pack kernel, or porting the glue from the mlir-aie
-   `llama_3_2_1b` example (RMSNorm/RoPE/softmax already on the array).
-   Define the oracle and exactness policy before writing the kernel.
+1. **Pack / activation glue.**  The identity-chain layout is solved by the
+   native drain, and GEGLU is now an epilogue mode (see item 6 above).  What
+   remains for the full decode path: RMSNorm (the hidden-width reduction is
+   replicated per compute, so no cross-group barrier is needed), RoPE, and the
+   KV append/attention link.  Decide the intermediate contract for each (bf16
+   is the short path) and add a tolerance before writing the kernel.
 2. **TXN generation and addressing.**  Use one arg slot per distinct buffer or
    per-op `arg_plus` offsets into larger BOs.  Keep per-op config objects.
    Bind one weights BO and select each operation's stream by offset.  Decide
@@ -384,9 +419,10 @@ bit-for-bit.
 
 - `txn_concat.h` - header check, op walker, patch policy, concatenation.
 - `txn_concat.cc` - golden loading, weight repack, low-level XRT runner,
-  independent vs chained comparison, timing.
+  independent vs chained comparison, the GEGLU chain case, and the production
+  `Program` GEGLU case.
 - `run.py` - compiles the prototype against `src/program/build-production`
-  and runs the cases.
+  (including `host/program.cc` for the production case) and runs the cases.
 
 ## Running
 
@@ -405,9 +441,10 @@ It reuses `aie.xclbin`, `design_meta.h`, `generate_txn.h`, and `golden/` from
 
 - Q4_0 and Q6_K are both covered.  The TXN body is format-independent; only
   the config and tile bytes differ.
-- The chain is an identity matmul chain.  RMSNorm, SiLU/gelu, and per-token
-  activation quantisation still need an on-device glue stage (or fusion into
-  the next epilogue).
+- The chain is an identity matmul chain, plus the GEGLU activation link.
+  RMSNorm, RoPE, softmax, and per-token activation quantisation still need
+  stages; the hidden-width RMSNorm can be replicated per compute, while
+  attention needs a real KV-cache/softmax link.
 - The repeated chain reuses the same two weight offsets and config objects.
   A real token TXN needs one weight offset and one config object per
   operation, sized for the whole stream.

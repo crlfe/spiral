@@ -22,6 +22,7 @@
 
 #include "design_meta.h"
 #include "generate_txn.h"
+#include "program/host/program.h"
 #include "quants/q4_0/repack.h"
 #include "quants/q6_k/repack.h"
 #include "txn_concat.h"
@@ -123,7 +124,8 @@ void write_config(uint32_t* buf,
                   int32_t weights_blocks,
                   int32_t total_tiles,
                   int32_t input_pad,
-                  int32_t weight_pad) {
+                  int32_t weight_pad,
+                  int32_t epilogue = design::kEpilogueNone) {
   std::memset(buf, 0, design::kConfigLen * sizeof(uint32_t));
   buf[design::kCfgFormat] = static_cast<uint32_t>(format);
   buf[design::kCfgTileBytes] = static_cast<uint32_t>(tile_bytes);
@@ -133,6 +135,7 @@ void write_config(uint32_t* buf,
   buf[design::kCfgTotalTiles] = static_cast<uint32_t>(total_tiles);
   buf[design::kCfgInputPad] = static_cast<uint32_t>(input_pad);
   buf[design::kCfgWeightPad] = static_cast<uint32_t>(weight_pad);
+  buf[design::kCfgEpilogue] = static_cast<uint32_t>(epilogue);
 }
 
 // Host packing helpers mirror src/program/host/program.cc; keep them in
@@ -247,8 +250,41 @@ float bf16_to_float(uint16_t bits) {
   return value;
 }
 
+// Round-to-nearest-even, matching the device epilogue's conv_even.
+uint16_t float_to_bf16(float value) {
+  uint32_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  const uint32_t lsb = (bits >> 16) & 1u;
+  bits += 0xFFFu + lsb;
+  return static_cast<uint16_t>(bits >> 16);
+}
+
+float gelu_f32(float x) {
+  constexpr float kC = 0.7978845608028654f;
+  constexpr float kA = 0.044715f;
+  return 0.5f * x * (1.0f + std::tanh(kC * x * (1.0f + kA * x * x)));
+}
+
+// Host reference GEGLU for a [vecs][2*ffn_cols] gate+up matrix.
+std::vector<uint16_t> host_geglu(const std::vector<uint16_t>& gate_up,
+                                 int32_t ffn_cols) {
+  const int32_t vecs = design::kInputsVecs;
+  const int32_t stride = 2 * ffn_cols;
+  std::vector<uint16_t> out(
+      static_cast<size_t>(vecs) * static_cast<size_t>(ffn_cols), 0);
+  for (int32_t vec = 0; vec < vecs; ++vec) {
+    for (int32_t col = 0; col < ffn_cols; ++col) {
+      const float gate = bf16_to_float(gate_up[vec * stride + col]);
+      const float up = bf16_to_float(gate_up[vec * stride + ffn_cols + col]);
+      out[vec * ffn_cols + col] = float_to_bf16(gelu_f32(gate) * up);
+    }
+  }
+  return out;
+}
+
 struct Op {
   Golden golden;
+  int32_t epilogue = design::kEpilogueNone;
   int32_t rows_steps = 0;
   int32_t cols_bands = 0;
   int32_t total_tiles = 0;
@@ -266,7 +302,8 @@ struct Op {
   std::vector<uint8_t> config;
 };
 
-Op prepare_op(const Golden& golden) {
+Op prepare_op(const Golden& golden,
+              int32_t epilogue = design::kEpilogueNone) {
   const bool is_q4 = golden.format == design::kFormatQ4_0;
   const bool is_q6 = golden.format == design::kFormatQ6K;
   if (!is_q4 && !is_q6) {
@@ -277,6 +314,7 @@ Op prepare_op(const Golden& golden) {
             : spiral::quants::q6_k::kPackedTransportTileBytes;
   Op op;
   op.golden = golden;
+  op.epilogue = epilogue;
   op.rows_steps = golden.weights_rows / design::kRowsStep;
   op.cols_bands = golden.weights_cols / design::kBandCols;
   op.total_tiles = op.rows_steps * op.cols_bands;
@@ -343,7 +381,7 @@ Op prepare_op(const Golden& golden) {
   op.config.assign(kConfigObjectBytes, 0);
   write_config(reinterpret_cast<uint32_t*>(op.config.data()), golden.format,
                tile_bytes, op.rows_steps, op.cols_bands, op.weights_blocks,
-               op.total_tiles, op.input_pad, op.weight_pad);
+               op.total_tiles, op.input_pad, op.weight_pad, op.epilogue);
   return op;
 }
 
@@ -437,6 +475,17 @@ class Runner {
         static_cast<size_t>(design::kInputsVecs) * op.golden.weights_cols, 0);
     unpack_outputs(outputs_.map<const uint16_t*>(), out.data(), op.cols_bands,
                    op.golden.weights_cols, 0);
+  }
+
+  // Unpack a prefix of the packed output buffer, used for the GEGLU
+  // intermediate check (the gate half is the first cols_bands).
+  std::vector<uint16_t> unpack_cols(int32_t cols_bands,
+                                    int32_t outputs_cols) {
+    std::vector<uint16_t> out(
+        static_cast<size_t>(design::kInputsVecs) * outputs_cols, 0);
+    unpack_outputs(outputs_.map<const uint16_t*>(), out.data(), cols_bands,
+                   outputs_cols, 0);
+    return out;
   }
 
  private:
@@ -582,6 +631,44 @@ void compare(const std::vector<uint16_t>& independent,
   }
 }
 
+// Tolerance comparison for paths that differ by an approximation (the bf16
+// vtanh in the GEGLU epilogue).  Reports the global relative error against the
+// reference magnitude, which is robust for near-zero elements.
+void compare_tol(const std::vector<uint16_t>& reference,
+                 const std::vector<uint16_t>& candidate,
+                 double tol,
+                 const char* label) {
+  if (reference.size() != candidate.size()) {
+    throw std::runtime_error("output sizes differ");
+  }
+  size_t bit_mismatches = 0;
+  double max_abs = 0.0;
+  double max_ref = 0.0;
+  size_t worst = 0;
+  for (size_t i = 0; i < reference.size(); ++i) {
+    if (reference[i] != candidate[i]) {
+      ++bit_mismatches;
+    }
+    const double ref = bf16_to_float(reference[i]);
+    const double got = bf16_to_float(candidate[i]);
+    const double diff = std::fabs(ref - got);
+    if (diff > max_abs) {
+      max_abs = diff;
+      worst = i;
+    }
+    max_ref = std::max(max_ref, std::fabs(ref));
+  }
+  const double rel = max_abs / std::max(1e-6, max_ref);
+  std::printf("%s: bit_mismatches=%zu max_abs=%.6g rel=%.3g worst=%zu "
+              "ref=%.6g got=%.6g\n",
+              label, bit_mismatches, max_abs, rel, worst,
+              bf16_to_float(reference[worst]),
+              bf16_to_float(candidate[worst]));
+  if (rel > tol) {
+    throw std::runtime_error(std::string(label) + " exceeds tolerance");
+  }
+}
+
 struct Timed {
   double total_us = 0.0;
   double kernel_us = 0.0;
@@ -610,6 +697,194 @@ Timed time_sequence(Runner& runner,
   return {median(total), median(kernel)};
 }
 
+// GEGLU chain: op0 is the combined gate+up matmul with the GEGLU epilogue,
+// op1 is the down matmul reading op0's packed gate half in place.
+void run_geglu_case(const std::string& golden_dir, int iterations) {
+  constexpr const char* kGateUp = "q4_0_1536x12288";
+  constexpr const char* kDown = "q4_0_6144x1536";
+  const Golden gate_up_golden = load_golden(golden_dir, kGateUp);
+  const Golden down_golden = load_golden(golden_dir, kDown);
+  const int32_t ffn_cols = gate_up_golden.weights_cols / 2;
+  if (ffn_cols != down_golden.weights_rows) {
+    throw std::runtime_error("gate+up half width does not match down K");
+  }
+
+  Op raw = prepare_op(gate_up_golden, design::kEpilogueNone);
+  Op glu = prepare_op(gate_up_golden, design::kEpilogueGeglu);
+  Op down = prepare_op(down_golden, design::kEpilogueNone);
+  raw.config_offset = 0;
+  glu.config_offset = kConfigObjectBytes;
+  down.config_offset = 2 * kConfigObjectBytes;
+  raw.weight_offset = 0;
+  glu.weight_offset = 0;  // same stream as raw
+  down.weight_offset = raw.weight_stream.size();
+
+  std::printf("geglu case: %s (gate+up) -> %s\n", kGateUp, kDown);
+  std::printf("  gate+up: %dx%d, rows_steps=%d bands=%d blocks=%d\n",
+              gate_up_golden.weights_rows, gate_up_golden.weights_cols,
+              raw.rows_steps, raw.cols_bands, raw.weights_blocks);
+  std::printf("  down:    %dx%d, rows_steps=%d bands=%d blocks=%d\n",
+              down_golden.weights_rows, down_golden.weights_cols,
+              down.rows_steps, down.cols_bands, down.weights_blocks);
+
+  std::vector<uint8_t> combined(raw.weight_stream.size() +
+                                    down.weight_stream.size() +
+                                    design::kL2StreamBytes,
+                                0);
+  std::memcpy(combined.data(), raw.weight_stream.data(),
+              raw.weight_stream.size());
+  std::memcpy(combined.data() + down.weight_offset, down.weight_stream.data(),
+              down.weight_stream.size());
+
+  std::vector<uint8_t> configs(3 * kConfigObjectBytes, 0);
+  std::memcpy(configs.data(), raw.config.data(), kConfigObjectBytes);
+  std::memcpy(configs.data() + glu.config_offset, glu.config.data(),
+              kConfigObjectBytes);
+  std::memcpy(configs.data() + down.config_offset, down.config.data(),
+              kConfigObjectBytes);
+
+  Plan independent = make_plan({&raw, &down});
+  Plan chained = make_plan({&glu, &down});
+  size_t instr_words = 0;
+  for (const Plan* plan : {&independent, &chained}) {
+    instr_words = std::max(instr_words, plan->chain.size());
+    for (const auto& single : plan->singles) {
+      instr_words = std::max(instr_words, single.size());
+    }
+  }
+
+  Runner runner(instr_words, 3, combined.size());
+  runner.upload_weights(combined);
+  runner.upload_configs(configs);
+
+  // Reference: op0 without the epilogue, host GEGLU, then the down matmul.
+  runner.load_inputs(raw, raw.golden.inputs.data(), input_objects(raw));
+  double kernel_us = 0.0;
+  runner.run_txn(independent.singles[0], &kernel_us);
+  const std::vector<uint16_t> raw_output =
+      runner.unpack_cols(raw.cols_bands, raw.golden.weights_cols);
+  const std::vector<uint16_t> reference_glu = host_geglu(raw_output, ffn_cols);
+
+  runner.load_inputs(down, reference_glu.data(), input_objects(down));
+  runner.run_txn(independent.singles[1], &kernel_us);
+  const std::vector<uint16_t> independent_output =
+      runner.unpack_cols(down.cols_bands, down.golden.weights_cols);
+
+  // Device GEGLU only, for an intermediate check.
+  runner.load_inputs(glu, glu.golden.inputs.data(), input_objects(glu));
+  runner.run_txn(chained.singles[0], &kernel_us);
+  const std::vector<uint16_t> device_glu =
+      runner.unpack_cols(glu.cols_bands / 2, ffn_cols);
+  compare_tol(reference_glu, device_glu, 2e-2, "geglu intermediate");
+
+  // Full chain.
+  runner.load_inputs(glu, glu.golden.inputs.data(), input_objects(glu));
+  runner.run_txn(chained.chain, &kernel_us);
+  const std::vector<uint16_t> chained_output =
+      runner.unpack_cols(down.cols_bands, down.golden.weights_cols);
+  compare_tol(independent_output, chained_output, 1e-2, "geglu final");
+
+  auto run_independent_geglu = [&]() {
+    double total = 0.0;
+    runner.load_inputs(raw, raw.golden.inputs.data(), input_objects(raw));
+    total += runner.run_txn(independent.singles[0], &kernel_us);
+    const auto raw_out =
+        runner.unpack_cols(raw.cols_bands, raw.golden.weights_cols);
+    const auto act = host_geglu(raw_out, ffn_cols);
+    runner.load_inputs(down, act.data(), input_objects(down));
+    total += runner.run_txn(independent.singles[1], &kernel_us);
+    runner.unpack_cols(down.cols_bands, down.golden.weights_cols);
+    return total;
+  };
+  auto run_chained_geglu = [&]() {
+    runner.load_inputs(glu, glu.golden.inputs.data(), input_objects(glu));
+    const double total = runner.run_txn(chained.chain, &kernel_us);
+    runner.unpack_cols(down.cols_bands, down.golden.weights_cols);
+    return total;
+  };
+
+  for (int i = 0; i < 3; ++i) {
+    run_independent_geglu();
+    run_chained_geglu();
+  }
+  std::vector<double> independent_times;
+  std::vector<double> chained_times;
+  for (int i = 0; i < iterations; ++i) {
+    independent_times.push_back(run_independent_geglu());
+    chained_times.push_back(run_chained_geglu());
+  }
+  const double ind_us = median(independent_times);
+  const double chain_us = median(chained_times);
+  std::printf("  total: independent %.1f us chain %.1f us speedup %.2fx\n",
+              ind_us, chain_us, ind_us / chain_us);
+
+  // Isolate the epilogue: same gate+up weights and input, none vs GEGLU.
+  // Interleave the two modes so clock/thermal drift cancels from the delta.
+  auto run_gate_up = [&](const Plan& plan, const Op& op) {
+    runner.load_inputs(op, op.golden.inputs.data(), input_objects(op));
+    return runner.run_txn(plan.singles[0], &kernel_us);
+  };
+  for (int i = 0; i < 3; ++i) {
+    run_gate_up(independent, raw);
+    run_gate_up(chained, glu);
+  }
+  std::vector<double> deltas;
+  std::vector<double> plain_times;
+  std::vector<double> geglu_times;
+  for (int i = 0; i < iterations; ++i) {
+    const double plain = run_gate_up(independent, raw);
+    const double geglu = run_gate_up(chained, glu);
+    plain_times.push_back(plain);
+    geglu_times.push_back(geglu);
+    deltas.push_back(geglu - plain);
+  }
+  std::printf(
+      "  epilogue: plain %.1f us geglu %.1f us delta %.1f us (interleaved)\n",
+      median(plain_times), median(geglu_times), median(deltas));
+}
+
+// Exercise the production Program path: prepare the two gate/up halves as one
+// two-segment handle, run with the GEGLU epilogue, and compare against the host
+// GEGLU of the plain run.  This covers the config word, the half-width output
+// check, and the unpack.
+void run_production_geglu_case(const std::string& golden_dir) {
+  const Golden golden = load_golden(golden_dir, "q4_0_1536x12288");
+  const int32_t half = golden.weights_cols / 2;
+  spiral::WeightSegment segments[2] = {
+      {golden.raw.data(), golden.raw_stride, 0, half},
+      {golden.raw.data(), golden.raw_stride, half, half},
+  };
+
+  spiral::Program program;
+  spiral::MatmulShape shape;
+  shape.format = golden.format;
+  shape.weights_rows = golden.weights_rows;
+  shape.weights_cols = golden.weights_cols;
+  shape.inputs_vecs = design::kInputsVecs;
+
+  spiral::MatmulShape plain_shape = shape;
+  plain_shape.epilogue = spiral::kEpilogueNone;
+  spiral::PreparedWeights plain_weights =
+      program.prepare(plain_shape, segments, 2);
+
+  spiral::MatmulShape geglu_shape = shape;
+  geglu_shape.epilogue = spiral::kEpilogueGeglu;
+  spiral::PreparedWeights geglu_weights =
+      program.prepare(geglu_shape, segments, 2);
+
+  std::vector<uint16_t> plain_out(
+      static_cast<size_t>(design::kInputsVecs) * golden.weights_cols);
+  std::vector<uint16_t> geglu_out(
+      static_cast<size_t>(design::kInputsVecs) * half);
+  program.run(plain_shape, plain_weights, golden.inputs.data(),
+              plain_out.data(), golden.weights_cols, 0);
+  program.run(geglu_shape, geglu_weights, golden.inputs.data(),
+              geglu_out.data(), half, 0);
+
+  const std::vector<uint16_t> reference = host_geglu(plain_out, half);
+  compare_tol(reference, geglu_out, 2e-2, "production geglu");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -620,6 +895,14 @@ int main(int argc, char** argv) {
     const int iterations = argc > 4 ? std::stoi(argv[4]) : 20;
     if (iterations <= 0) {
       throw std::invalid_argument("iterations must be positive");
+    }
+    if (argc > 5 && std::string(argv[5]) == "geglu") {
+      run_geglu_case(golden_dir, iterations);
+      return 0;
+    }
+    if (argc > 5 && std::string(argv[5]) == "program") {
+      run_production_geglu_case(golden_dir);
+      return 0;
     }
 
     const Golden golden0 = load_golden(golden_dir, name0);
@@ -673,41 +956,43 @@ int main(int argc, char** argv) {
         instr_words = std::max(instr_words, single.size());
       }
     }
-    Runner runner(instr_words, 2, combined_weights.size());
-    runner.upload_weights(combined_weights);
-    runner.upload_configs(configs);
+    {
+      Runner runner(instr_words, 2, combined_weights.size());
+      runner.upload_weights(combined_weights);
+      runner.upload_configs(configs);
 
-    std::printf("  txn: single=%zu words chain=%zu words ops=%u\n",
-                pair.singles.front().size(), pair.chain.size(), pair.chain[2]);
-    std::printf("  weights: op0=%zu op1=%zu guard=%zu bytes\n",
-                op0.weight_stream.size(), op1.weight_stream.size(),
-                design::kL2StreamBytes);
+      std::printf("  txn: single=%zu words chain=%zu words ops=%u\n",
+                  pair.singles.front().size(), pair.chain.size(), pair.chain[2]);
+      std::printf("  weights: op0=%zu op1=%zu guard=%zu bytes\n",
+                  op0.weight_stream.size(), op1.weight_stream.size(),
+                  design::kL2StreamBytes);
 
-    const Result independent = run_independent(runner, pair, op0);
-    const Result chain = run_chain(runner, pair, op0);
-    compare(independent.outputs, chain.outputs);
+      const Result independent = run_independent(runner, pair, op0);
+      const Result chain = run_chain(runner, pair, op0);
+      compare(independent.outputs, chain.outputs);
 
-    const Timed ind2 = time_sequence(runner, pair, op0, false, iterations);
-    const Timed ch2 = time_sequence(runner, pair, op0, true, iterations);
-    std::printf(
-        "  2 ops: independent total %.1f us (kernel %.1f) "
-        "chain total %.1f us (kernel %.1f) speedup %.2fx total %.2fx kernel\n",
-        ind2.total_us, ind2.kernel_us, ch2.total_us, ch2.kernel_us,
-        ind2.total_us / ch2.total_us, ind2.kernel_us / ch2.kernel_us);
-
-    if (repeatable) {
-      const Result ind8 = run_independent(runner, repeated, op0);
-      const Result ch8 = run_chain(runner, repeated, op0);
-      compare(ind8.outputs, ch8.outputs);
-      const Timed ind8t =
-          time_sequence(runner, repeated, op0, false, iterations);
-      const Timed ch8t = time_sequence(runner, repeated, op0, true, iterations);
+      const Timed ind2 = time_sequence(runner, pair, op0, false, iterations);
+      const Timed ch2 = time_sequence(runner, pair, op0, true, iterations);
       std::printf(
-          "  8 ops: independent %.1f us (%.1f us/op, kernel %.1f us/op) "
-          "chain %.1f us (%.1f us/op, kernel %.1f us/op) speedup %.2fx\n",
-          ind8t.total_us, ind8t.total_us / 8.0, ind8t.kernel_us / 8.0,
-          ch8t.total_us, ch8t.total_us / 8.0, ch8t.kernel_us / 8.0,
-          ind8t.total_us / ch8t.total_us);
+          "  2 ops: independent total %.1f us (kernel %.1f) "
+          "chain total %.1f us (kernel %.1f) speedup %.2fx total %.2fx kernel\n",
+          ind2.total_us, ind2.kernel_us, ch2.total_us, ch2.kernel_us,
+          ind2.total_us / ch2.total_us, ind2.kernel_us / ch2.kernel_us);
+
+      if (repeatable) {
+        const Result ind8 = run_independent(runner, repeated, op0);
+        const Result ch8 = run_chain(runner, repeated, op0);
+        compare(ind8.outputs, ch8.outputs);
+        const Timed ind8t =
+            time_sequence(runner, repeated, op0, false, iterations);
+        const Timed ch8t = time_sequence(runner, repeated, op0, true, iterations);
+        std::printf(
+            "  8 ops: independent %.1f us (%.1f us/op, kernel %.1f us/op) "
+            "chain %.1f us (%.1f us/op, kernel %.1f us/op) speedup %.2fx\n",
+            ind8t.total_us, ind8t.total_us / 8.0, ind8t.kernel_us / 8.0,
+            ch8t.total_us, ch8t.total_us / 8.0, ch8t.kernel_us / 8.0,
+            ind8t.total_us / ch8t.total_us);
+      }
     }
     return 0;
   } catch (const std::exception& error) {

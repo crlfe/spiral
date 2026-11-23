@@ -19,6 +19,7 @@ REPO = Path(__file__).resolve().parents[3]
 PROGRAM = REPO / "src" / "program"
 WORK = PROGRAM / "build-production"
 SOURCE = Path(__file__).resolve().parent / "txn_concat.cc"
+PROGRAM_SOURCE = PROGRAM / "host" / "program.cc"
 
 CASES = (
     ("q4 aligned", "q4_0_1536x2048", "q4_0_2048x1536"),
@@ -56,6 +57,7 @@ def main():
         "-o",
         str(exe),
         str(SOURCE),
+        str(PROGRAM_SOURCE),
         "-lxrt++",
         "-lxrt_coreutil",
     ]
@@ -68,6 +70,22 @@ def main():
             check=True,
             cwd=WORK,
         )
+
+    print("\n== q4 GEGLU gate+up -> down ==")
+    subprocess.run(
+        [str(exe), "golden", "q4_0_1536x12288", "q4_0_6144x1536", "20",
+         "geglu"],
+        check=True,
+        cwd=WORK,
+    )
+
+    print("\n== production Program GEGLU epilogue ==")
+    subprocess.run(
+        [str(exe), "golden", "q4_0_1536x12288", "q4_0_6144x1536", "20",
+         "program"],
+        check=True,
+        cwd=WORK,
+    )
 
 
 if __name__ == "__main__":
