@@ -523,6 +523,39 @@ are not chained; the multi-segment path currently benefits gate+up only.  The
 three-segment smoke check exists to keep that path working for models where
 the projections are contiguous.
 
+### Host-mediated GEGLU fusion (no TXN chaining)
+
+The FFN activation now runs in the device epilogue while the gate+up and down
+matmuls remain separate launches.  A matcher recognizes
+`gate+up -> GLU(GEGLU, split) -> down` with a single consumer per intermediate,
+an F32 contiguous GLU output, and a supported down matmul.  The gate+up nodes
+are skipped; the combined gate+up call runs at the GLU node's graph position
+with `kEpilogueGeglu`, so the activation is written when its lifetime starts
+(no early-write aliasing).  The down matmul then reads the GLU output as a
+normal host tensor.
+
+- [x] Matcher, execution at the GLU position, and the `SPIRAL_NO_GEGLU_FUSE=1`
+      fallback to the CPU GLU.
+- [x] `SPIRAL_GEGLU_CHECK=1` diagnostic: runs the same pair without the
+      epilogue and compares the device GEGLU against a host GELU.  Real Gemma
+      weights: 5e-4 to 3e-3 global relative per layer.
+- [ ] In-TXN chain: retarget the down input to the GEGLU output instead of
+      crossing the host (needs the production chain API).
+- [ ] Pipeline the GEGLU row chunks; decode has one chunk, and the current
+      path runs one chunk at a time because the output staging is shared.
+
+64-token greedy A/B, 3 alternating runs, `-n 64`, `temp 0`:
+
+| mode | output | cpu fallback | eval (median) | prompt eval |
+| :-- | :-- | --: | --: | --: |
+| CPU GLU (`SPIRAL_NO_GEGLU_FUSE=1`) | `Paris.` | 93.7 ms / 32 graphs | 51.65 ms/token | 76.7 ms |
+| device GEGLU | identical | 63.8 ms / 32 graphs | 51.31 ms/token | 73.3 ms |
+
+The CPU fallback drops by ~0.9 ms/token (the GLU); wall time gains ~0.3 ms
+because part of the old CPU work overlapped with other host work.  `fused_geglu`
+counts one per FFN block (35 per graph).  No NPU chaining, no dispatch saving,
+and the intermediate still crosses the host.
+
 ### Pipelined NPU submissions
 
 `Program` exposes `submit()` / `finish()` with a small pool of independent
@@ -585,7 +618,9 @@ The largest remaining wins are therefore:
    text is produced.  The fused value uses the approximate bf16 vtanh, so the
    `q4_0_1536x512_sc30` golden keeps its own `5e-2` policy (worst 0.725).
 3. **Streaming rate and the head** (~3 ms at 48 -> 55 GB/s; head ~7 ms).
-4. CPU fallback beyond the softcap is small; do not optimize it first.
+4. CPU fallback is now smaller: softcap and GEGLU are on the device.  The
+   remaining fallback is norms, RoPE, attention, and small elementwise ops;
+   do not optimize it before the chain/norm/attention links.
 
 Gate+up chaining removes one call per layer and helps prompt processing; the
 12288+12288 case is close to neutral, so wider is not always faster.

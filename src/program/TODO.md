@@ -141,9 +141,16 @@ over peak bandwidth.
       half for a standalone call.  The `sc30` softcap golden and the llama.cpp
       Gemma run (`fused_softcap=21`, `The capital of France is Paris.`) pass
       with the explicit kinds.
-- [ ] Production FFN chain: backend matcher for `gate+up -> GLU -> down` and
-      the `Program` chain API.  The device link above works in the prototype;
-      the backend still issues separate calls.
+- [x] Host-mediated GEGLU fusion in the llama.cpp backend: match
+      `gate+up -> GLU(GEGLU) -> down`, run the combined pair with the GEGLU
+      epilogue at the GLU node, and skip the CPU GLU.  Two NPU launches
+      remain; the activation crosses the host.  Gemma E2B 64-token greedy
+      output is identical, CPU fallback 93.7 -> 63.8 ms per 32 graphs,
+      `SPIRAL_NO_GEGLU_FUSE=1` for A/B, and `SPIRAL_GEGLU_CHECK=1` reports
+      5e-4 to 3e-3 device-vs-host error with real weights.
+- [ ] In-TXN FFN chain: `Program` chain API and the down input retargeted to
+      the GEGLU output instead of the host.  The device link and the backend
+      matcher are in place.
 
 ## Active
 
@@ -274,8 +281,11 @@ Reproduce with `SPIRAL_PROFILE_CPU=1 SPIRAL_PROFILE_NODES=1` and `-v` on
 - [ ] **Hoist token-start gathers** into the input BO (token row, 24 per-layer
   rows, F16 `per_layer_model_proj`).  Keep sampling host-side; it is the
   natural TXN boundary.
-- [ ] **Production FFN chain:** backend matcher for `gate+up -> GLU -> down`
-  and a `Program` chain API (the prototype has the mechanics).
+- [x] **Backend FFN matcher (host-mediated):** recognizes
+  `gate+up -> GLU(GEGLU) -> down`, runs the pair with the GEGLU epilogue at
+  the GLU node, and skips the CPU GLU.  The down remains a separate launch.
+- [ ] **In-TXN FFN chain:** add the `Program` chain API and retarget the down
+  input to the GEGLU output, removing the host crossing and one dispatch.
 - [ ] **Head throughput only:** the 11 chunks are already in-stream; the
   one-launch expansion is a streaming optimization.
 

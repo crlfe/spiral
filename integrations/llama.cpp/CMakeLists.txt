@@ -72,6 +72,13 @@ target_link_libraries(ggml-spiral PRIVATE
                       xrt_coreutil
                       ${CMAKE_DL_LIBS})
 
+# spiral::Program loads "aie.xclbin" from the working directory.  Refresh it
+# whenever the backend is rebuilt; a stale copy silently runs an old kernel.
+add_custom_command(TARGET ggml-spiral POST_BUILD
+                   COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                           "${SPIRAL_XCLBIN}"
+                           "$<TARGET_FILE_DIR:ggml-spiral>/aie.xclbin")
+
 option(GGML_SPIRAL_SMOKE "ggml: build the standalone Spiral smoke test" ON)
 
 if (GGML_SPIRAL_SMOKE)

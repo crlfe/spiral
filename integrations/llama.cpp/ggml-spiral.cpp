@@ -165,6 +165,7 @@ struct ggml_backend_spiral {
     uint64_t stats_mul_mats = 0;
     uint64_t stats_chains = 0;
     uint64_t stats_softcap_fused = 0;
+    uint64_t stats_geglu_fused = 0;
     uint64_t stats_row_chunks = 0;
     uint64_t stats_col_chunks = 0;
     double stats_wall_us = 0.0;
@@ -1133,6 +1134,181 @@ bool spiral_run_chain(ggml_backend_spiral * backend, ggml_tensor ** nodes,
     return true;
 }
 
+// Run a combined gate+up call with the GEGLU epilogue and write the activation
+// directly into the GLU node.  This is the host-mediated form of the FFN
+// fusion: the gate+up launch and the down launch stay separate, but the CPU
+// GELU is replaced by the device epilogue.  The caller invokes this at the GLU
+// node's graph position, so the GLU output is written when its lifetime
+// starts.
+bool spiral_run_geglu_pair(ggml_backend_spiral * backend, ggml_tensor * gate,
+                           ggml_tensor * up, ggml_tensor * glu,
+                           spiral_weight_chain & chain) {
+    if (chain.buffers.size() != 2 || chain.prepared.size() != 1 ||
+        chain.shapes.size() != 1) {
+        return false;
+    }
+    const auto * src1 = gate->src[1];
+    if (src1 == nullptr || up->src[1] != src1) {
+        return false;
+    }
+    const int32_t weights_rows = chain.buffers[0]->weights_rows;
+    const int32_t gate_padded = chain.buffers[0]->padded_cols;
+    const int32_t up_padded = chain.buffers[1]->padded_cols;
+    const int32_t gate_cols = gate->ne[0];
+    if (src1->ne[0] != weights_rows || gate_padded != up_padded ||
+        chain.padded_cols != gate_padded + up_padded ||
+        gate->ne[0] != up->ne[0] || glu->ne[0] != gate_cols ||
+        glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu)) {
+        return false;
+    }
+    for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+        if (glu->ne[d] != gate->ne[d]) {
+            return false;
+        }
+    }
+
+    const int64_t rows = src1->ne[1] * src1->ne[2] * src1->ne[3];
+    if (rows <= 0) {
+        return false;
+    }
+
+    backend->input_staging.resize(
+        static_cast<size_t>(kSpiralInputsVecs) * weights_rows);
+    backend->output_staging.resize(
+        static_cast<size_t>(kSpiralInputsVecs) * gate_padded);
+
+    const double node_start = spiral_now_us();
+    double node_npu_us = 0.0;
+    double node_pack_us = 0.0;
+    double node_gather_us = 0.0;
+    int node_col_chunks = 0;
+
+    spiral::MatmulShape run_shape = chain.shapes[0];
+    run_shape.epilogue = spiral::kEpilogueGeglu;
+    run_shape.soft_cap = 0.0f;
+
+    // Diagnostic: run the same gate+up pair without the epilogue and compare
+    // the device GEGLU against a host GELU of that result.
+    static const bool geglu_check =
+        std::getenv("SPIRAL_GEGLU_CHECK") != nullptr;
+    spiral::MatmulShape plain_shape = chain.shapes[0];
+    std::vector<uint16_t> check_staging;
+    if (geglu_check) {
+        check_staging.resize(
+            static_cast<size_t>(kSpiralInputsVecs) * chain.padded_cols);
+    }
+
+    const auto * x = static_cast<const float *>(src1->data);
+    auto * y = static_cast<float *>(glu->data);
+
+    auto gather = [&](int64_t first, int32_t chunk_rows) {
+        const double gather_start = spiral_now_us();
+        for (int32_t r = 0; r < chunk_rows; ++r) {
+            const auto * row = reinterpret_cast<const ggml_bf16_t *>(
+                backend->output_staging.data() +
+                static_cast<size_t>(r) * gate_padded);
+            ggml_bf16_to_fp32_row(
+                row, y + (first + r) * gate_cols, gate_cols);
+        }
+        node_gather_us += spiral_now_us() - gather_start;
+
+        if (geglu_check) {
+            auto bf = [](uint16_t bits) {
+                const uint32_t wide = static_cast<uint32_t>(bits) << 16;
+                float value = 0.0f;
+                std::memcpy(&value, &wide, sizeof(value));
+                return value;
+            };
+            auto gelu = [](float x) {
+                constexpr float kC = 0.7978845608028654f;
+                constexpr float kA = 0.044715f;
+                return 0.5f * x *
+                       (1.0f + std::tanh(kC * x * (1.0f + kA * x * x)));
+            };
+            double max_abs = 0.0;
+            double max_ref = 0.0;
+            for (int32_t r = 0; r < chunk_rows; ++r) {
+                const auto * base = reinterpret_cast<const uint16_t *>(
+                    check_staging.data() +
+                    static_cast<size_t>(r) * chain.padded_cols);
+                for (int32_t j = 0; j < gate_cols; ++j) {
+                    const float ref =
+                        gelu(bf(base[j])) * bf(base[gate_padded + j]);
+                    const float got =
+                        y[static_cast<int64_t>(first + r) * gate_cols + j];
+                    max_abs = std::max(
+                        max_abs, static_cast<double>(std::fabs(ref - got)));
+                    max_ref = std::max(
+                        max_ref, static_cast<double>(std::fabs(ref)));
+                }
+            }
+            GGML_LOG_INFO(
+                "spiral geglu check %-28s first=%lld rows=%d "
+                "max_abs=%.6g rel=%.3g\n",
+                glu->name, (long long) first, chunk_rows, max_abs,
+                max_abs / std::max(1e-6, max_ref));
+        }
+    };
+
+    for (int64_t first = 0; first < rows; first += kSpiralInputsVecs) {
+        const int32_t chunk_rows = static_cast<int32_t>(
+            std::min<int64_t>(kSpiralInputsVecs, rows - first));
+        const double pack_start = spiral_now_us();
+        std::fill(backend->input_staging.begin(),
+                  backend->input_staging.end(), 0);
+        for (int32_t r = 0; r < chunk_rows; ++r) {
+            ggml_fp32_to_bf16_row(
+                x + (first + r) * weights_rows,
+                reinterpret_cast<ggml_bf16_t *>(backend->input_staging.data()) +
+                    static_cast<size_t>(r) * weights_rows,
+                weights_rows);
+        }
+        node_pack_us += spiral_now_us() - pack_start;
+
+        if (geglu_check) {
+            backend->dev->program->run(
+                plain_shape, chain.prepared[0],
+                backend->input_staging.data(), check_staging.data(),
+                chain.padded_cols, 0);
+        }
+
+        // One row chunk at a time: the shared output staging and the
+        // optional host reference make cross-chunk pipelining unsafe.  Decode
+        // has one chunk; prefill can pipeline once the staging is per-slot.
+        spiral::RunTimings timings;
+        backend->dev->program->run(
+            run_shape, chain.prepared[0], backend->input_staging.data(),
+            backend->output_staging.data(), gate_padded, 0, &timings);
+        node_npu_us += timings.txn_us + timings.input_us + timings.kernel_us +
+                       timings.unpack_us;
+        backend->stats_npu_txn_us += timings.txn_us;
+        backend->stats_npu_input_us += timings.input_us;
+        backend->stats_npu_kernel_us += timings.kernel_us;
+        backend->stats_npu_unpack_us += timings.unpack_us;
+        gather(first, chunk_rows);
+        ++node_col_chunks;
+    }
+
+    const int64_t row_chunks =
+        (rows + kSpiralInputsVecs - 1) / kSpiralInputsVecs;
+    backend->stats_chains++;
+    backend->stats_mul_mats += 2;
+    backend->stats_row_chunks += 2 * static_cast<uint64_t>(row_chunks);
+    backend->stats_col_chunks += node_col_chunks;
+    backend->stats_npu_us += node_npu_us;
+    backend->stats_pack_us += node_pack_us;
+    backend->stats_gather_us += node_gather_us;
+    if (backend->profile_nodes) {
+        GGML_LOG_INFO(
+            "spiral geglu %-32s K=%-6d N=%-7d rows=%-3lld chunks=%-3d "
+            "npu=%8.1f us pack=%7.1f gather=%7.1f total=%7.1f\n",
+            glu->name, weights_rows, gate_cols, (long long) rows,
+            node_col_chunks, node_npu_us, node_pack_us, node_gather_us,
+            spiral_now_us() - node_start);
+    }
+    return true;
+}
+
 ggml_cgraph spiral_graph_view(ggml_cgraph * cgraph, int i0, int i1) {
     ggml_cgraph view = *cgraph;
     view.nodes = cgraph->nodes + i0;
@@ -1216,6 +1392,70 @@ bool spiral_softcap_pattern(const ggml_cgraph * cgraph, int32_t i, float * cap) 
     }
 
     *cap = p2[0];
+    return true;
+}
+
+bool spiral_geglu_pattern(const ggml_backend_spiral_device * dev,
+                          const ggml_cgraph * cgraph, int32_t i,
+                          ggml_tensor ** glu_out) {
+    if (i + 3 >= cgraph->n_nodes) {
+        return false;
+    }
+    ggml_tensor * gate = cgraph->nodes[i];
+    ggml_tensor * up = cgraph->nodes[i + 1];
+    ggml_tensor * glu = cgraph->nodes[i + 2];
+    ggml_tensor * down = cgraph->nodes[i + 3];
+    if (gate->op != GGML_OP_MUL_MAT || up->op != GGML_OP_MUL_MAT) {
+        return false;
+    }
+    // Reuse the gate+up pair checks: same input, K, format, and band budget.
+    if (spiral_chain_length(dev, cgraph->nodes + i, 2) != 2) {
+        return false;
+    }
+    const auto * gate_buffer = spiral_weight_buffer_of(dev, gate);
+    const auto * up_buffer = spiral_weight_buffer_of(dev, up);
+    if (gate_buffer == nullptr || up_buffer == nullptr ||
+        gate_buffer->padded_cols != up_buffer->padded_cols) {
+        return false;
+    }
+    if (glu->op != GGML_OP_GLU ||
+        ggml_get_glu_op(glu) != GGML_GLU_OP_GEGLU) {
+        return false;
+    }
+    if (glu->src[0] != gate || glu->src[1] != up) {
+        return false;
+    }
+    if (glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu) ||
+        glu->view_src != nullptr) {
+        return false;
+    }
+    if (gate->ne[0] != up->ne[0] || glu->ne[0] != gate->ne[0]) {
+        return false;
+    }
+    for (int32_t d = 1; d < GGML_MAX_DIMS; ++d) {
+        if (glu->ne[d] != gate->ne[d]) {
+            return false;
+        }
+    }
+    if (down->op != GGML_OP_MUL_MAT || down->src[1] != glu ||
+        !spiral_supports_mul_mat(dev, down)) {
+        return false;
+    }
+    // The gate and up results are not materialised, so each must feed only the
+    // GLU; the GLU must feed only the down matmul.
+    for (int32_t j = 0; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        for (int32_t k = 0; k < GGML_MAX_SRC; ++k) {
+            const ggml_tensor * src = n->src[k];
+            if ((src == gate || src == up) && n != glu) {
+                return false;
+            }
+            if (src == glu && n != down) {
+                return false;
+            }
+        }
+    }
+    *glu_out = glu;
     return true;
 }
 
@@ -1375,6 +1615,12 @@ enum ggml_status spiral_graph_compute(ggml_backend_t backend, ggml_cgraph * cgra
     };
 
     int i = 0;
+    ggml_tensor * geglu_gate = nullptr;
+    ggml_tensor * geglu_up = nullptr;
+    ggml_tensor * geglu_out = nullptr;
+    spiral_weight_chain * geglu_chain = nullptr;
+    static const bool geglu_fuse =
+        std::getenv("SPIRAL_NO_GEGLU_FUSE") == nullptr;
     while (i < cgraph->n_nodes) {
         ggml_tensor * node = cgraph->nodes[i];
 
@@ -1422,6 +1668,30 @@ enum ggml_status spiral_graph_compute(ggml_backend_t backend, ggml_cgraph * cgra
             continue;
         }
 
+        // The gate+up pair was consumed at its position; run it now, at the
+        // GLU node, so the activation is written when its lifetime starts.
+        if (geglu_out != nullptr) {
+            if (node != geglu_out) {
+                GGML_LOG_ERROR(
+                    "spiral: expected GEGLU node %s, got %s (%s)\n",
+                    geglu_out->name, node->name, ggml_op_name(node->op));
+                return GGML_STATUS_FAILED;
+            }
+            if (!spiral_run_geglu_pair(self, geglu_gate, geglu_up, geglu_out,
+                                       *geglu_chain)) {
+                GGML_LOG_ERROR("spiral: GEGLU pair for %s failed\n",
+                               geglu_out->name);
+                return GGML_STATUS_FAILED;
+            }
+            self->stats_geglu_fused++;
+            geglu_gate = nullptr;
+            geglu_up = nullptr;
+            geglu_out = nullptr;
+            geglu_chain = nullptr;
+            ++i;
+            continue;
+        }
+
         if (spiral_supports_mul_mat(self->dev, node)) {
             static const bool softcap_fuse =
                 std::getenv("SPIRAL_NO_SOFTCAP_FUSE") == nullptr;
@@ -1434,6 +1704,27 @@ enum ggml_status spiral_graph_compute(ggml_backend_t backend, ggml_cgraph * cgra
                 self->stats_softcap_fused++;
                 i += 4;
                 continue;
+            }
+            if (geglu_fuse) {
+                ggml_tensor * glu = nullptr;
+                if (spiral_geglu_pattern(self->dev, cgraph, i, &glu)) {
+                    auto * b0 = spiral_weight_buffer_of(self->dev, node);
+                    auto * b1 = spiral_weight_buffer_of(
+                        self->dev, cgraph->nodes[i + 1]);
+                    ggml_backend_spiral_buffer * pair[2] = {b0, b1};
+                    spiral_weight_chain * chain =
+                        (b0 != nullptr && b1 != nullptr)
+                            ? spiral_prepare_chain(self, pair, 2)
+                            : nullptr;
+                    if (chain != nullptr) {
+                        geglu_gate = node;
+                        geglu_up = cgraph->nodes[i + 1];
+                        geglu_out = glu;
+                        geglu_chain = chain;
+                        i += 2;
+                        continue;
+                    }
+                }
             }
             const int32_t remaining = cgraph->n_nodes - i;
             const int32_t length = spiral_chain_length(
@@ -1560,7 +1851,7 @@ void spiral_backend_free(ggml_backend_t backend) {
         GGML_LOG_INFO(
             "spiral profile: graphs=%llu wall=%.3f ms\n"
             "  cpu fallback: %.3f ms  nodes=%llu batches=%llu\n"
-            "  npu mulmat:   %.3f ms  calls=%llu chains=%llu fused_softcap=%llu row_chunks=%llu col_chunks=%llu max_slots=%d\n"
+            "  npu mulmat:   %.3f ms  calls=%llu chains=%llu fused_softcap=%llu fused_geglu=%llu row_chunks=%llu col_chunks=%llu max_slots=%d\n"
             "  npu stages:   txn=%.3f input=%.3f kernel=%.3f unpack=%.3f ms\n"
             "  host:         pack=%.3f gather=%.3f ms\n"
             "  weight prep:  %.3f ms  tensors=%llu\n",
@@ -1573,6 +1864,7 @@ void spiral_backend_free(ggml_backend_t backend) {
             (unsigned long long) self->stats_mul_mats,
             (unsigned long long) self->stats_chains,
             (unsigned long long) self->stats_softcap_fused,
+            (unsigned long long) self->stats_geglu_fused,
             (unsigned long long) self->stats_row_chunks,
             (unsigned long long) self->stats_col_chunks,
             self->dev->program ? self->dev->program->max_outstanding() : 0,

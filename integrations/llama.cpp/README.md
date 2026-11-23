@@ -20,6 +20,21 @@ node.  `SPIRAL_NO_SOFTCAP_FUSE=1` disables it for A/B or fallback.  The fused
 result uses the approximate bf16 vtanh; `spiral-smoke` includes the
 `q4_0_1536x512_sc30` case with the `5e-2` softcap verification policy.
 
+## GEGLU fusion
+
+The FFN chain `gate+up -> GLU(GEGLU, split) -> ffn_down` runs the activation in
+the device epilogue while the gate+up and down matmuls stay separate launches.
+The matcher requires a single consumer for the gate, up, and GLU, a contiguous
+F32 GLU output, and a supported down matmul.  The backend skips the gate and up
+nodes, runs the combined gate+up call at the GLU node's graph position with
+`kEpilogueGeglu`, and the down matmul reads the activation as a normal host
+tensor.  `SPIRAL_NO_GEGLU_FUSE=1` restores the CPU GLU for A/B;
+`SPIRAL_GEGLU_CHECK=1` runs the same pair without the epilogue and logs the
+device-vs-host GELU error.  On Gemma 4 E2B Q4_0 the 64-token greedy output is
+identical to the CPU-GLU path, CPU fallback drops from 93.7 to 63.8 ms per 32
+graphs, and the device error is 5e-4 to 3e-3 global relative per layer.  This is
+not an NPU chain: two launches remain and the activation crosses the host.
+
 ## Layout
 
 ```
