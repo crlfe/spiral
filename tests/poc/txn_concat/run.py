@@ -87,6 +87,14 @@ def main():
         cwd=WORK,
     )
 
+    print("\n== production Program FFN chain ==")
+    subprocess.run(
+        [str(exe), "golden", "q4_0_1536x12288", "q4_0_6144x1536", "20",
+         "chain"],
+        check=True,
+        cwd=WORK,
+    )
+
 
 if __name__ == "__main__":
     main()

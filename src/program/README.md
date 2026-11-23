@@ -188,6 +188,26 @@ one launch computes both outputs.  Output columns appear in segment order.
 This is intended for FFN gate+up and for Q+K+V in the KV layers; the caller
 splits the output columns.  Segments must share `format` and `weights_rows`.
 
+Dependent operations can be prepared as one chained transaction:
+
+```cpp
+spiral::ChainOp ops[2];
+ops[0].shape = gate_shape;                 // weights_cols = gate + up
+ops[0].shape.epilogue = spiral::kEpilogueGeglu;
+ops[0].weights = &gate_up;                 // two-segment prepare
+ops[1].shape = down_shape;                 // weights_rows = gate width
+ops[1].shape.epilogue = spiral::kEpilogueNone;
+ops[1].weights = &down;
+auto chain = program.prepare_chain(ops, 2);
+program.run_chain(chain, inputs, outputs.data(), down_shape.weights_cols, 0);
+```
+
+The first operation reads the host input; each later operation reads the
+previous output in place, and only the final operation's output is unpacked.
+`prepare_chain` copies every weight stream into one BO, so the per-operation
+handles only need to be alive during preparation.  Up to four operations;
+the chain runs synchronously and does not use the `submit`/`finish` pipeline.
+
 ## Performance snapshot
 
 Production medians (device kernel time).  This is a single-session

@@ -896,6 +896,51 @@ so it is off by default.  The offsetting cost is queue ordering: submitting
 the next call before the current one delays the current result, while
 submitting it after the current call only overlaps the CPU gap.
 
+### Chained transactions
+
+`Program::prepare_chain(ChainOp[], count)` builds one TXN from several
+prepared matmuls; `run_chain` executes it synchronously and unpacks only the
+final operation's output.  Each `ChainOp` carries a `MatmulShape` and a
+`PreparedWeights` handle.  Preparation:
+
+- copies every operation's resident weight stream into one BO at a 64-byte
+  aligned offset and patches each base body's weight `arg_plus`;
+- writes one config object per operation at `k * 8192` and patches the config
+  argument;
+- retargets every later operation's input patches to the output argument;
+- concatenates the compiler-generated bodies with `txn_concat.h` and uses
+  output offset 0 for every operation, so each output is consumed in place.
+
+The first operation reads the host input BO; later operations read the output
+BO.  The generated TCT waits order the in-place overwrite, so the down matmul
+reads the GEGLU result before writing its own output over it.
+
+The first production user is the FFN chain: gate+up with
+`kEpilogueGeglu` -> down.  The llama.cpp backend runs it at the down node's
+graph position, so the final output is written when its lifetime starts.
+`SPIRAL_NO_FFN_CHAIN=1` restores the host-mediated GEGLU path.
+
+Measured FFN 6144 (`q4_0_1536x12288` gate+up -> `q4_0_6144x1536`), production
+`Program` path, 20 iterations after warm-up:
+
+| path | total |
+| :-- | --: |
+| two launches with the device GEGLU intermediate | 447-458 us |
+| one chained TXN | 401-437 us |
+
+Gemma 4 E2B Q4_0, 64-token greedy, 3 alternating runs:
+
+| mode | eval | output |
+| :-- | --: | :-- |
+| host-mediated GEGLU (`SPIRAL_NO_FFN_CHAIN=1`) | 51.64 ms/token (19.37 t/s) | `Paris.` |
+| chained TXN | **47.81 ms/token (20.91 t/s)** | identical |
+
+The chain removes one dispatch and the host crossing of the activation per FFN
+block.  It also duplicates the gate+up and down streams in the chain BO
+(~32 MB per 12288 block) and costs ~30 ms of first-graph preparation (copying
+~1 GB of streams).  The chain is synchronous and capped at four operations;
+look-ahead (`SPIRAL_LOOKAHEAD=1`) is not compatible with it yet.
+
 ### What still needs a new design
 
 - **inp_gate + proj:** sequential, not parallel columns.  `inp_gate` produces

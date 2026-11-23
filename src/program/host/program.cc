@@ -24,6 +24,7 @@
 #include "generate_txn.h"
 #include "quants/q4_0/repack.h"
 #include "quants/q6_k/repack.h"
+#include "txn_concat.h"
 
 namespace spiral {
 namespace {
@@ -37,6 +38,9 @@ using PackedBytesFn = int64_t (*)(int64_t, int64_t);
 
 constexpr int32_t kInputParts = 4;
 constexpr int32_t kWeightParts = 2;
+constexpr int32_t kMaxChainOps = 4;
+constexpr size_t kConfigObjectBytes = design::kInputGroupElems * sizeof(uint16_t);
+constexpr size_t kChainConfigBytes = kMaxChainOps * kConfigObjectBytes;
 
 bool is_diagnostic_mode(int32_t format) {
   return format == design::kModeFifo || format == design::kModeRawCheck ||
@@ -51,6 +55,10 @@ void split_parts(int32_t total, int32_t parts, int32_t* out,
   for (int32_t i = 0; i < parts; ++i) {
     out[i] = base + (i < extra ? 1 : 0);
   }
+}
+
+size_t align_up(size_t value, size_t align) {
+  return (value + align - 1) / align * align;
 }
 
 size_t max_instruction_words() {
@@ -69,7 +77,7 @@ size_t max_instruction_words() {
   if (!sequence.has_value()) {
     throw std::runtime_error("transaction generation failed");
   }
-  return sequence->size();
+  return sequence->size() * kMaxChainOps;
 }
 
 RepackFn repack_fn(int32_t format) {
@@ -379,8 +387,7 @@ struct Program::Impl {
                           xrt::bo::flags::cacheable, kernel.group_id(1));
       inputs.emplace_back(loaded.device, design::kInputWords * sizeof(uint32_t),
                           xrt::bo::flags::host_only, kernel.group_id(4));
-      configs.emplace_back(loaded.device,
-                           design::kInputGroupElems * sizeof(uint16_t),
+      configs.emplace_back(loaded.device, kChainConfigBytes,
                            xrt::bo::flags::host_only, kernel.group_id(5));
       outputs.emplace_back(loaded.device,
                            design::kMaxOutputElems * sizeof(uint16_t),
@@ -431,6 +438,7 @@ struct PreparedWeights::Impl {
   int32_t group_bytes = 0;
   int32_t segments = 1;
   bool equal_segments = true;
+  size_t bo_bytes = 0;
   std::unique_ptr<xrt::bo> weights_bo;
   std::vector<uint8_t> weights;
   std::vector<uint32_t> txn;
@@ -441,6 +449,24 @@ PreparedWeights::~PreparedWeights() = default;
 PreparedWeights::PreparedWeights(PreparedWeights&&) noexcept = default;
 PreparedWeights& PreparedWeights::operator=(PreparedWeights&&) noexcept =
     default;
+
+struct PreparedChain::Impl {
+  const Program* owner = nullptr;
+  std::vector<MatmulShape> shapes;
+  int32_t rows_steps = 0;
+  int32_t input_pad = 0;
+  int32_t weights_rows = 0;
+  int32_t final_cols_bands = 0;
+  int32_t final_cols = 0;
+  std::vector<uint32_t> txn;
+  std::unique_ptr<xrt::bo> weights_bo;
+  std::vector<uint8_t> configs;
+};
+
+PreparedChain::PreparedChain() = default;
+PreparedChain::~PreparedChain() = default;
+PreparedChain::PreparedChain(PreparedChain&&) noexcept = default;
+PreparedChain& PreparedChain::operator=(PreparedChain&&) noexcept = default;
 
 Program::Program() : impl_(std::make_unique<Impl>()) {}
 Program::~Program() = default;
@@ -631,6 +657,7 @@ PreparedWeights Program::prepare_packed(const MatmulShape& shape,
   const size_t data_bytes =
       static_cast<size_t>(design::kGroups) * impl.group_bytes;
   const size_t bo_bytes = data_bytes + design::kL2StreamBytes;
+  impl.bo_bytes = bo_bytes;
   impl.weights.resize(bo_bytes, 0);
   impl.weights_bo = std::make_unique<xrt::bo>(
       impl_->loaded.device, bo_bytes, xrt::bo::flags::host_only,
@@ -835,6 +862,239 @@ void Program::finish(RunTicket& ticket) {
     --impl_->outstanding;
   }
   ticket.slot = -1;
+}
+
+PreparedChain Program::prepare_chain(const ChainOp* ops, int32_t count) {
+  if (!impl_) {
+    throw std::runtime_error("Program is not initialized");
+  }
+  if (ops == nullptr || count <= 0 || count > kMaxChainOps) {
+    throw std::invalid_argument(
+        "prepare_chain needs 1..kMaxChainOps operations");
+  }
+
+  PreparedChain chain;
+  chain.impl_ = std::make_unique<PreparedChain::Impl>();
+  auto& c = *chain.impl_;
+  c.owner = this;
+  c.shapes.reserve(static_cast<size_t>(count));
+
+  std::vector<std::vector<uint32_t>> bases;
+  std::vector<txn_concat::OpPatch> patches;
+  std::vector<size_t> weight_offsets(static_cast<size_t>(count), 0);
+  size_t weight_bytes = 0;
+  int32_t previous_cols = 0;
+
+  for (int32_t i = 0; i < count; ++i) {
+    const ChainOp& op = ops[i];
+    if (op.weights == nullptr || !op.weights->impl_) {
+      throw std::invalid_argument("chain operation has no prepared weights");
+    }
+    const auto& p = *op.weights->impl_;
+    if (p.owner != this) {
+      throw std::invalid_argument(
+          "chain PreparedWeights belongs to a different Program");
+    }
+    if (op.shape.format != p.shape.format ||
+        op.shape.weights_rows != p.shape.weights_rows ||
+        op.shape.weights_cols != p.shape.weights_cols) {
+      throw std::invalid_argument(
+          "chain shape does not match prepared weights");
+    }
+    if (op.shape.epilogue != kEpilogueNone &&
+        op.shape.epilogue != kEpilogueSoftcap &&
+        op.shape.epilogue != kEpilogueGeglu) {
+      throw std::invalid_argument("unknown tile epilogue");
+    }
+    if (op.shape.epilogue == kEpilogueSoftcap) {
+      if (op.shape.soft_cap == 0.0f) {
+        throw std::invalid_argument(
+            "softcap epilogue requires a nonzero soft_cap");
+      }
+    } else if (op.shape.soft_cap != 0.0f) {
+      throw std::invalid_argument(
+          "soft_cap is only valid with the softcap epilogue");
+    }
+    if (op.shape.epilogue == kEpilogueGeglu) {
+      if (p.segments != 2 || !p.equal_segments) {
+        throw std::invalid_argument(
+            "GEGLU epilogue needs two equal-width segments (gate, up)");
+      }
+      if (op.shape.weights_cols % (2 * design::kBandCols) != 0) {
+        throw std::invalid_argument(
+            "GEGLU epilogue needs an even number of bands");
+      }
+    }
+    const int32_t out_cols =
+        op.shape.epilogue == kEpilogueGeglu
+            ? op.shape.weights_cols / 2
+            : op.shape.weights_cols;
+    if (i > 0 && op.shape.weights_rows > previous_cols) {
+      throw std::invalid_argument(
+          "chain input is wider than the previous operation's output");
+    }
+    previous_cols = out_cols;
+
+    weight_offsets[static_cast<size_t>(i)] = align_up(weight_bytes, 64);
+    weight_bytes = weight_offsets[static_cast<size_t>(i)] + p.bo_bytes;
+
+    c.shapes.push_back(op.shape);
+    bases.push_back(p.txn);
+
+    txn_concat::OpPatch patch;
+    patch.config_offset = static_cast<uint64_t>(i) * kConfigObjectBytes;
+    patch.weight_offset = weight_offsets[static_cast<size_t>(i)];
+    patch.output_offset = 0;
+    patch.input_from_output = i > 0;
+    patches.push_back(patch);
+  }
+
+  // One weight BO with every operation's resident stream at its offset.
+  const size_t bo_bytes = weight_bytes + design::kL2StreamBytes;
+  c.weights_bo = std::make_unique<xrt::bo>(
+      impl_->loaded.device, bo_bytes, xrt::bo::flags::host_only,
+      impl_->kernel.group_id(3));
+  auto* weight_dst = c.weights_bo->map<uint8_t*>();
+  std::memset(weight_dst, 0, bo_bytes);
+  for (int32_t i = 0; i < count; ++i) {
+    const auto& p = *ops[i].weights->impl_;
+    const auto* src = p.weights_bo->map<uint8_t*>();
+    std::memcpy(weight_dst + weight_offsets[static_cast<size_t>(i)], src,
+                p.bo_bytes);
+  }
+  c.weights_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+  // One config object per operation.
+  c.configs.assign(static_cast<size_t>(count) * kConfigObjectBytes, 0);
+  for (int32_t i = 0; i < count; ++i) {
+    const auto& p = *ops[i].weights->impl_;
+    write_config(
+        reinterpret_cast<uint32_t*>(c.configs.data() +
+                                    static_cast<size_t>(i) * kConfigObjectBytes),
+        ops[i].shape.format, p.tile_bytes, p.rows_steps, p.cols_bands,
+        p.weights_blocks, p.total_tiles, p.input_pad, p.weight_pad,
+        ops[i].shape.soft_cap, ops[i].shape.epilogue);
+  }
+
+  c.txn = txn_concat::concat(bases, patches);
+  if (c.txn.size() > impl_->instr_words) {
+    throw std::runtime_error("chain instruction stream overflow");
+  }
+
+  const auto& first = *ops[0].weights->impl_;
+  const auto& last = *ops[count - 1].weights->impl_;
+  c.rows_steps = first.rows_steps;
+  c.input_pad = first.input_pad;
+  c.weights_rows = ops[0].shape.weights_rows;
+  c.final_cols_bands = last.cols_bands;
+  c.final_cols = ops[count - 1].shape.weights_cols;
+  return chain;
+}
+
+void Program::run_chain(const PreparedChain& chain, const uint16_t* inputs,
+                        uint16_t* outputs, int32_t outputs_cols,
+                        int32_t outputs_col_offset, RunTimings* timings) {
+  if (!impl_) {
+    throw std::runtime_error("Program is not initialized");
+  }
+  if (!chain.impl_) {
+    throw std::invalid_argument("PreparedChain is empty");
+  }
+  const auto& c = *chain.impl_;
+  if (c.owner != this) {
+    throw std::invalid_argument(
+        "PreparedChain belongs to a different Program");
+  }
+  if (inputs == nullptr || outputs == nullptr) {
+    throw std::invalid_argument("null input or output buffer");
+  }
+  if (outputs_col_offset < 0 ||
+      outputs_cols < outputs_col_offset + c.final_cols) {
+    throw std::invalid_argument("output buffer is too small");
+  }
+  if (c.txn.size() > impl_->instr_words) {
+    throw std::runtime_error("chain instruction stream overflow");
+  }
+
+  const int32_t slots = static_cast<int32_t>(impl_->runs.size());
+  int32_t slot = -1;
+  for (int32_t k = 0; k < slots; ++k) {
+    const int32_t candidate = (impl_->next_slot + k) % slots;
+    if (!impl_->busy[static_cast<size_t>(candidate)]) {
+      slot = candidate;
+      break;
+    }
+  }
+  if (slot < 0) {
+    throw std::runtime_error("all pipeline slots are busy");
+  }
+  impl_->next_slot = (slot + 1) % slots;
+  impl_->busy[static_cast<size_t>(slot)] = true;
+  ++impl_->outstanding;
+  impl_->max_outstanding =
+      std::max(impl_->max_outstanding, impl_->outstanding);
+
+  RunTimings t;
+  const double start_time = now_us();
+  const auto slot_index = static_cast<size_t>(slot);
+
+  auto stage = Clock::now();
+  impl_->instrs[slot_index].write(c.txn.data(),
+                                  c.txn.size() * sizeof(uint32_t), 0);
+  impl_->instrs[slot_index].sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  t.txn_us = elapsed_us(stage);
+
+  stage = Clock::now();
+  auto* config_buf = impl_->configs[slot_index].map<uint32_t*>();
+  std::memcpy(config_buf, c.configs.data(), c.configs.size());
+  impl_->configs[slot_index].sync(XCL_BO_SYNC_BO_TO_DEVICE,
+                                  c.configs.size(), 0);
+  fill_inputs(impl_->inputs[slot_index].map<uint32_t*>(), c.rows_steps,
+              c.weights_rows, inputs);
+  const int32_t input_groups =
+      (c.rows_steps + design::kInputGroupRows - 1) /
+      design::kInputGroupRows;
+  const size_t input_objects = input_groups + c.input_pad;
+  impl_->inputs[slot_index].sync(
+      XCL_BO_SYNC_BO_TO_DEVICE,
+      input_objects * design::kInputGroupElems * sizeof(uint16_t), 0);
+  t.input_us = elapsed_us(stage);
+
+  stage = Clock::now();
+  auto& run = impl_->runs[slot_index];
+  run.set_arg(0, kRunOpcode);
+  run.set_arg(1, impl_->instrs[slot_index]);
+  run.set_arg(2, static_cast<uint32_t>(c.txn.size()));
+  run.set_arg(3, *c.weights_bo);
+  run.set_arg(4, impl_->inputs[slot_index]);
+  run.set_arg(5, impl_->configs[slot_index]);
+  run.set_arg(6, impl_->outputs[slot_index]);
+  run.start();
+  t.start_us = elapsed_us(stage);
+
+  stage = Clock::now();
+  run.wait2(std::chrono::milliseconds(kRunTimeoutMs));
+  t.wait_us = elapsed_us(stage);
+
+  stage = Clock::now();
+  impl_->outputs[slot_index].sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+  t.sync_us = elapsed_us(stage);
+  t.kernel_us = t.start_us + t.wait_us + t.sync_us;
+
+  stage = Clock::now();
+  unpack_outputs(impl_->outputs[slot_index].map<const uint16_t*>(),
+                 outputs, c.final_cols_bands, outputs_cols,
+                 outputs_col_offset);
+  t.unpack_us = elapsed_us(stage);
+  t.total_us = now_us() - start_time;
+
+  impl_->busy[slot_index] = false;
+  if (impl_->outstanding > 0) {
+    --impl_->outstanding;
+  }
+  if (timings) {
+    *timings = t;
+  }
 }
 
 void Program::run(const MatmulShape& shape, const PreparedWeights& weights,

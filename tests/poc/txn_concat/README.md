@@ -127,6 +127,15 @@ the floor is paid once.
    output check/unpack.  Both produce the same device result
    (12,116 bit mismatches, 5.3e-3 relative).
 
+7. **The production chain API is exercised.**  The `chain` case builds one
+   `Program::prepare_chain` from the gate+up (GEGLU) and down prepared handles,
+   runs it with `run_chain`, and compares it with two separate launches that
+   use the same device GEGLU intermediate.  The result is bit-identical.  On
+   this 6144 FFN the chain is 401-437 us against 447-458 us for two launches;
+   the remaining difference is dispatch and host hand-off.  The chain copies
+   both weight streams into one BO, so the per-op handles only need to be alive
+   during preparation.
+
 ## Why concatenate
 
 The ~44-50 us on every NPU call is **dispatch latency**, not this design's

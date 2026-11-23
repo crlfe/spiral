@@ -92,6 +92,33 @@ class PreparedWeights {
   std::unique_ptr<Impl> impl_;
 };
 
+// One operation in a chained transaction.  The PreparedWeights handle must
+// outlive the chain.
+struct ChainOp {
+  MatmulShape shape;
+  const PreparedWeights* weights = nullptr;
+};
+
+// A prepared multi-operation transaction.  Operations run back to back in one
+// dispatch; each operation's input can read the previous output in place.  The
+// chain copies the prepared weight streams, so the per-operation handles need
+// not outlive it.
+class PreparedChain {
+ public:
+  PreparedChain();
+  ~PreparedChain();
+
+  PreparedChain(PreparedChain&&) noexcept;
+  PreparedChain& operator=(PreparedChain&&) noexcept;
+  PreparedChain(const PreparedChain&) = delete;
+  PreparedChain& operator=(const PreparedChain&) = delete;
+
+ private:
+  friend class Program;
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
 // A loaded Spiral NPU program.
 //
 // The device design, instruction stream, and buffer objects are created once.
@@ -144,6 +171,17 @@ class Program {
 
   // Wait for a submitted call, unpack it, and release its slot.
   void finish(RunTicket& ticket);
+
+  // Prepare one TXN with `count` operations.  Later operations read the
+  // previous output buffer in place; the final operation's output is the
+  // chain result.  The weight streams are copied into the chain's BO.
+  PreparedChain prepare_chain(const ChainOp* ops, int32_t count);
+
+  // Run a prepared chain synchronously and unpack the final operation's
+  // output.  `inputs` feeds the first operation.
+  void run_chain(const PreparedChain& chain, const uint16_t* inputs,
+                 uint16_t* outputs, int32_t outputs_cols,
+                 int32_t outputs_col_offset, RunTimings* timings = nullptr);
 
   // One-shot convenience: prepare, run, and discard the repacked weights.
   //

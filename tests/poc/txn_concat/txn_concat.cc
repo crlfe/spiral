@@ -885,6 +885,109 @@ void run_production_geglu_case(const std::string& golden_dir) {
   compare_tol(reference, geglu_out, 2e-2, "production geglu");
 }
 
+void run_production_chain_case(const std::string& golden_dir) {
+  const Golden gate_up = load_golden(golden_dir, "q4_0_1536x12288");
+  const Golden down_golden = load_golden(golden_dir, "q4_0_6144x1536");
+  const int32_t gate_cols = gate_up.weights_cols / 2;
+  if (gate_cols != down_golden.weights_rows) {
+    throw std::runtime_error("gate+up half width does not match down K");
+  }
+  spiral::WeightSegment segments[2] = {
+      {gate_up.raw.data(), gate_up.raw_stride, 0, gate_cols},
+      {gate_up.raw.data(), gate_up.raw_stride, gate_cols, gate_cols},
+  };
+
+  spiral::Program program;
+  spiral::MatmulShape gate_shape;
+  gate_shape.format = gate_up.format;
+  gate_shape.weights_rows = gate_up.weights_rows;
+  gate_shape.weights_cols = gate_up.weights_cols;
+  gate_shape.inputs_vecs = design::kInputsVecs;
+
+  spiral::MatmulShape down_shape;
+  down_shape.format = down_golden.format;
+  down_shape.weights_rows = down_golden.weights_rows;
+  down_shape.weights_cols = down_golden.weights_cols;
+  down_shape.inputs_vecs = design::kInputsVecs;
+
+  spiral::PreparedWeights gate_weights =
+      program.prepare(gate_shape, segments, 2);
+  spiral::PreparedWeights down_weights =
+      program.prepare(down_shape, down_golden.raw.data(),
+                      down_golden.raw_stride, 0);
+
+  // Reference: plain gate+up, host GEGLU, then down.
+  std::vector<uint16_t> plain_out(
+      static_cast<size_t>(design::kInputsVecs) * gate_up.weights_cols);
+  program.run(gate_shape, gate_weights, gate_up.inputs.data(),
+              plain_out.data(), gate_up.weights_cols, 0);
+  const std::vector<uint16_t> reference_glu = host_geglu(plain_out, gate_cols);
+  std::vector<uint16_t> reference_out(
+      static_cast<size_t>(design::kInputsVecs) * down_golden.weights_cols);
+  program.run(down_shape, down_weights, reference_glu.data(),
+              reference_out.data(), down_golden.weights_cols, 0);
+
+  // One TXN: gate+up (GEGLU) -> down, both in place.
+  spiral::ChainOp ops[2];
+  ops[0].shape = gate_shape;
+  ops[0].shape.epilogue = spiral::kEpilogueGeglu;
+  ops[0].weights = &gate_weights;
+  ops[1].shape = down_shape;
+  ops[1].shape.epilogue = spiral::kEpilogueNone;
+  ops[1].weights = &down_weights;
+  spiral::PreparedChain chain = program.prepare_chain(ops, 2);
+
+  std::vector<uint16_t> chain_out(
+      static_cast<size_t>(design::kInputsVecs) * down_golden.weights_cols);
+  for (int i = 0; i < 3; ++i) {
+    program.run_chain(chain, gate_up.inputs.data(), chain_out.data(),
+                      down_golden.weights_cols, 0, nullptr);
+  }
+  std::vector<double> totals;
+  std::vector<double> kernels;
+  for (int i = 0; i < 20; ++i) {
+    spiral::RunTimings timings;
+    program.run_chain(chain, gate_up.inputs.data(), chain_out.data(),
+                      down_golden.weights_cols, 0, &timings);
+    totals.push_back(timings.total_us);
+    kernels.push_back(timings.kernel_us);
+  }
+  compare_tol(reference_out, chain_out, 1e-2, "production chain");
+  std::printf("production chain: total %.1f us kernel %.1f us\n",
+              median(totals), median(kernels));
+
+  // Two separate launches with the same device GEGLU intermediate.
+  spiral::MatmulShape geglu_shape = gate_shape;
+  geglu_shape.epilogue = spiral::kEpilogueGeglu;
+  std::vector<uint16_t> glu_bf(
+      static_cast<size_t>(design::kInputsVecs) * gate_cols);
+  std::vector<uint16_t> two_out(
+      static_cast<size_t>(design::kInputsVecs) * down_golden.weights_cols);
+  auto run_two = [&](spiral::RunTimings* out) {
+    spiral::RunTimings t1;
+    spiral::RunTimings t2;
+    program.run(geglu_shape, gate_weights, gate_up.inputs.data(),
+                glu_bf.data(), gate_cols, 0, &t1);
+    program.run(down_shape, down_weights, glu_bf.data(), two_out.data(),
+                down_golden.weights_cols, 0, &t2);
+    if (out != nullptr) {
+      *out = t1;
+      out->total_us += t2.total_us;
+    }
+  };
+  for (int i = 0; i < 3; ++i) {
+    run_two(nullptr);
+  }
+  std::vector<double> two_totals;
+  for (int i = 0; i < 20; ++i) {
+    spiral::RunTimings t;
+    run_two(&t);
+    two_totals.push_back(t.total_us);
+  }
+  compare_tol(chain_out, two_out, 1e-6, "chain vs two launches");
+  std::printf("production two launches: total %.1f us\n", median(two_totals));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -902,6 +1005,10 @@ int main(int argc, char** argv) {
     }
     if (argc > 5 && std::string(argv[5]) == "program") {
       run_production_geglu_case(golden_dir);
+      return 0;
+    }
+    if (argc > 5 && std::string(argv[5]) == "chain") {
+      run_production_chain_case(golden_dir);
       return 0;
     }
 
