@@ -298,7 +298,7 @@ envelope, not a rounding-mode bug. Do not replace this with a fixed absolute
 error: it cannot fit both K=1536 and K=12288, and it makes the effective
 relative bound depend on the column magnitude.
 
-`src/quants/tests/mmul.py` uses its own per-column bound. `run.py` applies the
+`src/quants/tests/mmul.py` uses its own per-column bound. `tests.py` applies the
 same 30-case policy as the C++ test.
 
 The Python runner uses the fixed-max layout (64 input objects, 128 weight
@@ -312,8 +312,10 @@ memref and conditional acquire/release pattern.
   changed. `build.py` deletes the active build directory's `*.o` first.
 - The inline-kernel JIT cache can also reuse stale objects. Clear stale
   `~/.npu/cache` entries after editing an inline kernel.
-- `design.py` and `run.py` are in the JIT `source_files` list, so edits to fixed
-  constants or module-level helpers invalidate the cache automatically.
+- `design.py`, `run.py`, `npu.py`, `sequence.py` and `worker.py` are in the
+  JIT `source_files` list, so edits to fixed constants, the static device
+  configuration, the host sequence or the worker body invalidate the cache
+  automatically.
 - `build.py` emits `design_meta.h` from `design.py`; the host uses it for buffer
   sizes, tile geometry, output layout and config indices, so host and Python
   design cannot drift.
@@ -337,11 +339,16 @@ memref and conditional acquire/release pattern.
   `if_`/`else_` cannot yield memory objects.
 - `@iron.jit` rejects unannotated scalar parameters (no runtime-scalar
   plumbing), even though `Runtime`/`fill` support runtime values.
+- Runtime fills and drains take a `TensorAccessPattern` (`tap=...`), not
+  separate `offset`/`sizes`/`strides` arguments; `tensor_dims` is the runtime
+  buffer's shape. `sequence.py` is the only place that builds them.
+- `range_` with `iter_args` supplies its own yield, so do not pass
+  `insert_yield`.
 - bfloat16 inputs must be reinterpreted, not cast: `.view(np.uint16)`. A
   `dtype=np.uint16` cast converts numerically and produces garbage bits.
 - `pack.py` owns case construction: config object, input groups, block-major
-  weights and reference data. `run.py` pads into the fixed host buffers and
-  verifies.
+  weights and reference data. `sequence.py` pads into the fixed host buffers
+  and `tests.py` verifies.
 
 ### C++ host notes
 
@@ -391,7 +398,7 @@ Measure program memory from the linked ELF:
 builds are larger because they also link `program_assemble`, `program_probe`,
 `program_raw_check`, the split-path worker and diagnostic-only branches.
 
-Unused device functions and kernels should be removed from `run.py`: they slow
+Unused device functions and kernels should be removed from `npu.py`: they slow
 JIT/build, appear in the source-file cache set, and hide which kernels the
 worker actually calls. The block kernels own the production path;
 `assemble`/`probe` remain for diagnostics.

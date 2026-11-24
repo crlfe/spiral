@@ -15,8 +15,11 @@ beat the CPU or iGPU on throughput.
 
 ```text
 design.py           fixed geometry, buffer types, config layout
+npu.py              static NPU configuration: tiles, object FIFOs, buffers, kernels
+sequence.py         host runtime sequence: DMA fills and drains
+worker.py           worker program: config decode and stream loop
+run.py              composition root and JIT entry points
 pack.py             case construction, host packing, NumPy references
-run.py              JIT program and Python test runner
 build.py            xclbin + transaction + design_meta.h + golden data
 kernels/            AIE tile assembly, probe diagnostics, quant compute
 host/program.h/.cc  loaded design and host repack/pack/unpack API
