@@ -24,9 +24,16 @@ set(SPIRAL_PROGRAM_BUILD_DIR "${SPIRAL_PROGRAM_DIR}/build-production" CACHE PATH
     "Directory containing the production aie.xclbin, design_meta.h, generate_txn.h")
 set(SPIRAL_GOLDEN_DIR "${SPIRAL_PROGRAM_DIR}/build/golden" CACHE PATH
     "Directory containing the golden smoke-test cases")
-set(SPIRAL_AIE_INCLUDE_DIR
-    "$ENV{HOME}/Projects/mlir-aie/ironenv/lib/python3.12/site-packages/mlir_aie/include"
-    CACHE PATH "Directory containing aie/Runtime/TxnEncoding.h")
+# Prefer the environment set up by tools/env.sh; fall back to a sibling mlir-aie
+# checkout so a default build needs no configuration.
+if (DEFINED ENV{MLIR_AIE_INSTALL_DIR} AND NOT "$ENV{MLIR_AIE_INSTALL_DIR}" STREQUAL "")
+  set(_spiral_aie_default "$ENV{MLIR_AIE_INSTALL_DIR}/include")
+else()
+  set(_spiral_aie_default
+      "${_spiral_here}/../../mlir-aie/ironenv/lib/python3.12/site-packages/mlir_aie/include")
+endif()
+set(SPIRAL_AIE_INCLUDE_DIR "${_spiral_aie_default}" CACHE PATH
+    "Directory containing aie/Runtime/TxnEncoding.h")
 
 set(SPIRAL_PROGRAM_SOURCE "${SPIRAL_PROGRAM_DIR}/host/program.cc")
 set(SPIRAL_XCLBIN "${SPIRAL_PROGRAM_BUILD_DIR}/aie.xclbin")

@@ -1,3 +1,6 @@
+> Role: record (frozen). Written 2026-11; numbers are historical evidence and
+> are not updated. Current numbers: [`../../../docs/measurements.md`](../../../docs/measurements.md).
+
 # Quantized Weight Stream PoC
 
 `stream.py` tests the memory path a quantized matrix multiply would use.  The

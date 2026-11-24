@@ -1,3 +1,6 @@
+> Role: record (frozen). Written 2026-11; numbers are historical evidence and
+> are not updated. Current numbers: [`../../docs/measurements.md`](../../docs/measurements.md).
+
 # Program-memory overlays
 
 Can a loaded xclbin swap compute-tile program memory quickly, without a PDI
@@ -290,22 +293,22 @@ running across replacements.
 
 ```bash
 # link layout and tails (no hardware)
-~/Projects/mlir-aie/ironenv/bin/python tests/poc/overlay_blocks.py
+python tests/poc/overlay_blocks.py
 
 # transport: one tile, write + read-back
-~/Projects/mlir-aie/ironenv/bin/python tests/poc/overlay_packets.py --design slot --batch --packets 768
-~/Projects/mlir-aie/ironenv/bin/python tests/poc/overlay_packets.py --design slot --packets 768 --verify-all --read-batch 4
+python tests/poc/overlay_packets.py --design slot --batch --packets 768
+python tests/poc/overlay_packets.py --design slot --packets 768 --verify-all --read-batch 4
 
 # broadcast: all 32 tiles + polls (default)
-~/Projects/mlir-aie/ironenv/bin/python tests/poc/overlay_packets.py
+python tests/poc/overlay_packets.py
 
 # switch: alternate A,B rounds with the slot rewritten each round
-~/Projects/mlir-aie/ironenv/bin/python tests/poc/overlay_packets.py --design switch --count 6
+python tests/poc/overlay_packets.py --design switch --count 6
 # the same rounds unrolled into one dispatch
-~/Projects/mlir-aie/ironenv/bin/python tests/poc/overlay_packets.py --design switch --count 32 --one-run
+python tests/poc/overlay_packets.py --design switch --count 32 --one-run
 
 # cost baseline / A/B images; still used by slot --image variant
-~/Projects/mlir-aie/ironenv/bin/python tests/poc/overlay.py
+python tests/poc/overlay.py
 ```
 
 `overlay_packets.py` options: `--design broadcast|slot|switch`, `--packets N`

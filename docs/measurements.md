@@ -1,0 +1,359 @@
+> Role: reference (numbers). Current as of 2026-11-24. History: `git log -- docs/measurements.md`.
+
+# Measurements
+
+The single home for performance numbers. Other documents link here instead of
+restating figures. Every table names the build, the machine state and the date
+where it is known; if a number has none of those, it is not quotable.
+
+Machine: Ryzen AI 9 HX 475 (XDNA2, `aie2p`, arch 21), 64 GB.
+`/dev/accel/accel0`; targets from `tests/poc`, `src/quants`, `src/program`.
+
+## 1. How to measure
+
+### Configuration baseline
+
+Numbers are only comparable when the machine is in the same state. The baseline
+is the normal boot state plus two deliberate changes: iGPU SCLK capped at
+2400 MHz and NPU pmode `turbo`.
+
+| setting | value | source |
+| :-- | :-- | :-- |
+| NPU power mode | `turbo` | `DRM_AMDXDNA_GET_POWER_MODE` |
+| iGPU DPM force level | `manual` | `power_dpm_force_performance_level` |
+| iGPU SCLK OD bounds | 600 / 2400 MHz | `pp_od_clk_voltage` |
+| platform profile | `balanced` | `/sys/firmware/acpi/platform_profile` |
+| CPU governor | `powersave` on every policy | `cpufreq/policy*/scaling_governor` |
+| CPU EPP | `balance_performance` (warning only) | `cpufreq/policy*/energy_performance_preference` |
+| PM QoS | off (`SPIRAL_DMA_LATENCY` unset) | environment |
+
+`tests/bench/soak/hostconfig.py` verifies all of it, prints restore commands,
+and exits `2` on drift. `--allow-drift` reports and continues; those runs must
+not be compared with the tables here.
+
+fclk and socclk are deliberately **not** pinned: pinning them measured no
+change, so they stay on DVFS and are printed as observations. The iGPU SCLK cap
+is the one setting that drifts silently (a reboot or driver reload restores the
+3100 MHz hardware range).
+
+### Procedure
+
+- Cool to the idle baseline: fans off, `Tctl` below ~45 C.
+- Run a long greedy generation per device (thousands of tokens), sampling about
+  once per 0.5 s, until `Tctl` and fan RPM have been flat for 20 s.
+- Report peak `Tctl`, peak fan RPM, throughput, and both fans.
+- Cool back to idle (fan 0, `Tctl` within 2 C) before the next device.
+- Short runs mislead: the iGPU and CPU look fanless until the task outlasts the
+  thermal time constant.
+
+### Signals
+
+| signal | source |
+| :-- | :-- |
+| CPU temperature | `k10temp` `temp1_input` (Tctl) |
+| iGPU temperature | `amdgpu` hwmon `temp1_input` |
+| fan speed | both `hp` fans (`fan1_input`, `fan2_input`) |
+| host CPU utilisation | `/proc/stat` busy delta |
+| NPU clocks | `DRM_IOCTL_AMDXDNA_GET_INFO` (MP-NPU and H) |
+| iGPU clock | `amdgpu` hwmon `pp_dpm_sclk` / `amdgpu` sysfs |
+| throughput | `pp8`, `tg16`, a 300-token generation |
+
+Both `hp` fans follow one EC curve and always move together (150-200 RPM
+apart). The curve has a knee just above 53 C: 53.1 C can finish at zero RPM
+while 54.0 C sits at 2.8k, and CPU-heavy runs jump to ~4.8k.
+
+**Power is not measured.** RAPL `energy_uj` is root-only in the measurement
+container and `SOCKET_POWER` is too coarse, so fan RPM and `Tctl` are the proxy.
+
+### Acceptance bar
+
+Productive-and-quiet, not peak throughput: a usable rate with fan RPM within
+~150 of idle and `Tctl` within ~10 C of idle. No current path meets it (the
+quietest, FastFlowLM, still reaches 54 C and 2.8k RPM), so it is a target, not a
+gate.
+
+## 2. Device and engine comparison
+
+`gemma-4-E2B_q4_0-it.gguf` (Gemma 4 E2B Q4_0, native Q6_K head). 3000-token
+greedy soaks, one submission thread, peaks after the 20 s plateau window,
+measured 2026-11 under the configuration baseline.
+
+| engine | tokens | t/s | peak Tctl | peak iGPU | fan1 | fan2 | plateau | cool-back |
+| :-- | --: | --: | --: | --: | --: | --: | --: | --: |
+| iGPU (`ROCm0`, gfx1150) | 3000 | 52.42 | 54.2 C | 54.0 C | 2793 | 2597 | none in 59 s | 123 s |
+| FastFlowLM (`gemma4-it:e2b`) | 3000 | 25.75 | 54.0 C | 48.0 C | 2818 | 2626 | none in 117 s | 194 s |
+| CPU (12 threads) | 3000 | 22.17 | 91.0 C | 56.0 C | 4845 | 4657 | none in 138 s | 126 s |
+| Spiral NPU | 3000 | 16.15 | 73.6 C | 56.0 C | 4834 | 4657 | 65 s | 121 s |
+
+FastFlowLM uses its own quantisation and packing, so that row compares engine
+classes; the other three share the GGUF. The CPU row varied 19.6-22.8 t/s
+between runs at the same settings.
+
+The NPU path's heat is mostly host work: an NPU-only busy loop
+(`src/program ./test --head-soak 20000`, 1% CPU busy) reaches `Tctl` 60.6 C,
+iGPU 49.0 C and 2818/2626 RPM over 152 s. The extra heat during decode is the
+CPU fallback and host submission. The same head loop runs ~4% faster under
+pmode `turbo` (152.3 s vs 155-159 s).
+
+### Per-call path, 300-token answer
+
+30-token prompt, 300-token greedy answer, native Q6_K head, one CPU fallback
+thread, `llama-completion -no-cnv --ignore-eos --temp 0`.
+
+| device | pp8 | tg16 | 300-token generation | per token |
+| :-- | --: | --: | --: | --: |
+| iGPU (`ROCm0`) | 383.1 t/s | 55.30 t/s | 55.11 t/s | 18.1 ms |
+| CPU (`-ngl 0`, 12 threads) | 224.1 t/s | 35.34 t/s | 35.78 t/s | 28.0 ms |
+| Spiral NPU | 111.5 t/s | 18.47 t/s | 17.78 t/s | 56.2 ms |
+
+All three stream ~1.4 GB/token of active weights. The NPU path adds the ~80 us
+per-call floor plus the PCIe hop; decode makes ~240 calls/token, so ~19 ms/token
+is fixed launch/fill overhead.
+
+Thread counts, `tg16` / `pp8` on the NPU path: 1 thread 18.47 / 111.5,
+2 16.8 / 106, 4 14.5 / 95, 8 10.5 / 68. CPU inference peaks at 12 threads
+(36.1 / 225). These were taken before the pmode baseline; treat them as ratios.
+
+### Backend fusions and chains
+
+Gemma 4 E2B Q4_0, 64-token greedy, 3 alternating runs, `-n 64`, `temp 0`.
+Output is byte-identical across all rows.
+
+| mode | CPU fallback | eval (median) |
+| :-- | --: | --: |
+| CPU GLU (`SPIRAL_NO_GEGLU_FUSE=1`) | 93.7 ms / 32 graphs | 51.65 ms/token (19.36 t/s) |
+| host-mediated GEGLU (`SPIRAL_NO_FFN_CHAIN=1`) | 63.8 ms / 32 graphs | 51.64 ms/token (19.37 t/s) |
+| chained TXN (default) | 63.8 ms / 32 graphs | **47.81 ms/token (20.91 t/s)** |
+
+The chained TXN is the current best decode number. It is a 64-token run, not a
+soak; the soak table above predates it.
+
+| experiment | before | after |
+| :-- | --: | --: |
+| gate+up combined (individual -> chained) | 106.1 pp8 / 16.2 tg1 / 17.3 tg16 | 122.2 / 17.5 / 18.4 |
+| pipeline depth 1 -> 2 (`pp8` / `tg16`) | 95.3 / 18.0 | 112.5 / 18.3 |
+| pipeline depth 4 (`pp8` / `tg16`) | - | 111.6 / 16.4 |
+| softcap fused into the epilogue, 29 runs | ~53.7 ms/token | ~50.4 ms/token (6%) |
+
+The gate+up and pipeline rows predate the pmode baseline; the relative wins are
+the durable part. `pp8`/`tg16` carry roughly ±3-9 t/s and ±0.7 t/s run variance.
+
+64-token decode profile, one CPU fallback thread:
+
+| component | per token |
+| :-- | --: |
+| clean NPU calls | ~48 ms |
+| CPU fallback | 9.4 ms |
+| host/sampling | ~10 ms |
+| **total** | **~56 ms (17.7 t/s)** |
+
+Fallback breakdown before the softcap/GEGLU links: `UNARY` (tanh over 262144
+values) 5.1 ms, `GLU` 1.2, `FLASH_ATTN_EXT` 1.2, `RMS_NORM` 0.8, `MUL` 0.6,
+`ROPE` 0.2. More `SPIRAL_CPU_THREADS` speeds the tanh but slows the token.
+
+PM QoS (`SPIRAL_DMA_LATENCY=1`), three alternating runs:
+
+| metric | on | off |
+| :-- | --: | --: |
+| `pp8` | 118.1 t/s | 111.4 t/s |
+| `tg16` | 16.84 t/s | 18.11 t/s |
+| 300-token generation | 15.2-15.3 t/s | 16.8-17.3 t/s |
+
+### NPU tuning
+
+Same 3000-token NPU soak, normal boot state otherwise:
+
+| configuration | t/s |
+| :-- | --: |
+| boot state (pmode `default`) | 14.70 |
+| + fclk 7 (1960 MHz) | 14.64 |
+| + fclk 7 + socclk 7 (1472 MHz) | 14.65 |
+| pmode `turbo`, no clock pins | 16.38 |
+
+pmode is the whole difference (~11% decode) and it does not survive a reboot;
+a `spiral-npu-tune` systemd unit re-applies it. MP/H clocks are identical
+(1408/2112 MHz) under both settings, so the gain is not a clock effect.
+
+## 3. Fixed program (`src/program`)
+
+Production build, device kernel time, twenty runs, measured after the bf16 tile
+epilogue. Ranges, not medians: run-to-run spread is large enough that a single
+number is misleading.
+
+| case | kernel (us) |
+| :-- | --: |
+| Q4_0 1536x512 | 71-79 |
+| Q4_0 2048x2048 | 103-113 |
+| Q6_K 2048x2048 | 127-151 |
+| Q4_0 1536x12288 | 267-280 |
+| Q6_K 1536x6144 | 210-230 |
+
+Q6_K head (262144 columns), prepared weights:
+
+| path | wall | kernel sum |
+| :-- | --: | --: |
+| 11 chunks, one slot | 7.7-8.2 ms | 7.2-7.5 ms |
+| 11 chunks, two pipeline slots | 6.5-6.9 ms | 5.9-6.2 ms |
+| 4 slots | 6.5 ms | 5.9 ms |
+| 8 slots | 6.6 ms | 6.0 ms |
+
+Head chunk sweep (bands per chunk -> total): 25 -> 9462.6 us, 32 -> 8764.7,
+40 -> 8461.2, 48 -> 7984.1. `MAX_BANDS_PER_CHUNK=48` is kept.
+
+Cost model for a cold, streaming call: `kernel_us ~= 80 us + bytes / 48 GB/s`.
+This is linear in weight bytes plus a fixed launch; naive `bytes / time`
+understates the streaming rate. Cold-timing medians that fit the line:
+
+| case | weight bytes | p50 kernel |
+| :-- | --: | --: |
+| 4096x1536 | 3.54 MB | 153.3 us |
+| 6144x1536 | 5.31 MB | 194.5 us |
+| 12288x1536 | 10.60 MB | 299.7 us |
+
+Idle gaps are expensive: inserting a sleep between calls slows the next call,
+and the penalty grows with the gap. The model's interleaving of NPU calls with
+CPU fallback therefore costs more than a back-to-back loop would, and keeping
+the NPU busy is worth more than raw bandwidth. `SPIRAL_COLD_GAP_US` reproduces
+the measurement.
+
+Combined column matmuls (prepared weights, production):
+
+| combined call | columns | kernel us | total us | separate total |
+| :-- | --: | --: | --: | --: |
+| gate + up, 6144 | 12288 | 318.8 | 339.3 | 436.0 |
+| gate + up, 12288 | 24576 | 548.9 | 595.1 | 684.4 |
+| Q + K + V, sliding | 3072 | 139.8 | 148.0 | 290.0 |
+| Q + K + V, full | 5120 | 178.8 | 189.6 | 337.8 |
+
+FFN 6144 chain (`q4_0_1536x12288` gate+up -> `q4_0_6144x1536`), 20 iterations:
+
+| path | total |
+| :-- | --: |
+| two launches with device GEGLU intermediate | 447-458 us |
+| one chained TXN | 401-437 us |
+
+Launch-limited E2B estimate before chaining: 286 launches, 51.97 ms kernel /
+55.83 ms wall (19.2 / 17.9 tok/s); after combining gate+up and QKV, 221 launches
+and ~19.8 tok/s. A 286-op token-shaped stream in one TXN simulates at 29.7 ms
+against 55.8 ms per-call (memory bound 25.1 ms); an empty TXN is ~44 us.
+
+Program memory: production core `.text` 11872 bytes before the GEGLU epilogue,
+12544 bytes (77% of 16 KiB) after; diagnostic build 14880 bytes. Worker stack
+8192 bytes. `program_output` 1360 B, no stack frame.
+
+Golden tolerance in the shipped code: `max(1e-3, 6e-3 * column_scale)`; softcap
+and packed16 use `5e-2`. Worst observed golden ratio ~0.65. Absolute error
+grows ~`1.2e-7 * K`: max abs 0.0026 at K=2048, 0.0049 at 4096, 0.0071 at 6144,
+0.0127 at 12288. That is an unbiased RTNE accumulation envelope, not a bug.
+
+## 4. Quant kernels (`src/quants`)
+
+Fused single-core `mmul.py`, 256x64 shape, measured 2026-11-18 on Linux 7.3.5
+at the measured 1.8 GHz H clock. `% PM` is kernel `.text` as a share of the
+16 KiB compute-tile program memory. `est w/s` is the full-NPU estimate:
+`min(weights/cycle * 1.5 GHz * 32, 55 GB/s / bytes-per-weight)`.
+
+| format | bits/w | cycles | cycles/tile | weights/cycle | % PM | est w/s | limit |
+| :-- | --: | --: | --: | --: | --: | --: | :-- |
+| `q4_0` | 4.5 | 7883 | 246.34 | 2.078 | 24.7% | 94B | compute at 1.5, memory 98B at 1.8 GHz |
+| `q4_0_packed16` | 4.5 | 7397 | 231.16 | 2.215 | 23.2% | 98B | near-exact, memory-bound at 1.8 GHz |
+| `q4_0_hilo` | 5.0 | 7268 | 227.13 | 2.254 | 22.2% | 88B | memory, +11% size |
+| `q6_k` | 6.625 | 10180 | 318.13 | 1.609 | 30.5% | 66B | memory-bound, 66B |
+| `q6_k_int8` | 8.625 | 9101 | 284.41 | 1.800 | 26.7% | 51B | memory, +31% size |
+| `q8_0` | 8.5 | 7707 | 240.84 | 2.126 | 43.8% | 52B | memory |
+
+Standalone unpack (diagnostic only, never a selection criterion): `q4_0` 6579,
+`q4_0_packed16` 5459, `q4_0_hilo` 2916, `q6_k` 8498, `q6_k_int8` 4210, `q8_0`
+2920 cycles.
+
+Exact and packed16 use the same 9216 packed bytes at this shape, so only cycles
+differ: 6.2% (7397 vs 7883). The production path is the exact `q4_0`.
+
+Program-memory bytes per kernel: `q6_k` 4992, `q8_0` 7168, `q4_0` 4048,
+`q4_0_packed16` 3808, `q4_0_hilo` 3632, `q6_k_int8` 4368.
+
+Target-model traffic: Gemma 4 E2B active NPU weights are 1.381 GB/token with
+canonical `q4_0` + native `q6_k` head (1.497 GB with `q4_0_hilo`, 1.482 GB with
+`q6_k_int8`). At 55 GB/s that is 25.1 ms/token or 39.8 tok/s.
+
+## 5. Loop and compiler experiments
+
+Standalone 64-byte copy, 16 KiB total (256 x 64 B), measured on the same part:
+
+| C++ form / hand asm | cycles | bytes/cycle | kernel `.text` | program `.text` |
+| :-- | --: | --: | --: | --: |
+| indexed, rolled | 2313 | 7.1 | 176 B | 512 B |
+| indexed, `unroll(enable)` | 516 | 31.8 | 272 B | 608 B |
+| indexed, `unroll_count(16)` | 441 | 37.2 | 320 B | 656 B |
+| indexed, `unroll(full)` | 263 | 62.3 | 1568 B | 1904 B |
+| **pointer, no pragma** | **266** | **61.6** | **208 B** | **544 B** |
+| pointer, `unroll_count(8)` | 263 | 62.3 | 272 B | 560 B |
+| indexed, manual 8x | 670 | 24.5 | 576 B | 912 B |
+| hand asm, 8-deep | 271 | 60.5 | 436 B | 800 B |
+
+The q4_0 counterexample: pointer increments on a recurrence-bound loop regress
+2-4%. See `rejected.md`.
+
+`-O3` produced byte-identical objects and identical cycles; `-Os` grew `.text`
+and was slower on large shapes. A fixed-shape 256x16 Q4_0 experiment reached
+2316 cycles against 2204 for the existing schedule. The full list of neutral
+`aie-*` flags is in `rejected.md`.
+
+## 6. float16 scale probes (`tests/bench`)
+
+One core, 32 iterations. `vals/iter` differs between probes; compare per-value
+ratios, not raw cycles. Re-measured 2026-11-18.
+
+| probe | cycles | vals/iter | cyc/iter | error |
+| :-- | --: | --: | --: | :-- |
+| `float16_packed16_split_bf16` | 904 | 32 | 28.2 | 9.8e-4 relative |
+| `float16_expadd_split_bf16_flush` | 1387 | 32 | 43.3 | 6.0e-5 abs |
+| `float16_expadd_split_bf16_denorm` | 2089 | 32 | 65.3 | 0 |
+| `float16_shift_split_bf16` | 1450 | 32 | 45.3 | 0 |
+| `float16_bits_split_bf16` | 1740 | 32 | 54.4 | 0 |
+| `float16_direct_split_bf16` | 2252 | 32 | 70.4 | 0 |
+| `int8_scale_bf16` | 866 | 64 | 27.1 | 0 |
+| `int8_scale_bf16_2term` | 964 | 64 | 30.1 | 0 |
+| `int8_scale_int_mul` | 642 | 64 | 20.1 | 0 |
+| `q6k_3term_prep` | 3434 | 32 | 107.3 | 0 |
+| `q6k_3term_apply_x8` | 1063 | 64 | 33.2 | 0 |
+| `q6k_int_apply` | 2054 | 64 | 64.2 | 0 |
+
+XDNA2 native vector width is 512 bits: 64 int8, 32 bf16/int16, 16 f32, 128
+int4 lanes per register. The `_x8`/`_x16` probes exercise a quarter/half of a
+native bf16 vector and are kept only for format-shaped cases.
+
+## 7. PoC records (`tests/poc`)
+
+These belong to completed experiments and are frozen; see the linked records
+for conditions and caveats.
+
+- Bulk host-to-NPU DMA: 1 channel 14.2, 4 channels 41.0, 8 channels 55.5,
+  16 channels 57.4 GB/s. Matrix-shaped transfer 56.5 GB/s.
+- 2048x2048 bf16 mmul with f32 I/O: 10022.6 us, 53.98 GB/s, 214.26 GFLOP/s.
+- Quantized weight stream: q4_0 52.8, q6_k 54.6 (96% of the bulk ceiling),
+  iq1_s 33.5 GB/s.
+- Call overhead, C++: ~80-92 us per repeat, ~31.8 us per call pipelined;
+  reconfiguration per switch ~2.6 ms; Python ~105 us per call.
+- Program-memory overlay: full PDI reload ~2.6 ms; blockwrite 1.3-1.5 us/KiB,
+  ~0.45-0.5 ms for 32 tiles; control packets 68.8/138.6 us per tile against
+  50.7/96.3 us for blockwrite.
+- TXN concatenation: 2-op chains 1.18-1.39x, 8-op chains 1.57-1.94x over
+  independent launches; every identity case bit-identical.
+
+Details: [tests/poc/README.md](../tests/poc/README.md),
+[overlay.md](../tests/poc/overlay.md),
+[stream/README.md](../tests/poc/stream/README.md),
+[txn_concat/README.md](../tests/poc/txn_concat/README.md).
+
+## 8. Recording rules
+
+- Name the build (production/diagnostic), the shape, and the date.
+- Report cycles, `weights/cycle`, bytes/weight, `.text`, and stack frame for a
+  kernel change; report `Tctl` and both fans for anything that runs long.
+- Prefer medians/p95 from repeated interleaved runs over means or best-of-N.
+- Cycles and `weights/cycle` are clock-independent; weights/s and GB/s scale
+  with the clock. Say which clock a rate assumes.
+- Compare within one boot where possible. Cross-boot absolute cycles have
+  matched closely, but per-value ratios from one session are safer.
+- A number with no configuration and no date is not evidence.

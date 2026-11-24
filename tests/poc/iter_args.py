@@ -14,7 +14,7 @@ result to an output object.  Expected output is 10.
 
 Run:
 
-    ~/Projects/mlir-aie/ironenv/bin/python tests/poc/iter_args.py
+    python tests/poc/iter_args.py
 """
 
 import numpy as np

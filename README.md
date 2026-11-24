@@ -8,22 +8,9 @@ than it should be. So we're going to fix it.
 
 ## Roadmap
 
-I have hacked together enough of a llama.cpp GGML backend that I believe the
-NPU can be used as an accelerator, starting with offloading large matrix ops.
-The backend lives in [`integrations/llama.cpp`](integrations/llama.cpp); it is
-attached to a local llama.cpp checkout with a symlink and a small hook patch,
-so this repository stays the place for proving capabilities and benchmarking.
-The eventual code may build as a proper backend in the llama.cpp tree.
-
-My current focus is bringing up a basic set of dequantization routines, which
-take the highly-compressed weights typical of consumer models and expand them
-on the NPU to the bf16 blocks that its hardware can efficiently multiply.
-Optimizing those well enough to run at full bandwidth will be a challenge,
-so I have added a framework for fast unit testing and cycle counting. The first
-real model test will be Gemma 4 26B-A4B IT QAT Q4_0. The objective is
-productive, quiet inference: the NPU is used for efficiency, and an NPU+iGPU
-split is parked until the NPU path is closer to competitive, ideally on a much
-larger model.
+The llama.cpp GGML backend is now complete enough to run Gemma 4 E2B QAT,
+with the matrix multiplication offloaded to the NPU. Other operations have
+had mixed results, so refactoring and optimization is ongoing.
 
 ## Development Hardware
 
@@ -44,7 +31,6 @@ substantially slower than the Radeon 890M iGPU, but runs much cooler:
 | llama-b10839 ROCm  | Qwen 3.6 35B-A3B UD-Q8_K_XL    | 36.4 GB    | 18 tps |
 | llama-b10839 ROCm  | Qwen 3.8 27B UD-Q4_K_XL        | 16.4 GB    |  4 tps |
 | llama-b10839 ROCm  | Gemma 4 26B-A4B IT QAT Q4_0    | 13.4 GB    | 25 tps |
-|
 
 Interestingly, on the iGPU Qwen 3.6 35B-A3B runs as fast in Q8 as the smaller
 Q4 versions, suggesting that the bottleneck is not the system memory bandwidth.
@@ -53,7 +39,7 @@ If the same memory bandwidth were saturated by Qwen 35B-A3B Q4, we would double
 the basic decode rate to 36 tps. Adding speculative decoding like MTP or DFlash
 could then easily get us over 50 tps when writing code.
 
-## Gemma 4 E2B: engine comparison
+## Gemma 4 E2B QAT: engine comparison
 
 3000-token greedy generations on this laptop, same model class.  The iGPU SCLK
 is capped at 2400 MHz and the NPU runs pmode `turbo`.  The three llama.cpp rows
@@ -61,16 +47,44 @@ share the same Q4_0 GGUF with its native Q6_K head; FastFlowLM uses its own
 quantisation and packing, so that row is a comparison of engines rather than of
 identical weights.
 
-| engine | model | decode |
+| engine | decode |
 | :-- | :-- | --: |
-| llama.cpp ROCm (gfx1150 iGPU) | Gemma 4 E2B Q4_0, Q6_K head | 52.4 t/s |
-| FastFlowLM | `gemma4-it:e2b` | 25.8 t/s |
-| llama.cpp CPU (12 threads) | Gemma 4 E2B Q4_0, Q6_K head | 22.2 t/s |
-| Spiral NPU backend | Gemma 4 E2B Q4_0, Q6_K head | 16.2 t/s |
+| llama.cpp ROCm (gfx1150 iGPU) | 52.4 t/s |
+| FastFlowLM | 25.8 t/s |
+| llama.cpp CPU (12 threads) | 22.2 t/s |
+| Spiral NPU backend | 16.2 t/s |
 
 Temperature, fan and clock behaviour for these runs, including the NPU's
 per-fan comparison with FastFlowLM, are in
 [`src/program/NOTES.md`](src/program/NOTES.md) under "Efficiency acceptance".
+
+
+## Layout
+
+```text
+src/quants/        quant formats: host repack, device unpack, fused mmul
+src/program/       one fixed NPU design, built from Python, called from C++
+integrations/      the llama.cpp ggml backend
+tests/bench/       standalone compiler and float16 probes, soak harnesses
+tests/poc/         completed proofs of concept (bandwidth, overlays, TXN)
+docs/              measurements, rejected experiments, upstream pins
+AGENTS.md          the contract for working in this repository
+```
+
+Start with [`AGENTS.md`](AGENTS.md) and [`docs/index.md`](docs/index.md).
+
+## Build
+
+```sh
+source tools/env.sh
+python src/program/build.py --production
+cd src/program/build-production && ./test
+```
+
+See [`src/program/README.md`](src/program/README.md) for the full build and
+test matrix, [`src/quants/README.md`](src/quants/README.md) for the kernels,
+and [`integrations/llama.cpp/README.md`](integrations/llama.cpp/README.md) for
+the backend.
 
 # License and Warranty Disclaimer
 

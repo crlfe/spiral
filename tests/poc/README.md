@@ -1,8 +1,12 @@
+> Role: record (frozen). Written 2026-11; numbers are historical evidence and
+> are not updated. Current numbers: [`../../docs/measurements.md`](../../docs/measurements.md).
+
 # Proof of Concept
 
 These tests use the AMD MLIR-AIE Python library to evaluate basic functionality
-and performance of the AMD XDNA 2 NPU. For download and setup instructions, see
-[their code repository](https://github.com/Xilinx/mlir-aie).
+and performance of the AMD XDNA 2 NPU. Toolchain setup and pinned versions are
+in [`../../docs/upstream.md`](../../docs/upstream.md). Run them from the
+repository root after `source tools/env.sh`.
 
 To run examples with inline kernels, you may need to add the Peano LLVM compiler
 that MLIR-AIE installed to your PATH after following the MLIR-AIE instructions
@@ -102,7 +106,7 @@ The worker sums the first word of four input objects (1+2+3+4) and writes the
 sum plus the last value and a call count to an output object:
 
 ```bash
-~/Projects/mlir-aie/ironenv/bin/python tests/poc/iter_args.py
+python tests/poc/iter_args.py
 ```
 
 Expected:
@@ -204,8 +208,8 @@ show the per-dispatch floor being amortised.
 
 ```
 # Build the production design first
-~/Projects/mlir-aie/ironenv/bin/python src/program/build.py --production
-~/Projects/mlir-aie/ironenv/bin/python tests/poc/txn_concat/run.py
+python src/program/build.py --production
+python tests/poc/txn_concat/run.py
 
 q4_0_1536x2048 -> q4_0_2048x1536
   chain vs independent: bit_mismatches=0 max_abs=0.00000000

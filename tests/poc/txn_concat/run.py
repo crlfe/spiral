@@ -4,11 +4,11 @@
 The prototype links against the production build's generated TXN header and
 xclbin, so build that first:
 
-    ~/Projects/mlir-aie/ironenv/bin/python src/program/build.py --production
+    python src/program/build.py --production
 
 Then:
 
-    ~/Projects/mlir-aie/ironenv/bin/python tests/poc/txn_concat/run.py
+    python tests/poc/txn_concat/run.py
 """
 
 import subprocess
@@ -34,16 +34,14 @@ def main():
     for needed in ("aie.xclbin", "generate_txn.h", "design_meta.h", "golden"):
         if not (WORK / needed).exists():
             raise SystemExit(
-                f"missing {WORK / needed}; run "
-                "`~/Projects/mlir-aie/ironenv/bin/python "
-                "src/program/build.py --production` first"
+                f"missing {WORK / needed}; source tools/env.sh, then run "
+                "`python src/program/build.py --production` first"
             )
 
     include = Path(sysconfig.get_paths()["purelib"]) / "mlir_aie/include"
     if not include.exists():
         raise SystemExit(
-            f"missing {include}; run this script with the mlir-aie ironenv "
-            "python (see the module docstring)"
+            f"missing {include}; source tools/env.sh first (see the module docstring)"
         )
     exe = WORK / "txn_concat"
     cmd = [

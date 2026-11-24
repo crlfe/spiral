@@ -1,3 +1,6 @@
+> Role: record (frozen). Written 2026-11; numbers are historical evidence and
+> are not updated. Current numbers: [`../../../docs/measurements.md`](../../../docs/measurements.md).
+
 # TXN concatenation and chained matmuls
 
 This prototype builds two fixed-program matmuls into one TXN, retargets the
@@ -438,8 +441,8 @@ bf16 vtanh; it reports the global relative error against the host f32 GELU
 Build the production design first, then run the prototype:
 
 ```bash
-~/Projects/mlir-aie/ironenv/bin/python src/program/build.py --production
-~/Projects/mlir-aie/ironenv/bin/python tests/poc/txn_concat/run.py
+python src/program/build.py --production
+python tests/poc/txn_concat/run.py
 ```
 
 The prototype does not rebuild the xclbin or regenerate `generate_txn.h`.
@@ -478,8 +481,8 @@ timings are reproduced by this directory.
 - `include/aie/Runtime/TxnEncoding.h` in mlir-aie: the TXN encoding.
 - `src/program/build-production/generate_txn.h`: the current per-shape base
   body.
-- `src/program/NOTES.md`: fixed-program data flow, config words, cost model,
+- `src/program/DESIGN.md`: fixed-program data flow, config words, cost model,
   and the efficiency acceptance procedure.
 - `tests/poc/invoke.py`: the dispatch-floor probe.
-- `src/quants/NOTES.md`: quant kernel and loop notes.
+- `src/quants/DESIGN.md`: quant kernel and loop notes.
 - HRX release: `utils/fetch-hrx-release.sh` in mlir-aie.

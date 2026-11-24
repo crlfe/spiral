@@ -8,7 +8,7 @@ controls.
 
 Expected failures are results too: each unsupported probe is compiled in
 isolation so it fails only its own row. The durable findings belong in
-`src/quants/NOTES.md`; this script is the evidence.
+`src/quants/DESIGN.md`; this script is the evidence.
 """
 
 import sys

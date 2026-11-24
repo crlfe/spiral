@@ -16,9 +16,9 @@ PDI reload.
 
 Usage::
 
-    ~/Projects/mlir-aie/ironenv/bin/python tests/poc/overlay.py
-    ~/Projects/mlir-aie/ironenv/bin/python tests/poc/overlay.py --pad 0
-    ~/Projects/mlir-aie/ironenv/bin/python tests/poc/overlay.py --tiles 4
+    python tests/poc/overlay.py
+    python tests/poc/overlay.py --pad 0
+    python tests/poc/overlay.py --tiles 4
 
 The ``--pad`` value controls the generated ``.text`` size (0 is a tiny kernel;
 380 is roughly a production-sized 10.5 KiB image).  The script builds two

@@ -16,7 +16,7 @@ runtime block-write side is demonstrated separately by ``overlay.py``.
 
 Run with the mlir-aie environment:
 
-    ~/Projects/mlir-aie/ironenv/bin/python tests/poc/overlay_blocks.py
+    python tests/poc/overlay_blocks.py
 """
 
 from __future__ import annotations

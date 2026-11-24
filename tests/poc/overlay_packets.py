@@ -27,11 +27,11 @@ Three modes:
 
 Usage::
 
-    ~/Projects/mlir-aie/ironenv/bin/python tests/poc/overlay_packets.py
-    ~/Projects/mlir-aie/ironenv/bin/python tests/poc/overlay_packets.py --design slot --batch --packets 768
-    ~/Projects/mlir-aie/ironenv/bin/python tests/poc/overlay_packets.py --design slot --packets 768 --verify-all --read-batch 4
-    ~/Projects/mlir-aie/ironenv/bin/python tests/poc/overlay_packets.py --design switch
-    ~/Projects/mlir-aie/ironenv/bin/python tests/poc/overlay_packets.py --no-run
+    python tests/poc/overlay_packets.py
+    python tests/poc/overlay_packets.py --design slot --batch --packets 768
+    python tests/poc/overlay_packets.py --design slot --packets 768 --verify-all --read-batch 4
+    python tests/poc/overlay_packets.py --design switch
+    python tests/poc/overlay_packets.py --no-run
 
 Notes, measurements and the rejected experiments are in ``overlay.md``.
 """
