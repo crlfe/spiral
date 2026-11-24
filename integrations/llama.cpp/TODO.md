@@ -23,6 +23,13 @@ steps in [`README.md`](README.md), numbers in
 
 - [ ] Verify M=1, M=17 and K=6144/12288 through the backend path.
 - [ ] Verify the decode-graph split count and overlap behaviour.
+- [ ] Handle an NPU TDR/caught error by draining the pipeline, then retrying or
+      failing cleanly. A timeout may leave the device unusable for subsequent
+      processes until the driver resets; the transient TDR cascade seen while
+      bringing up `llama-batched-bench` is the motivating case.
+- [ ] Add batched-decode correctness: run `llama-server -np N` with N concurrent
+      greedy requests and compare each slot with an `-np 1` run, including N=3
+      and N=5 for partial 4-row chunks. (`llama-batched-bench` checks no text.)
 - [ ] Test `gemma-4-E2B-it-bf16.gguf` with greedy decoding against CPU.
 - [ ] Confirm no late-token divergence from bf16 dequantization; record max
       relative error and token-match lengths.
@@ -49,7 +56,10 @@ steps in [`README.md`](README.md), numbers in
          `src/program/TODO.md`; the backend only needs to stop splitting there.
 4. **CPU fallback.** Softcap and GEGLU are on the device now. The remaining
    fallback is norms, RoPE, attention and small elementwise ops; do not
-   optimize it before the chain/norm/attention links.
+   optimize it before the chain/norm/attention links. The 4-slot E2B soak
+   (54.4 t/s at 67.2 C, ~2.8k RPM; iGPU 87.9 t/s at 60.9 C and ~3.6k RPM)
+   shows the remaining heat is host work, so device-side norm/RoPE/attention
+   is the next E2B lever before adding slots or A4B.
 
 ## Open questions
 

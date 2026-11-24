@@ -114,6 +114,68 @@ Thread counts, `tg16` / `pp8` on the NPU path: 1 thread 18.47 / 111.5,
 2 16.8 / 106, 4 14.5 / 95, 8 10.5 / 68. CPU inference peaks at 12 threads
 (36.1 / 225). These were taken before the pmode baseline; treat them as ratios.
 
+### Batched decode rows (parallel slots)
+
+Gemma 4 E2B Q4_0, native Q6_K head. `llama-batched-bench` with
+`-dev Spiral0 -ngl 999 -npp 64 -ntg 128`, `-c 4096 -b 2048 -ub 512 -fa off`,
+`SPIRAL_CPU_THREADS=1`, separate prompts (no `-pps`). One fresh process per
+`npl`; the numbers were taken after the device had recovered from a transient
+TDR cascade (see `TODO.md`). Build: llama.cpp `d26efdb`, `src/program`
+`1ab7793` plus the zero-row no-op fix, `build.py --production`. Measured
+2026-11-24.
+
+| npl | T_PP s | S_PP t/s | T_TG s | S_TG t/s | per-slot t/s | step ms | vs npl=1 |
+| --: | --: | --: | --: | --: | --: | --: | --: |
+| 1 | 0.249 | 256.5 | 8.289 | 15.44 | 15.44 | 64.8 | 1.00x |
+| 2 | 1.051 | 121.8 | 8.543 | 29.97 | 14.99 | 66.7 | 1.94x |
+| 3 | 1.537 | 125.0 | 8.670 | 44.29 | 14.76 | 67.7 | 2.87x |
+| 4 | 2.064 | 124.0 | 8.948 | 57.22 | 14.31 | 69.9 | 3.71x |
+
+The backend chunks batch rows by `kSpiralInputsVecs = 4`, and the NPU mmul is
+4 rows wide, so npl 1-4 share one weight sweep per decode step. Step time grows
+8% while four tokens are produced per step. Effective wall bandwidth is nearly
+constant at ~20-21 GB/s (`1.38 GB/token * npl / T_TG`): the gain is amortising
+bytes over four rows, not higher bandwidth. npl=1 settles at 15.4-15.6 t/s once
+warm; a cold first run measured 13.6 t/s.
+
+Short-run thermal context (each run ~15 s, fans off throughout, so not the
+steady-state acceptance measurement):
+
+| npl | idle Tctl | peak Tctl | peak iGPU | peak fan |
+| --: | --: | --: | --: | --: |
+| 1 | 35.9 C | 61.1 C | 41.0 C | 0 |
+| 2 | 43.9 C | 68.6 C | 45.0 C | 0 |
+| 3 | 44.8 C | 70.1 C | 45.0 C | 0 |
+| 4 | 45.0 C | 72.0 C | 47.0 C | 0 |
+
+Prefill aggregate falls from ~256 t/s for one sequence to ~124 t/s for multiple
+sequences. The four-row limit is the current design; npl 8/16 would re-stream
+weights once per four rows and are not measured.
+
+#### Steady-state 4-slot soak
+
+Same model and command shape, but long enough to plateau: `npp 64`, separate
+prompts, `-fa off`, `SPIRAL_CPU_THREADS=1`. NPU `ntg 2048`; iGPU `ntg 4096` in
+the ROCm build. Configuration baseline verified; measured 2026-11-24 after
+`4959ba1` and the production xclbin.
+
+| engine | slots | aggregate t/s | per-slot t/s | step ms | peak Tctl | peak iGPU | fan1/fan2 | plateau | cool-back |
+| :-- | --: | --: | --: | --: | --: | --: | --: | --: | --: |
+| Spiral NPU | 1 | 15.30 | 15.30 | 65.3 | 62.9 C | 47.0 C | 2837/2645 | none in 139 s | 93 s |
+| Spiral NPU | 4 | **54.44** | 13.61 | 73.5 | 67.2 C | 48.0 C | 2782/2636 | 82 s (75 s steady) | 103 s |
+| iGPU (`ROCm0`) | 4 | **87.88** | 21.97 | 45.5 | 60.9 C | 61.0 C | 3648/3348 | 57 s (131 s steady) | 100 s |
+
+The NPU's four slots are a **3.56x** throughput gain over one slot for +4.3 C
+peak Tctl and essentially unchanged peak fan RPM; per-token heat drops sharply.
+The iGPU is 61% faster in aggregate but runs both itself and the fans hotter.
+Neither device meets the quiet acceptance bar: both ramp from 0 to roughly
+2.8k-3.6k RPM. The NPU row's Tctl is the host CPU, not the NPU: the iGPU stays
+near idle while the CPU fallback and submission raise Tctl.
+
+The remaining E2B heat is therefore host work. Device-side RMS norm, RoPE and
+attention links are the next E2B lever; more slots or A4B would add work before
+that is addressed.
+
 ### Backend fusions and chains
 
 Gemma 4 E2B Q4_0, 64-token greedy, 3 alternating runs, `-n 64`, `temp 0`.

@@ -108,6 +108,15 @@ epilogue and logs the device-vs-host GELU error.
   (`SPIRAL_PIPELINE_SLOTS`, default 2). The pipeline does not run calls
   concurrently — the array is fully occupied by one call — it removes the
   serial launch bubble.
+- Rows are chunked by `kSpiralInputsVecs = 4`, and the NPU mmul is four rows
+  wide. A decode batch of up to four sequences therefore shares one weight
+  sweep; `llama-batched-bench` npl=1/2/3/4 measured 15.4/30.0/44.3/57.2 t/s
+  aggregate with per-slot throughput falling only 7% (see
+  `docs/measurements.md`). Splitting the array across calls does not help:
+  there is no concurrent execution.
+- A graph with zero output rows (for example the no-logits warm-up batch in
+  `llama-batched-bench`) still visits the matmul nodes. They are a no-op, not a
+  shape error.
 - Cross-node look-ahead (`SPIRAL_LOOKAHEAD=1`) submits a later same-input matmul
   before the current result is consumed and defers only its host unpack. It is
   correct but within noise on Gemma; queue ordering costs as much as it saves.

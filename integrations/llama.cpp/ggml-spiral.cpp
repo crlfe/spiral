@@ -705,7 +705,13 @@ bool spiral_run_mul_mat(ggml_backend_spiral * backend, ggml_tensor * node,
     const int32_t weights_rows = weight_buffer->shapes[0].weights_rows;
     const int32_t weights_cols = weight_buffer->weights_cols;
     const int64_t rows = src1->ne[1] * src1->ne[2] * src1->ne[3];
-    if (rows <= 0 || src1->ne[0] != weights_rows ||
+    if (rows <= 0) {
+        // A graph with no output rows (for example a warm-up batch that
+        // requests no logits) still visits the matmul nodes.  There is nothing
+        // to compute; do not treat it as a shape error.
+        return true;
+    }
+    if (src1->ne[0] != weights_rows ||
         node->ne[0] != weights_cols || node->ne[1] != src1->ne[1] ||
         node->ne[2] != src1->ne[2] || node->ne[3] != src1->ne[3]) {
         GGML_LOG_ERROR("spiral: MUL_MAT %s shape mismatch K=%lld N=%lld rows=%lld node=[%lld,%lld,%lld,%lld]\n",
@@ -1035,7 +1041,7 @@ bool spiral_run_chain(ggml_backend_spiral * backend, ggml_tensor ** nodes,
 
     const int64_t rows = src1->ne[1] * src1->ne[2] * src1->ne[3];
     if (rows <= 0) {
-        return false;
+        return true;  // zero-row graph; nothing to compute
     }
 
     backend->input_staging.resize(
@@ -1183,7 +1189,7 @@ bool spiral_run_geglu_pair(ggml_backend_spiral * backend, ggml_tensor * gate,
 
     const int64_t rows = src1->ne[1] * src1->ne[2] * src1->ne[3];
     if (rows <= 0) {
-        return false;
+        return true;  // zero-row graph; nothing to compute
     }
 
     backend->input_staging.resize(
@@ -1387,7 +1393,10 @@ bool spiral_run_ffn_chain(ggml_backend_spiral * backend,
     const int32_t weights_rows = src1->ne[0];
     const int32_t final_cols = down->ne[0];
     const int64_t rows = src1->ne[1] * src1->ne[2] * src1->ne[3];
-    if (rows <= 0 || final_cols <= 0) {
+    if (rows <= 0) {
+        return true;  // zero-row graph; nothing to compute
+    }
+    if (final_cols <= 0) {
         return false;
     }
 
