@@ -50,7 +50,7 @@ Read these before optimising; each has cost someone a day.
 - **`bytes / time` is not a bandwidth.** A call costs ~80 us plus
   bytes/48 GB/s; the fixed floor dominates small calls.
 - **Do not allocate the product of independent maxima.** Buffer sizes come from
-  the target tensor set.
+  the target tensor set, which is enumerated in `docs/targets.md`.
 
 ## Workflow for a kernel change
 
@@ -77,6 +77,7 @@ Read these before optimising; each has cost someone a day.
 | attach/build the ggml backend | `integrations/llama.cpp/README.md` |
 | matchers, fallback, preparation | `integrations/llama.cpp/DESIGN.md` |
 | any performance figure | `docs/measurements.md` |
+| which model, tensor shapes, format allocation | `docs/targets.md` |
 | before retrying an idea | `docs/rejected.md` |
 | mlir-aie/llvm-aie sources, env setup | `docs/upstream.md` |
 

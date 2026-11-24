@@ -688,8 +688,8 @@ Golden and end-to-end policies for the program live in
 
 ## Target model
 
-`gemma-4-E2B_q4_0-it.gguf`: 35 dense blocks, hidden 1536, FFN 6144 (first 15) /
-12288 (last 20), Q4_0 block weights plus a 6.625-bit native Q6_K output head.
-`gemma-4-26B-A4B-it-qat-q4_0.gguf` is not a good first target: MoE with 128
-experts and 8 active. Traffic figures are in `docs/measurements.md`; the
-bring-up checklist is in `src/program/TODO.md`.
+The kernels are developed against the artifacts in
+[`../../docs/targets.md`](../../docs/targets.md): provenance, format allocation
+and tensor shapes for each, with the current target first. The traffic figures
+are in [`../../docs/measurements.md`](../../docs/measurements.md); the bring-up
+checklist is in [`../program/TODO.md`](../program/TODO.md).

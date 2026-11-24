@@ -13,6 +13,7 @@ how you find the rest.
 | [`../README.md`](../README.md) | orientation | first contact with the project, hardware, headline results |
 | [`../AGENTS.md`](../AGENTS.md) | contract | every agent session; invariants, traps, workflow, navigation |
 | [`measurements.md`](measurements.md) | numbers | quoting or comparing any performance figure |
+| [`targets.md`](targets.md) | reference | choosing a model target, or sizing a format or capability against one |
 | [`rejected.md`](rejected.md) | negative results | before trying an optimisation or a format variant |
 | [`upstream.md`](upstream.md) | pins | reading mlir-aie/llvm-aie sources, or reproducing the toolchain |
 

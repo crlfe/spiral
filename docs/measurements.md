@@ -272,9 +272,31 @@ differ: 6.2% (7397 vs 7883). The production path is the exact `q4_0`.
 Program-memory bytes per kernel: `q6_k` 4992, `q8_0` 7168, `q4_0` 4048,
 `q4_0_packed16` 3808, `q4_0_hilo` 3632, `q6_k_int8` 4368.
 
-Target-model traffic: Gemma 4 E2B active NPU weights are 1.381 GB/token with
-canonical `q4_0` + native `q6_k` head (1.497 GB with `q4_0_hilo`, 1.482 GB with
-`q6_k_int8`). At 55 GB/s that is 25.1 ms/token or 39.8 tok/s.
+Target-model traffic, derived from the allocations in
+[`targets.md`](targets.md): the formats each artifact actually uses, one row per
+token for an embedding lookup, the tied head counted as a full matmul, and the
+routed-expert fraction of each artifact's experts. These are not device
+measurements; the gate is bandwidth, so they are the ceiling before dispatch and
+host cost. The E2B row is the earlier figure, kept unchanged.
+
+| target | GB/token | ms/token at 55 GB/s | ceiling |
+| :-- | --: | --: | --: |
+| Gemma 4 E2B q4_0 | 1.381 | 25.1 | 39.8 tok/s |
+| Gemma 4 26B-A4B qat q4_0 | 2.377 | 43.2 | 23.1 tok/s |
+| Qwen3.6 35B-A3B UD-Q4_K_XL | 2.789 | 50.7 | 19.7 tok/s |
+| ISTA Qwen3.8-Flash-Next Q2_0, `Q2_0` share only | 0.664 | 12.1 | — |
+| Gemma 4 31B qat q4_0 | 17.27 | 314.0 | 3.2 tok/s |
+| Qwen3.8 27B UD-Q4_K_XL | 16.83 | 306.0 | 3.3 tok/s |
+
+E2B carries canonical `q4_0` plus the native `q6_k` head (1.497 GB/token with
+`q4_0_hilo`, 1.482 GB with `q6_k_int8`). The two dense models sit an order of
+magnitude above the rest: every matmul weight is read per token, so ~3 tok/s is
+the bandwidth wall and no kernel work moves it. The 26B reads 22.8B expert
+parameters at 8-of-128; the Qwen 3.6 reads 33.0B at 8-of-256, but its dense path
+is almost entirely `Q8_0`, which costs it more than the sparser expert selection
+saves. The `Q2_0` row is the routed-expert share of that artifact alone, at
+2.36B active parameters; the rest of its path is at formats this repository does
+not implement.
 
 ## 5. Loop and compiler experiments
 

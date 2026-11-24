@@ -67,7 +67,7 @@ src/program/       one fixed NPU design, built from Python, called from C++
 integrations/      the llama.cpp ggml backend
 tests/bench/       standalone compiler and float16 probes, soak harnesses
 tests/poc/         completed proofs of concept (bandwidth, overlays, TXN)
-docs/              measurements, rejected experiments, upstream pins
+docs/              measurements, targets, rejected experiments, upstream pins
 AGENTS.md          the contract for working in this repository
 ```
 
