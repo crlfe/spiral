@@ -1,4 +1,4 @@
-> Role: reference (numbers). Current as of 2026-11-24. History: `git log -- docs/measurements.md`.
+> Role: reference (numbers). Current as of 2026-11-25. History: `git log -- docs/measurements.md`.
 
 # Measurements
 
@@ -176,6 +176,55 @@ The remaining E2B heat is therefore host work. Device-side RMS norm, RoPE and
 attention links are the next E2B lever; more slots or A4B would add work before
 that is addressed.
 
+#### Stage timings, one vs four rows
+
+`llama-batched-bench -npp 16 -ntg 32` for 32 decode steps, with
+`SPIRAL_PROFILE_GRAPH=1 SPIRAL_PROFILE_NODES=1 -lv 4` (info logs are hidden
+below `-lv 4`). Node and chain lines were filtered to `rows=1` and `rows=4`.
+Chain stage splits are derived from the run totals minus the node stages; a
+step's `kernel` includes `start + wait + sync`.
+
+| per decode step | x1 | x4 |
+| :-- | --: | --: |
+| wall (`T_TG / 32`) | 62.9 ms | 68.3 ms |
+| **NPU total** | **43.1 ms** | **42.6 ms** |
+| node matmuls | 23.2 ms | 23.1 ms |
+| — kernel | 22.30 | 22.17 |
+| — txn / input / unpack | 0.15 / 0.40 / 0.40 | 0.15 / 0.40 / 0.41 |
+| FFN chains (35 per step) | 19.9 ms | 19.5 ms |
+| — kernel (derived) | 19.70 | 19.33 |
+| — txn / input / unpack | 0.04 / 0.11 / 0.03 | 0.04 / 0.10 / 0.03 |
+| outside the NPU (wall − NPU) | 19.8 ms | 25.7 ms |
+| per-token wall | 62.9 ms | 17.1 ms |
+
+The NPU does the same work per step for one or four rows: ~42-43 ms, 97% of it
+in the kernel stage, with input/txn/unpack together under 1.2 ms. Four rows
+therefore divide per-token NPU time by four. The x4 step costs 5.4 ms more
+wall, all of it outside the NPU: cumulative CPU fallback rises from 42 ms to
+134 ms over the 32-step run, and host pack/gather from ~0.18 to ~0.69 ms per
+step; the rest is graph scheduling and submission between backend views. The
+NPU is not the thing that fails to scale with slots.
+
+#### Remaining CPU fallback after the fusions
+
+`SPIRAL_PROFILE_CPU=1`, x4, `npp 16 -ntg 16`, decode nodes with four rows.
+Per-node logging inflates the totals slightly; the ranking is the useful part.
+
+| op | nodes/step | ms/step |
+| :-- | --: | --: |
+| `RMS_NORM` | 242 | 1.24 |
+| `MUL` | 298 | 0.43 |
+| `SOFT_MAX` | 35 | 0.33 |
+| `ROPE` | 50 | 0.24 |
+| `UNARY` | 35 | 0.17 |
+| `CONT` | 35 | 0.16 |
+| `ADD` | 106 | 0.09 |
+| `GET_ROWS` (PLE lookup) | 6 | 0.05 |
+
+The measured CPU nodes are ~2.7 ms/step; the graph profile's cumulative CPU
+fallback is ~4.2 ms/step over the same run. The rest of the ~25.7 ms/step
+outside the NPU is graph scheduling and host submission between backend views.
+
 ### Backend fusions and chains
 
 Gemma 4 E2B Q4_0, 64-token greedy, 3 alternating runs, `-n 64`, `temp 0`.
@@ -235,6 +284,30 @@ Same 3000-token NPU soak, normal boot state otherwise:
 pmode is the whole difference (~11% decode) and it does not survive a reboot;
 a `spiral-npu-tune` systemd unit re-applies it. MP/H clocks are identical
 (1408/2112 MHz) under both settings, so the gain is not a clock effect.
+
+### Backend verification pass
+
+Build: production xclbin (`src/program/build-production`, 2026-11-24) with
+llama.cpp `build-spiral` and a server-only `build-server`, model
+`gemma-4-E2B_q4_0-it.gguf`, prelude on unless noted. Short runs; no soak, so
+no `Tctl`/fan context and none of these are thermal results. Measured
+2026-11-25.
+
+| check | result |
+| :-- | :-- |
+| shapes on the NPU | chained path exercises K = 256/1536/2048/4096; `SPIRAL_NO_FFN_CHAIN=1` adds K=6144 (45 calls) and K=12288 (60 calls), all as `spiral node` NPU calls |
+| M=1 and M=17 | `-ub 17` on a 24-token prompt: prefill rows 17, 7 and 2, decode rows 1, no failures |
+| batched decode, `-np 3` | 3/3 slots byte-equal to the `-np 1` greedy text, 48 tokens; 2.55-2.62 s/slot, 3.29 s wall |
+| batched decode, `-np 5` | 5/5 slots byte-equal, 48 tokens; 4.37-4.52 s/slot, 5.57 s wall (≈55 t/s aggregate vs 20.4 t/s for one slot) |
+| decode graph | 1524 nodes, **3** scheduler splits (`-lv 4`), `max_slots=2` |
+| 16-token profile | 34 graphs, 4692 NPU calls, 595 FFN chains, 595 prenorm, 4962 row chunks, 3882 col chunks; kernel 801.8 ms, txn 4.6, input 12.6, unpack 11.4; pack 3.2, gather 2.3 |
+| resident weights | 1326 MiB in the Spiral weight BOs (llama memory breakdown) |
+| greedy vs CPU | agree to character 112 of the completion (≈25 of 64 tokens) then diverge (`inherent` vs `physical`); `SPIRAL_NO_PRENORM=1` diverges at the same character |
+| CPU fallback with unsupported matmuls | **fails**: bf16 E2B with `--device Spiral0 -ngl 999`, and q4_0 with `-ngl 0`, decode garbage; `SPIRAL_MATMUL_ONLY=1` and `--device none` are correct |
+
+The divergence is the documented bf16/quant rounding difference, not the
+prelude; the fallback failure is a defect in the backend, not in the model or
+the NPU path. See `integrations/llama.cpp/TODO.md`.
 
 ## 3. Fixed program (`src/program`)
 
@@ -334,11 +407,64 @@ at `.text` 3408 B. The scale pass gained ~48% from two independent chunk
 chains, a 512-bit two-chunk weight load, and one-instruction 128-bit lane
 broadcasts; the sum gained ~28% from four f32 partial accumulators.
 
+### Integrated prelude (`src/program`), production
+
+Build: `python src/program/build.py --production`, 2026-11-24, one process,
+`./test --prenorm-spike`. The normal body runs the matmul on the raw input; the
+prenorm body sums the same input, scales each group by `r * weight`, then runs
+the same matmul.
+
+| shape | normal | prenorm | device cost |
+| :-- | --: | --: | --: |
+| `q4_0_1536x512` | 92.1 us | 94.9 us | 2.8 us |
+| `q4_0_1536x2048` | 126.4 us | 129.9 us | 3.5 us |
+
+Interleaved 20-run totals, normal call first each iteration. Both bodies are
+bit-identical to a host-normalized bf16 reference through the same mmul (max
+error 0) when the reference mirrors the device's `r*weight` hi/lo split and
+single rounding of `x*hi + x*lo`.
+
+| property | value |
+| :-- | --: |
+| `.text` | 16208 B of 16384 (98.9%) |
+| stack | 8192 B |
+| TXN stream, normal | 973 words / 3892 B |
+| TXN stream, prenorm | 1121 words / 4484 B |
+
+The weight is copied out of the config object into an 8 KiB L1 buffer, paid for
+by dropping the input FIFO to depth 1. The config object caps the weight at
+`K <= 2032`; the L1 buffer caps it at `K <= 2048`.
+
+`--prenorm-spike` also covers the fused forms, measured 2026-11-25 on the same
+build: a two-segment wide call (`prenorm_wide_1536x1024`, 0/4096 values differ)
+and a two-operation chain with the prelude on op0
+(`prenorm_chain_1536x512x512`, K=1536 then 512, 0/2048 values differ). Both are
+bit-exact against the same host-normalized reference, so the prelude survives
+concatenation and chaining without an extra rounding.
+
+### E2B soak, FFN prelude on vs off
+
+Build: production, 2026-11-24, `tests/bench/soak/soak.py npu 3000` with the
+host configuration verified (turbo, balanced, powersave, 600/2400 MHz iGPU,
+PM QoS off). The prelude covers the FFN gate+up input only; the attention norm
+stays on the host.
+
+| build | wall | tokens/s | Tctl max | iGPU max | fans | plateau |
+| :-- | --: | --: | --: | --: | --: | --: |
+| prelude off (`SPIRAL_NO_PRENORM=1`) | 179.5 s | 17.29 | 74.9 C | 56.0 C | 4834/4667 | 74.4 s |
+| prelude on | 181.5 s | 17.09 | 74.0 C | 56.0 C | 4845/4667 | 108.6 s |
+
+The prelude removes ~1190 host norm/gain nodes per run but is 1.2% slower and
+does not move the fans; the Tctl difference is inside run-to-run noise. It is
+not a thermal win at this coverage.
+
 ## 4. Quant kernels (`src/quants`)
 
 Fused single-core `mmul.py`, 256x64 shape, measured 2026-11-18 on Linux 7.3.5
-at the measured 1.8 GHz H clock. `% PM` is kernel `.text` as a share of the
-16 KiB compute-tile program memory. `est w/s` is the full-NPU estimate:
+at the measured 1.8 GHz H clock; the `q6_k` and `q6_k_int8` rows were
+re-measured 2026-11-24 after the immediate-lane scale broadcast. `% PM` is
+kernel `.text` as a share of the 16 KiB compute-tile program memory.
+`est w/s` is the full-NPU estimate:
 `min(weights/cycle * 1.5 GHz * 32, 55 GB/s / bytes-per-weight)`.
 
 | format | bits/w | cycles | cycles/tile | weights/cycle | % PM | est w/s | limit |
@@ -346,9 +472,16 @@ at the measured 1.8 GHz H clock. `% PM` is kernel `.text` as a share of the
 | `q4_0` | 4.5 | 7883 | 246.34 | 2.078 | 24.7% | 94B | compute at 1.5, memory 98B at 1.8 GHz |
 | `q4_0_packed16` | 4.5 | 7397 | 231.16 | 2.215 | 23.2% | 98B | near-exact, memory-bound at 1.8 GHz |
 | `q4_0_hilo` | 5.0 | 7268 | 227.13 | 2.254 | 22.2% | 88B | memory, +11% size |
-| `q6_k` | 6.625 | 10180 | 318.13 | 1.609 | 30.5% | 66B | memory-bound, 66B |
-| `q6_k_int8` | 8.625 | 9101 | 284.41 | 1.800 | 26.7% | 51B | memory, +31% size |
+| `q6_k` | 6.625 | 10115 | 316.09 | 1.620 | 29.8% | 66B | memory-bound, 66B |
+| `q6_k_int8` | 8.625 | 8440 | 263.75 | 1.941 | 25.6% | 51B | memory, +31% size |
 | `q8_0` | 8.5 | 7707 | 240.84 | 2.126 | 43.8% | 52B | memory |
+
+The q6 rows gained from `repeat_lane64` (register-lane `vextbcst.128`) instead
+of `broadcast_vector` for the subgroup scale expansion: `q6_k_int8` 9101 ->
+8440 cycles (−7.3%) and stack 2240 -> 1728 B, `q6_k` 10180 -> 10115 (−0.6%) and
+stack 3200 -> 2432 B. At 256x128 the same change is 20329 -> 20200 (`q6_k`) and
+18178 -> 16841 (`q6_k_int8`). The same edit regressed `q4_0` 7883 -> 7929 and
+`q4_0_packed16` 7397 -> 7573, so those keep `broadcast_vector`.
 
 Standalone unpack (diagnostic only, never a selection criterion): `q4_0` 6579,
 `q4_0_packed16` 5459, `q4_0_hilo` 2916, `q6_k` 8498, `q6_k_int8` 4210, `q8_0`
@@ -357,8 +490,8 @@ Standalone unpack (diagnostic only, never a selection criterion): `q4_0` 6579,
 Exact and packed16 use the same 9216 packed bytes at this shape, so only cycles
 differ: 6.2% (7397 vs 7883). The production path is the exact `q4_0`.
 
-Program-memory bytes per kernel: `q6_k` 4992, `q8_0` 7168, `q4_0` 4048,
-`q4_0_packed16` 3808, `q4_0_hilo` 3632, `q6_k_int8` 4368.
+Program-memory bytes per kernel: `q6_k` 4880, `q8_0` 7168, `q4_0` 4048,
+`q4_0_packed16` 3808, `q4_0_hilo` 3632, `q6_k_int8` 4192.
 
 Target-model traffic, derived from the allocations in
 [`targets.md`](targets.md): the formats each artifact actually uses, one row per

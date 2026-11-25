@@ -1,4 +1,4 @@
-> Role: tasks. Current as of 2026-11-24. History: `git log -- integrations/llama.cpp/TODO.md`.
+> Role: tasks. Current as of 2026-11-25. History: `git log -- integrations/llama.cpp/TODO.md`.
 
 # `ggml-spiral` tasks
 
@@ -21,20 +21,26 @@ steps in [`README.md`](README.md), numbers in
 
 ## Verification still open
 
-- [ ] Verify M=1, M=17 and K=6144/12288 through the backend path.
-- [ ] Verify the decode-graph split count and overlap behaviour.
 - [ ] Handle an NPU TDR/caught error by draining the pipeline, then retrying or
       failing cleanly. A timeout may leave the device unusable for subsequent
       processes until the driver resets; the transient TDR cascade seen while
       bringing up `llama-batched-bench` is the motivating case.
-- [ ] Add batched-decode correctness: run `llama-server -np N` with N concurrent
-      greedy requests and compare each slot with an `-np 1` run, including N=3
-      and N=5 for partial 4-row chunks. (`llama-batched-bench` checks no text.)
-- [ ] Test `gemma-4-E2B-it-bf16.gguf` with greedy decoding against CPU.
-- [ ] Confirm no late-token divergence from bf16 dequantization; record max
-      relative error and token-match lengths.
-- [ ] Record resident weight bytes, per-op NPU time, pack/dispatch/sync and
-      decode-graph splits per token.
+- [ ] Fix the internal CPU fallback for graphs that contain unsupported
+      matmuls. `gemma-4-E2B-it-bf16.gguf --device Spiral0 -ngl 999` decodes
+      garbage (and `gemma-4-E2B_q4_0-it.gguf --device Spiral0 -ngl 0` does the
+      same); the identical command with `SPIRAL_MATMUL_ONLY=1`, which leaves
+      the glue on the real CPU backend, is correct, and `--device none` is
+      correct. The fallback claims the whole 485-split graph and executes
+      thousands of nodes, so the defect is in the fallback graph views or the
+      mixed-device assignment, not in the model or the NPU path.
+- [ ] Greedy divergence from the CPU starts late rather than never: on a
+      24-token prompt and a 64-token completion, NPU and CPU agree to character
+      112 (~25 tokens) and then differ (`inherent` vs `physical`).
+      `SPIRAL_NO_PRENORM=1` gives the same divergence point, so it is the
+      native-Q4_0/Q6_K rounding, not the prelude. Record match lengths per
+      prompt before treating "same greedy text" as a general claim.
+- [ ] Record per-op NPU time and pack/dispatch/sync per token. Aggregate
+      decode numbers are now in `docs/measurements.md`.
 
 ## Next work
 
@@ -85,9 +91,9 @@ steps in [`README.md`](README.md), numbers in
          fallback runner carries the same input.
    - [x] Standalone matmuls stay on the host norm; the grouping only takes a
          norm that one contiguous chain covers.
-   - [ ] Add a fused-prenorm case to `host/test.cc --prenorm-spike`: a
-         2-segment wide call and a 2-op chain, bit-exact against the
-         host-normalized reference.
+   - [x] Fused-prenorm cases are in `host/test.cc --prenorm-spike`: a
+         2-segment wide call and a 2-op chain, both bit-exact against the
+         host-normalized reference (see `docs/measurements.md`).
    - [x] 3000-token soak: prelude off 179.5 s / 17.29 t/s / Tctl 74.9 C /
          fans 4834/4667; prelude on 181.5 s / 17.09 t/s / Tctl 74.0 C /
          fans 4845/4667. So 1.2% slower, no fan change. Leave it on by

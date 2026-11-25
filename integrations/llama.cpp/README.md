@@ -1,4 +1,4 @@
-> Role: orientation. Current as of 2026-11-24. History: `git log -- integrations/llama.cpp/README.md`.
+> Role: orientation. Current as of 2026-11-25. History: `git log -- integrations/llama.cpp/README.md`.
 
 # llama.cpp integration
 
@@ -25,8 +25,12 @@ open questions: [`TODO.md`](TODO.md). Throughput and thermal results:
 - Internal CPU fallback for every other op, which reduces the Gemma prompt
   graph to one scheduler split.
 
-Gemma 4 E2B Q4_0 with the native Q6_K head returns the same greedy text as the
-CPU path. Current best decode is the chained-TXN path; see measurements.
+Gemma 4 E2B Q4_0 with the native Q6_K head tracks the CPU greedy text and
+diverges only late from native-quant rounding (measured match points are in
+[`../../docs/measurements.md`](../../docs/measurements.md)). Current best decode
+is the chained-TXN path; the backend's CPU fallback is known to miscompute
+granular graphs that contain unsupported matmuls, so select it only for models
+whose weights it can offload.
 
 ## Attach and build
 

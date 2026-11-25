@@ -263,6 +263,79 @@ void set_epilogue(spiral::MatmulShape& shape, float soft_cap) {
                                    : spiral::kEpilogueNone;
 }
 
+// The gain used by the prelude cases.  A smooth non-constant vector catches
+// chunk and lane mapping errors that an all-ones weight would hide.
+std::vector<float> make_prenorm_weight(int32_t k) {
+  std::vector<float> weight(static_cast<size_t>(k), 1.0f);
+  for (int32_t i = 0; i < k; ++i) {
+    weight[static_cast<size_t>(i)] =
+        1.0f + 0.05f * std::sin(0.01f * static_cast<float>(i));
+  }
+  return weight;
+}
+
+// Host reference for the device prelude: normalize the bf16 activation in f32,
+// apply the norm weight, and round once to bf16.  Mirror the device's hi/lo
+// split of r * weight and its single rounding of x*hi + x*lo so the only
+// remaining difference is the device's own r.
+std::vector<uint16_t> prenorm_reference(const uint16_t* inputs, int32_t k,
+                                        int32_t vecs,
+                                        const std::vector<float>& weight,
+                                        float eps) {
+  std::vector<uint16_t> out(static_cast<size_t>(vecs) * k, 0);
+  for (int32_t v = 0; v < vecs; ++v) {
+    double sum = 0.0;
+    for (int32_t i = 0; i < k; ++i) {
+      const double x = bf16_bits_to_float(
+          inputs[static_cast<size_t>(v) * k + i]);
+      sum += x * x;
+    }
+    const float r = static_cast<float>(
+        1.0 / std::sqrt(sum / static_cast<double>(k) + eps));
+    const float r_hi_f = bf16_bits_to_float(float_to_bf16_bits(r));
+    const float r_lo_f = bf16_bits_to_float(
+        float_to_bf16_bits(r - r_hi_f));
+    for (int32_t i = 0; i < k; ++i) {
+      const float x = bf16_bits_to_float(
+          inputs[static_cast<size_t>(v) * k + i]);
+      const float w = weight[static_cast<size_t>(i)];
+      const float w_hi = bf16_bits_to_float(float_to_bf16_bits(w));
+      const float w_lo = bf16_bits_to_float(
+          float_to_bf16_bits(w - w_hi));
+      // Device order: rh*wh, + rh*wl, + rl*wh.
+      float s = r_hi_f * w_hi;
+      s = s + r_hi_f * w_lo;
+      s = s + r_lo_f * w_hi;
+      const uint16_t hi = float_to_bf16_bits(s);
+      const float hi_f = bf16_bits_to_float(hi);
+      const uint16_t lo = float_to_bf16_bits(s - hi_f);
+      out[static_cast<size_t>(v) * k + i] = float_to_bf16_bits(
+          x * hi_f + x * bf16_bits_to_float(lo));
+    }
+  }
+  return out;
+}
+
+// The prelude and the host reference agree bit for bit; anything else is a
+// device or reference bug, not a tolerance question.
+bool check_exact(const std::string& name, const std::vector<uint16_t>& got,
+                 const std::vector<uint16_t>& want) {
+  size_t mismatches = 0;
+  double max_error = 0.0;
+  for (size_t i = 0; i < got.size(); ++i) {
+    if (got[i] == want[i]) {
+      continue;
+    }
+    ++mismatches;
+    max_error = std::max<double>(
+        max_error, std::fabs(bf16_bits_to_float(got[i]) -
+                             bf16_bits_to_float(want[i])));
+  }
+  std::printf("%s prenorm exact: %zu/%zu values differ, max error %.6f\n",
+              name.c_str(), mismatches, got.size(), max_error);
+  return mismatches == 0;
+}
+
 bool run_golden(spiral::Program& program, const std::string& name) {
   Golden golden = load_golden(name);
   std::vector<uint16_t> outputs(
@@ -287,49 +360,12 @@ bool run_prenorm_spike(spiral::Program& program, const std::string& name) {
   const int32_t cols = golden.weights_cols;
   const int32_t vecs = design::kInputsVecs;
   std::vector<uint16_t> outputs(static_cast<size_t>(vecs) * cols, 0);
-  std::vector<uint16_t> ref_inputs(static_cast<size_t>(vecs) * k, 0);
   std::vector<uint16_t> ref_outputs(static_cast<size_t>(vecs) * cols, 0);
-  std::vector<float> weight(static_cast<size_t>(k), 1.0f);
   constexpr float kEps = 1e-6f;
-  for (int32_t i = 0; i < k; ++i) {
-    weight[static_cast<size_t>(i)] =
-        1.0f + 0.05f * std::sin(0.01f * static_cast<float>(i));
-  }
+  const std::vector<float> weight = make_prenorm_weight(k);
 
-  // Host reference: normalize the bf16 activation in f32, apply the norm
-  // weight, and round once to bf16.  Mirror the device's hi/lo split of
-  // r * weight and its single rounding of x*hi + x*lo so the only remaining
-  // difference is the device's own r.
-  for (int32_t v = 0; v < vecs; ++v) {
-    double sum = 0.0;
-    for (int32_t i = 0; i < k; ++i) {
-      const double x = bf16_bits_to_float(
-          golden.inputs[static_cast<size_t>(v) * k + i]);
-      sum += x * x;
-    }
-    const float r = static_cast<float>(
-        1.0 / std::sqrt(sum / static_cast<double>(k) + kEps));
-    const float r_hi_f = bf16_bits_to_float(float_to_bf16_bits(r));
-    const float r_lo_f = bf16_bits_to_float(
-        float_to_bf16_bits(r - r_hi_f));
-    for (int32_t i = 0; i < k; ++i) {
-      const float x = bf16_bits_to_float(
-          golden.inputs[static_cast<size_t>(v) * k + i]);
-      const float w = weight[static_cast<size_t>(i)];
-      const float w_hi = bf16_bits_to_float(float_to_bf16_bits(w));
-      const float w_lo = bf16_bits_to_float(
-          float_to_bf16_bits(w - w_hi));
-      // Device order: rh*wh, + rh*wl, + rl*wh.
-      float s = r_hi_f * w_hi;
-      s = s + r_hi_f * w_lo;
-      s = s + r_lo_f * w_hi;
-      const uint16_t hi = float_to_bf16_bits(s);
-      const float hi_f = bf16_bits_to_float(hi);
-      const uint16_t lo = float_to_bf16_bits(s - hi_f);
-      ref_inputs[static_cast<size_t>(v) * k + i] = float_to_bf16_bits(
-          x * hi_f + x * bf16_bits_to_float(lo));
-    }
-  }
+  std::vector<uint16_t> ref_inputs =
+      prenorm_reference(golden.inputs.data(), k, vecs, weight, kEps);
 
   spiral::MatmulShape normal_shape;
   normal_shape.format = golden.format;
@@ -401,6 +437,141 @@ bool run_prenorm_spike(spiral::Program& program, const std::string& name) {
   std::printf("%s prenorm spike: normal %.1f us, prenorm %.1f us\n",
               name.c_str(), normal_us / kRuns, prenorm_us / kRuns);
   return ok;
+}
+
+// A wide, two-segment call led by the prelude.  The reference runs each
+// segment as its own normal matmul on the host-normalized input; the wide
+// prenorm call must reproduce those columns bit for bit.
+bool run_prenorm_wide(spiral::Program& program, const std::string& label,
+                      const std::vector<std::string>& names) {
+  std::vector<Golden> goldens;
+  goldens.reserve(names.size());
+  for (const auto& name : names) {
+    goldens.push_back(load_golden(name));
+  }
+  const Golden& first = goldens[0];
+  int32_t total_cols = 0;
+  for (const auto& golden : goldens) {
+    if (golden.format != first.format ||
+        golden.weights_rows != first.weights_rows) {
+      throw std::runtime_error(label + ": segments have different shapes");
+    }
+    total_cols += golden.weights_cols;
+  }
+  const int32_t k = first.weights_rows;
+  const int32_t vecs = design::kInputsVecs;
+  constexpr float kEps = 1e-6f;
+  const std::vector<float> weight = make_prenorm_weight(k);
+  const std::vector<uint16_t> ref_inputs =
+      prenorm_reference(first.inputs.data(), k, vecs, weight, kEps);
+
+  spiral::MatmulShape shape;
+  shape.format = first.format;
+  shape.weights_rows = k;
+  shape.weights_cols = total_cols;
+  shape.inputs_vecs = vecs;
+  std::vector<spiral::WeightSegment> segments;
+  segments.reserve(goldens.size());
+  for (const auto& golden : goldens) {
+    spiral::WeightSegment segment;
+    segment.raw_weights = golden.raw.data();
+    segment.raw_stride = golden.raw_stride;
+    segment.weights_cols = golden.weights_cols;
+    segments.push_back(segment);
+  }
+  auto wide = program.prepare(shape, segments.data(),
+                              static_cast<int32_t>(segments.size()));
+
+  spiral::PrenormSpec spec;
+  spec.weight = weight.data();
+  spec.k = k;
+  spec.eps = kEps;
+  auto prenorm = program.prepare_prenorm(wide, spec);
+
+  std::vector<uint16_t> outputs(static_cast<size_t>(vecs) * total_cols, 0);
+  std::vector<uint16_t> ref_outputs(static_cast<size_t>(vecs) * total_cols, 0);
+  int32_t col_offset = 0;
+  for (const auto& golden : goldens) {
+    spiral::MatmulShape segment_shape;
+    segment_shape.format = golden.format;
+    segment_shape.weights_rows = golden.weights_rows;
+    segment_shape.weights_cols = golden.weights_cols;
+    set_epilogue(segment_shape, golden.soft_cap);
+    segment_shape.inputs_vecs = vecs;
+    auto segment = program.prepare(segment_shape, golden.raw.data(),
+                                   golden.raw_stride, 0);
+    program.run(segment_shape, segment, ref_inputs.data(),
+                ref_outputs.data(), total_cols, col_offset);
+    col_offset += golden.weights_cols;
+  }
+
+  shape.prenorm = true;
+  shape.prenorm_spec = spec;
+  program.run(shape, prenorm, first.inputs.data(), outputs.data(), total_cols,
+              0);
+  return check_exact(label, outputs, ref_outputs);
+}
+
+// A two-operation chain led by the prelude on op0.  The reference is the same
+// chain run on the host-normalized input, so op1 sees the reference's bf16
+// output as its input exactly as the device chain does.
+bool run_prenorm_chain(spiral::Program& program, const std::string& label,
+                       const std::string& first_name,
+                       const std::string& second_name) {
+  Golden head = load_golden(first_name);
+  Golden tail = load_golden(second_name);
+  if (head.weights_cols != tail.weights_rows) {
+    throw std::runtime_error(
+        label + ": second operation's K does not match the first output");
+  }
+  const int32_t k = head.weights_rows;
+  const int32_t cols = tail.weights_cols;
+  const int32_t vecs = design::kInputsVecs;
+  constexpr float kEps = 1e-6f;
+  const std::vector<float> weight = make_prenorm_weight(k);
+  const std::vector<uint16_t> ref_inputs =
+      prenorm_reference(head.inputs.data(), k, vecs, weight, kEps);
+
+  spiral::MatmulShape first_shape;
+  first_shape.format = head.format;
+  first_shape.weights_rows = head.weights_rows;
+  first_shape.weights_cols = head.weights_cols;
+  set_epilogue(first_shape, head.soft_cap);
+  first_shape.inputs_vecs = vecs;
+
+  spiral::MatmulShape second_shape;
+  second_shape.format = tail.format;
+  second_shape.weights_rows = tail.weights_rows;
+  second_shape.weights_cols = tail.weights_cols;
+  set_epilogue(second_shape, tail.soft_cap);
+  second_shape.inputs_vecs = vecs;
+
+  auto first_normal = program.prepare(first_shape, head.raw.data(),
+                                      head.raw_stride, 0);
+  auto second_normal = program.prepare(second_shape, tail.raw.data(),
+                                       tail.raw_stride, 0);
+
+  spiral::PrenormSpec spec;
+  spec.weight = weight.data();
+  spec.k = k;
+  spec.eps = kEps;
+  auto first_prenorm = program.prepare_prenorm(first_normal, spec);
+
+  std::vector<uint16_t> outputs(static_cast<size_t>(vecs) * cols, 0);
+  std::vector<uint16_t> ref_outputs(static_cast<size_t>(vecs) * cols, 0);
+
+  spiral::ChainOp ref_ops[2] = {{first_shape, &first_normal},
+                                {second_shape, &second_normal}};
+  auto ref_chain = program.prepare_chain(ref_ops, 2);
+  program.run_chain(ref_chain, ref_inputs.data(), ref_outputs.data(), cols, 0);
+
+  spiral::ChainOp ops[2] = {{first_shape, &first_prenorm},
+                            {second_shape, &second_normal}};
+  ops[0].shape.prenorm = true;
+  ops[0].shape.prenorm_spec = spec;
+  auto chain = program.prepare_chain(ops, 2);
+  program.run_chain(chain, head.inputs.data(), outputs.data(), cols, 0);
+  return check_exact(label, outputs, ref_outputs);
 }
 
 bool run_head(spiral::Program& program, const std::string& name) {
@@ -885,6 +1056,12 @@ int main(int argc, char** argv) {
       bool ok = true;
       ok = run_prenorm_spike(program, "q4_0_1536x512") && ok;
       ok = run_prenorm_spike(program, "q4_0_1536x2048") && ok;
+      ok = run_prenorm_wide(program, "prenorm_wide_1536x1024",
+                            {"q4_0_1536x512", "q4_0_1536x512"}) &&
+           ok;
+      ok = run_prenorm_chain(program, "prenorm_chain_1536x512x512",
+                             "q4_0_1536x512", "q4_0_512x512") &&
+           ok;
       return ok ? 0 : 1;
     }
     if (argc > 1 && std::string(argv[1]) == "--head-timing") {

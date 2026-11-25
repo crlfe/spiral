@@ -1,4 +1,4 @@
-> Role: tasks. Current as of 2026-11-24. History: `git log -- src/program/TODO.md`.
+> Role: tasks. Current as of 2026-11-25. History: `git log -- src/program/TODO.md`.
 
 # `src/program` tasks
 
@@ -390,10 +390,12 @@ buffer at `K <= 2048`; larger hidden sizes need a different weight container.
       writes the gain into op0's config, and `txn_concat` handles the extra
       input fill. `--prenorm-spike` still bit-identical.
 - [x] The backend standalone path uses `prepare_prenorm`; no duplicate BO.
-- [ ] Extend `host/test.cc --prenorm-spike` with a prenorm chain case
-      (`prepare_chain` with a prenorm op0), bit-exact against the
-      host-normalized reference. The backend path is already exercised by
-      E2B (`prenorm=595`, output identical).
+- [x] Extend `host/test.cc --prenorm-spike` with a prenorm chain case
+      (`prepare_chain` with a prenorm op0) and a two-segment wide call, both
+      bit-exact against the host-normalized reference. The chain case is
+      `prenorm_chain_1536x512x512`; the wide case is
+      `prenorm_wide_1536x1024`. The backend path is exercised by E2B
+      (`prenorm=595`); see `docs/measurements.md`.
 
 Acceptance: a fused call carries the prelude once for its shared input, the
 fused-call count is unchanged (`chains`/`ffn_chains`), and the standalone
