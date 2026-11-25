@@ -308,6 +308,32 @@ and packed16 use `5e-2`. Worst observed golden ratio ~0.65. Absolute error
 grows ~`1.2e-7 * K`: max abs 0.0026 at K=2048, 0.0049 at 4096, 0.0071 at 6144,
 0.0127 at 12288. That is an unbiased RTNE accumulation envelope, not a bug.
 
+### RMS norm kernel (`src/funcs/rmsnorm`), standalone
+
+Build: `python src/funcs/tests/rmsnorm.py` on the baseline machine state,
+2026-11-24. One compute tile, `rows_steps = 6` (K=1536, two groups, the second
+with two real row steps). Trace around each pass, seed 1:
+
+| pass | cycles |
+| :-- | --: |
+| sum of squares | 765 |
+| in-place scale | 3904 |
+| **total** | **5315** |
+| `.text` | 3600 B |
+| max stack frame | 384 B |
+
+Rows sweep, same build: 4 rows 3696 cycles, 6 rows 5315, 8 rows 6693. The
+second group is partial at 6 rows, which is why the per-row figure is not flat.
+
+Accuracy: `max abs error 0.0156`, worst tolerance ratio `0.464` across seeds
+1-5 under `max(1e-3, 6e-3 * row_scale)` (seed 1 gives `0.450`). Reordering the
+f32 sum of squares across four partial accumulators did not change it.
+
+The same harness before this change measured 9197 total (sum 1059, scale 7486)
+at `.text` 3408 B. The scale pass gained ~48% from two independent chunk
+chains, a 512-bit two-chunk weight load, and one-instruction 128-bit lane
+broadcasts; the sum gained ~28% from four f32 partial accumulators.
+
 ## 4. Quant kernels (`src/quants`)
 
 Fused single-core `mmul.py`, 256x64 shape, measured 2026-11-18 on Linux 7.3.5
