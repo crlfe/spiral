@@ -22,6 +22,7 @@
 
 #include "design_meta.h"
 #include "generate_txn.h"
+#include "generate_txn_prenorm.h"
 #include "quants/q4_0/repack.h"
 #include "quants/q6_k/repack.h"
 #include "txn_concat.h"
@@ -70,14 +71,18 @@ size_t max_instruction_words() {
               input_padded);
   split_parts(design::kMaxWeightBlocks, kWeightParts, weight_parts,
               weight_padded);
-  auto sequence = generate_txn_main_sequence(
+  auto normal = generate_txn_main_sequence(
       input_parts[0], input_parts[1], input_parts[2], input_parts[3],
       weight_parts[0], weight_parts[1],
       design::kMaxWeightBlocks * (design::kL2StreamBytes / 4));
-  if (!sequence.has_value()) {
+  auto prenorm = generate_txn_main_prenorm_sequence(
+      input_parts[0], input_parts[1], input_parts[2], input_parts[3],
+      weight_parts[0], weight_parts[1],
+      design::kMaxWeightBlocks * (design::kL2StreamBytes / 4));
+  if (!normal.has_value() || !prenorm.has_value()) {
     throw std::runtime_error("transaction generation failed");
   }
-  return sequence->size() * kMaxChainOps;
+  return std::max(normal->size(), prenorm->size()) * kMaxChainOps;
 }
 
 RepackFn repack_fn(int32_t format) {
@@ -119,7 +124,8 @@ void write_config(uint32_t* buf, int32_t format, int32_t tile_bytes,
                   int32_t rows_steps, int32_t cols_bands,
                   int32_t weights_blocks, int32_t total_tiles,
                   int32_t input_pad, int32_t weight_pad, float soft_cap,
-                  int32_t epilogue) {
+                  int32_t epilogue, bool prenorm, float prenorm_eps,
+                  float prenorm_inv_k) {
   std::memset(buf, 0, design::kConfigLen * sizeof(uint32_t));
   buf[design::kCfgFormat] = static_cast<uint32_t>(format);
   buf[design::kCfgTileBytes] = static_cast<uint32_t>(tile_bytes);
@@ -130,6 +136,13 @@ void write_config(uint32_t* buf, int32_t format, int32_t tile_bytes,
   buf[design::kCfgInputPad] = static_cast<uint32_t>(input_pad);
   buf[design::kCfgWeightPad] = static_cast<uint32_t>(weight_pad);
   buf[design::kCfgEpilogue] = static_cast<uint32_t>(epilogue);
+  buf[design::kCfgPrenorm] = prenorm ? 1u : 0u;
+  uint32_t eps_bits = 0;
+  uint32_t inv_k_bits = 0;
+  std::memcpy(&eps_bits, &prenorm_eps, sizeof(eps_bits));
+  std::memcpy(&inv_k_bits, &prenorm_inv_k, sizeof(inv_k_bits));
+  buf[design::kCfgPrenormEps] = eps_bits;
+  buf[design::kCfgPrenormInvK] = inv_k_bits;
   if (soft_cap != 0.0f) {
     const uint16_t cap_hi = float_to_bf16_bits(soft_cap);
     const uint16_t cap_lo = float_to_bf16_bits(
@@ -438,8 +451,12 @@ struct PreparedWeights::Impl {
   int32_t group_bytes = 0;
   int32_t segments = 1;
   bool equal_segments = true;
+  bool prenorm = false;
+  int32_t prenorm_k = 0;
+  float prenorm_eps = 0.0f;
+  std::vector<uint16_t> prenorm_weight;
   size_t bo_bytes = 0;
-  std::unique_ptr<xrt::bo> weights_bo;
+  std::shared_ptr<xrt::bo> weights_bo;
   std::vector<uint8_t> weights;
   std::vector<uint32_t> txn;
 };
@@ -459,7 +476,7 @@ struct PreparedChain::Impl {
   int32_t final_cols_bands = 0;
   int32_t final_cols = 0;
   std::vector<uint32_t> txn;
-  std::unique_ptr<xrt::bo> weights_bo;
+  std::shared_ptr<xrt::bo> weights_bo;
   std::vector<uint8_t> configs;
 };
 
@@ -472,6 +489,36 @@ Program::Program() : impl_(std::make_unique<Impl>()) {}
 Program::~Program() = default;
 Program::Program(Program&&) noexcept = default;
 Program& Program::operator=(Program&&) noexcept = default;
+
+void validate_prenorm_spec(const MatmulShape& shape) {
+  if (!design::kPrenormAvailable) {
+    throw std::invalid_argument(
+        "the diagnostic build does not link the RMS-norm prelude");
+  }
+  const int32_t k = shape.weights_rows;
+  if (shape.prenorm_spec.weight == nullptr || shape.prenorm_spec.k != k ||
+      k <= 0 || k % 256 != 0 ||
+      design::kPrenormWeightOffset + 2 * k * 2 >
+          design::kInputGroupElems * 2) {
+    throw std::invalid_argument(
+        "prenorm weight must match weights_rows, be a multiple of 256 and fit "
+        "the config object");
+  }
+}
+
+void convert_prenorm_weight(int32_t k, const float* weight,
+                            std::vector<uint16_t>& out) {
+  out.resize(static_cast<size_t>(2) * k);
+  for (int32_t chunk = 0; chunk < k / 8; ++chunk) {
+    for (int32_t i = 0; i < 8; ++i) {
+      const float value = weight[chunk * 8 + i];
+      const uint16_t hi = float_to_bf16_bits(value);
+      const uint16_t lo = float_to_bf16_bits(value - bf16_bits_to_float(hi));
+      out[chunk * 16 + i] = hi;
+      out[chunk * 16 + 8 + i] = lo;
+    }
+  }
+}
 
 PreparedWeights Program::prepare(const MatmulShape& shape,
                                  const uint8_t* raw_weights,
@@ -613,6 +660,14 @@ PreparedWeights Program::prepare_packed(const MatmulShape& shape,
   impl.owner = this;
   impl.id = impl_->next_weight_id++;
   impl.shape = shape;
+  impl.prenorm = shape.prenorm;
+  if (shape.prenorm) {
+    validate_prenorm_spec(shape);
+    impl.prenorm_k = shape.weights_rows;
+    impl.prenorm_eps = shape.prenorm_spec.eps;
+    convert_prenorm_weight(shape.weights_rows, shape.prenorm_spec.weight,
+                           impl.prenorm_weight);
+  }
   impl.rows_steps = rows_steps;
   impl.cols_bands = cols_bands;
   impl.total_tiles = total_tiles;
@@ -641,9 +696,16 @@ PreparedWeights Program::prepare_packed(const MatmulShape& shape,
 
   const int32_t group_stride_words =
       weights_blocks * (design::kL2StreamBytes / 4);
-  auto sequence = generate_txn_main_sequence(
-      input_parts[0], input_parts[1], input_parts[2], input_parts[3],
-      weight_parts[0], weight_parts[1], group_stride_words);
+  std::optional<std::vector<uint32_t>> sequence;
+  if (shape.prenorm) {
+    sequence = generate_txn_main_prenorm_sequence(
+        input_parts[0], input_parts[1], input_parts[2], input_parts[3],
+        weight_parts[0], weight_parts[1], group_stride_words);
+  } else {
+    sequence = generate_txn_main_sequence(
+        input_parts[0], input_parts[1], input_parts[2], input_parts[3],
+        weight_parts[0], weight_parts[1], group_stride_words);
+  }
   if (!sequence.has_value()) {
     throw std::runtime_error("transaction generation failed");
   }
@@ -659,7 +721,7 @@ PreparedWeights Program::prepare_packed(const MatmulShape& shape,
   const size_t bo_bytes = data_bytes + design::kL2StreamBytes;
   impl.bo_bytes = bo_bytes;
   impl.weights.resize(bo_bytes, 0);
-  impl.weights_bo = std::make_unique<xrt::bo>(
+  impl.weights_bo = std::make_shared<xrt::bo>(
       impl_->loaded.device, bo_bytes, xrt::bo::flags::host_only,
       impl_->kernel.group_id(3));
   if (!impl.weights.empty()) {
@@ -668,6 +730,75 @@ PreparedWeights Program::prepare_packed(const MatmulShape& shape,
   }
   impl.weights.clear();
   impl.weights.shrink_to_fit();
+  return prepared;
+}
+
+PreparedWeights Program::prepare_prenorm(const PreparedWeights& base,
+                                         const PrenormSpec& spec) {
+  if (!impl_) {
+    throw std::runtime_error("Program is not initialized");
+  }
+  if (!base.impl_) {
+    throw std::invalid_argument("PreparedWeights is empty");
+  }
+  const auto& b = *base.impl_;
+  if (b.owner != this) {
+    throw std::invalid_argument(
+        "PreparedWeights belongs to a different Program");
+  }
+  if (b.shape.prenorm) {
+    throw std::invalid_argument("PreparedWeights already has a prelude");
+  }
+  MatmulShape shape = b.shape;
+  shape.prenorm = true;
+  shape.prenorm_spec = spec;
+  validate_prenorm_spec(shape);
+
+  PreparedWeights prepared;
+  prepared.impl_ = std::make_unique<PreparedWeights::Impl>();
+  auto& impl = *prepared.impl_;
+  impl.owner = this;
+  impl.id = impl_->next_weight_id++;
+  impl.shape = shape;
+  impl.rows_steps = b.rows_steps;
+  impl.cols_bands = b.cols_bands;
+  impl.total_tiles = b.total_tiles;
+  impl.weights_blocks = b.weights_blocks;
+  impl.tile_bytes = b.tile_bytes;
+  impl.input_pad = b.input_pad;
+  impl.weight_pad = b.weight_pad;
+  impl.group_bytes = b.group_bytes;
+  impl.segments = b.segments;
+  impl.equal_segments = b.equal_segments;
+  impl.bo_bytes = b.bo_bytes;
+  impl.weights_bo = b.weights_bo;
+  impl.prenorm = true;
+  impl.prenorm_k = spec.k;
+  impl.prenorm_eps = spec.eps;
+  convert_prenorm_weight(spec.k, spec.weight, impl.prenorm_weight);
+
+  int32_t input_parts[kInputParts] = {};
+  int32_t weight_parts[kWeightParts] = {};
+  int32_t input_padded = 0;
+  int32_t weight_padded = 0;
+  const int32_t input_groups =
+      (b.rows_steps + design::kInputGroupRows - 1) /
+      design::kInputGroupRows;
+  split_parts(input_groups, kInputParts, input_parts, input_padded);
+  split_parts(b.weights_blocks, kWeightParts, weight_parts, weight_padded);
+  if (input_padded - input_groups != b.input_pad ||
+      weight_padded - b.weights_blocks != b.weight_pad) {
+    throw std::runtime_error("prepared padding does not reproduce");
+  }
+  const int32_t group_stride_words =
+      b.weights_blocks * (design::kL2StreamBytes / 4);
+  auto sequence = generate_txn_main_prenorm_sequence(
+      input_parts[0], input_parts[1], input_parts[2], input_parts[3],
+      weight_parts[0], weight_parts[1], group_stride_words);
+  if (!sequence.has_value()) {
+    throw std::runtime_error("transaction generation failed");
+  }
+  impl.txn = std::move(*sequence);
   return prepared;
 }
 
@@ -699,7 +830,8 @@ RunTicket Program::submit(const MatmulShape& shape,
   }
   if (shape.format != prepared.shape.format ||
       shape.weights_rows != prepared.shape.weights_rows ||
-      shape.weights_cols != prepared.shape.weights_cols) {
+      shape.weights_cols != prepared.shape.weights_cols ||
+      shape.prenorm != prepared.shape.prenorm) {
     throw std::invalid_argument("shape does not match prepared weights");
   }
   if (shape.epilogue != kEpilogueNone &&
@@ -806,7 +938,15 @@ RunTicket Program::submit(const MatmulShape& shape,
                prepared.rows_steps, prepared.cols_bands,
                prepared.weights_blocks, prepared.total_tiles,
                prepared.input_pad, prepared.weight_pad, shape.soft_cap,
-               shape.epilogue);
+               shape.epilogue, shape.prenorm, prepared.prenorm_eps,
+               prepared.prenorm ? 1.0f / prepared.prenorm_k : 0.0f);
+  if (prepared.prenorm) {
+    std::memcpy(
+        reinterpret_cast<uint8_t*>(config_buf) +
+            design::kPrenormWeightOffset,
+        prepared.prenorm_weight.data(),
+        prepared.prenorm_weight.size() * sizeof(uint16_t));
+  }
   impl_->configs[static_cast<size_t>(slot)].sync(
       XCL_BO_SYNC_BO_TO_DEVICE,
       design::kInputGroupElems * sizeof(uint16_t), 0);
@@ -901,6 +1041,24 @@ PreparedChain Program::prepare_chain(const ChainOp* ops, int32_t count) {
       throw std::invalid_argument(
           "chain shape does not match prepared weights");
     }
+    if (op.shape.prenorm) {
+      if (i != 0) {
+        throw std::invalid_argument(
+            "the prelude is only supported on the first chain operation");
+      }
+      if (!p.shape.prenorm) {
+        throw std::invalid_argument(
+            "chain prelude needs a prenorm prepared handle");
+      }
+      if (op.shape.prenorm_spec.k != 0 &&
+          op.shape.prenorm_spec.k != p.prenorm_k) {
+        throw std::invalid_argument(
+            "chain prelude shape does not match prepared weights");
+      }
+    } else if (p.shape.prenorm) {
+      throw std::invalid_argument(
+          "chain operation lost its prenorm prepared handle");
+    }
     if (op.shape.epilogue != kEpilogueNone &&
         op.shape.epilogue != kEpilogueSoftcap &&
         op.shape.epilogue != kEpilogueGeglu) {
@@ -968,12 +1126,21 @@ PreparedChain Program::prepare_chain(const ChainOp* ops, int32_t count) {
   c.configs.assign(static_cast<size_t>(count) * kConfigObjectBytes, 0);
   for (int32_t i = 0; i < count; ++i) {
     const auto& p = *ops[i].weights->impl_;
-    write_config(
-        reinterpret_cast<uint32_t*>(c.configs.data() +
-                                    static_cast<size_t>(i) * kConfigObjectBytes),
-        ops[i].shape.format, p.tile_bytes, p.rows_steps, p.cols_bands,
-        p.weights_blocks, p.total_tiles, p.input_pad, p.weight_pad,
-        ops[i].shape.soft_cap, ops[i].shape.epilogue);
+    auto* config = reinterpret_cast<uint32_t*>(
+        c.configs.data() + static_cast<size_t>(i) * kConfigObjectBytes);
+    write_config(config, ops[i].shape.format, p.tile_bytes, p.rows_steps,
+                 p.cols_bands, p.weights_blocks, p.total_tiles, p.input_pad,
+                 p.weight_pad, ops[i].shape.soft_cap, ops[i].shape.epilogue,
+                 ops[i].shape.prenorm, p.prenorm_eps,
+                 ops[i].shape.prenorm ? 1.0f / p.prenorm_k : 0.0f);
+    if (ops[i].shape.prenorm) {
+      std::memcpy(
+          c.configs.data() +
+              static_cast<size_t>(i) * kConfigObjectBytes +
+              design::kPrenormWeightOffset,
+          p.prenorm_weight.data(),
+          p.prenorm_weight.size() * sizeof(uint16_t));
+    }
   }
 
   c.txn = txn_concat::concat(bases, patches);

@@ -61,6 +61,10 @@ CFG_WEIGHT_PAD = 7
 CFG_SOFT_CAP_HI_LO = 8    # two bf16 bits: cap hi, cap lo
 CFG_SOFT_INV_HI_LO = 9    # two bf16 bits: 1/cap hi, 1/cap lo
 CFG_EPILOGUE = 10         # EPILOGUE_* selector
+CFG_PRENORM = 11          # nonzero: this call carries the prenorm body
+CFG_PRENORM_EPS = 12      # f32 bits
+CFG_PRENORM_INV_K = 13    # f32 bits
+
 
 # Tile epilogue selector.  The value is a single exclusive kind; a separate
 # flags word will be added when layout-preserving modifiers (scale/add/clamp)
@@ -71,6 +75,9 @@ EPILOGUE_GEGLU = 2
 
 # Config words are copied as int32; round the object up to a 64-byte line.
 CONFIG_LEN = 16
+# The norm weight starts after the config header; it is interleaved per
+# 8-value K chunk as [hi8][lo8] bf16.
+PRENORM_WEIGHT_OFFSET_BYTES = CONFIG_LEN * 4
 
 # State word indices.
 STATE_CARRY_LEN = 0
@@ -86,6 +93,13 @@ l1_stream_type = np.ndarray[(L1_STREAM_BYTES,), np.dtype[np.uint8]]
 l2_stream_type = np.ndarray[(L2_STREAM_BYTES,), np.dtype[np.uint8]]
 l1_carry_type = np.ndarray[(CARRY_BYTES,), np.dtype[np.uint8]]
 l1_state_type = np.ndarray[(STATE_WORDS,), np.dtype[np.int32]]
+# Norm prelude state: four f32 sums followed by four hi/lo bf16 pairs.
+l1_prenorm_state_type = np.ndarray[(16,), np.dtype[np.int32]]
+# Stable copy of the config-carried norm weight; the config object itself is a
+# stream object the input DMA reuses, so the scale pass cannot read it in place.
+l1_prenorm_weight_type = np.ndarray[
+    (INPUT_GROUP_ELEMS,), np.dtype[bfloat16]
+]
 l1_input_group_type = np.ndarray[
     (INPUT_GROUP_ELEMS,), np.dtype[bfloat16]
 ]

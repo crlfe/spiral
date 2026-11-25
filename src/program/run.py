@@ -39,18 +39,20 @@ SOURCE_FILES = COMMON_SOURCE_FILES + npu.DIAGNOSTIC_SOURCE_FILES
 PRODUCTION_SOURCE_FILES = COMMON_SOURCE_FILES
 
 
-def _make_program(dynamic, production=False):
+def _make_program(dynamic, production=False, prenorm=False):
     """Build the fixed-max program.
 
     Flow: static device configuration -> worker program -> runtime sequence.
     ``dynamic`` selects the runtime-sized host sequence used by the C++
-    caller; production omits the diagnostic path.
+    caller; production omits the diagnostic path.  ``prenorm`` selects the
+    second, prelude-carrying host body.
     """
     device = npu.build(production)
     workers = worker.build_workers(device, dynamic, production)
     rt = Runtime(
-        sequence.build(dynamic),
+        sequence.build(dynamic, prenorm),
         npu.runtime_args(device, dynamic),
+        name="prenorm_sequence" if prenorm else "sequence",
         strict_task_groups=False,
     )
     return Program(NPU2(), rt, workers).resolve_program()
@@ -86,6 +88,28 @@ def production_dynamic_program(
     outputs: Out,
 ):
     return _make_program(True, production=True)
+
+
+@iron.jit(source_files=SOURCE_FILES)
+def prenorm_dynamic_program(
+    weights: In,
+    inputs: In,
+    config: In,
+    outputs: Out,
+):
+    """Diagnostic program with the prelude-carrying host body."""
+    return _make_program(True, prenorm=True)
+
+
+@iron.jit(source_files=PRODUCTION_SOURCE_FILES)
+def production_prenorm_dynamic_program(
+    weights: In,
+    inputs: In,
+    config: In,
+    outputs: Out,
+):
+    """Production program with the prelude-carrying host body."""
+    return _make_program(True, production=True, prenorm=True)
 
 
 if __name__ == "__main__":

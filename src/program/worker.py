@@ -37,12 +37,18 @@ def build_workers(device, dynamic, production=False):
         carry,
         state,
         accum,
+        prenorm_state,
+        prenorm_weight,
         begin,
         zero,
         output,
         block_begin,
         q4_0_block,
         q6_k_block,
+        prenorm_sum,
+        prenorm_finish,
+        prenorm_scale,
+        prenorm_load,
         assemble=None,
         probe=None,
         raw_check=None,
@@ -50,13 +56,6 @@ def build_workers(device, dynamic, production=False):
         """Per-compute worker: decode config, stream blocks, drain output."""
         config_buf = inputs_cons.acquire(1)
         begin(config_buf, config_out, state)
-        inputs_cons.release(1)
-
-        fmt = config_out[design.CFG_FORMAT]
-        tile_bytes = config_out[design.CFG_TILE_BYTES]
-        cols_bands = config_out[design.CFG_COLS_BANDS]
-        weights_blocks = config_out[design.CFG_WEIGHTS_BLOCKS]
-        rows_steps = config_out[design.CFG_ROWS_STEPS]
 
         i32 = IntegerType.get_signless(32)
         zero_i32 = arith.constant(i32, 0)
@@ -64,6 +63,26 @@ def build_workers(device, dynamic, production=False):
         two_i32 = arith.constant(i32, 2)
         group_rows_i32 = arith.constant(i32, design.INPUT_GROUP_ROWS)
         fmt_q4_i32 = arith.constant(i32, design.FORMAT_Q4_0)
+        prenorm = config_out[design.CFG_PRENORM]
+        # Copy the config-carried norm weight into its stable L1 buffer before
+        # the input stream reuses the config slot, then release it as usual.
+        if production:
+            with if_(arith.cmpi(CmpIPredicate.ne, prenorm, zero_i32)):
+                prenorm_load(
+                    config_buf,
+                    prenorm_weight,
+                    arith.muli(
+                        config_out[design.CFG_ROWS_STEPS],
+                        arith.constant(i32, 2 * design.ROWS_STEP),
+                    ),
+                )
+        inputs_cons.release(1)
+
+        fmt = config_out[design.CFG_FORMAT]
+        tile_bytes = config_out[design.CFG_TILE_BYTES]
+        cols_bands = config_out[design.CFG_COLS_BANDS]
+        weights_blocks = config_out[design.CFG_WEIGHTS_BLOCKS]
+        rows_steps = config_out[design.CFG_ROWS_STEPS]
         if not production:
             fmt_q6_i32 = arith.constant(i32, design.FORMAT_Q6_K)
             mode_fifo_i32 = arith.constant(i32, design.MODE_FIFO)
@@ -157,6 +176,34 @@ def build_workers(device, dynamic, production=False):
                                         cols_bands,
                                     )
 
+        def emit_prenorm_sum():
+            """Consume the first input fill set and reduce it to r hi/lo."""
+            with if_(arith.cmpi(CmpIPredicate.ne, prenorm, zero_i32)):
+                if dynamic:
+                    input_pad = config_out[design.CFG_INPUT_PAD]
+                    sum_groups = arith.addi(num_groups, input_pad)
+                else:
+                    sum_groups = arith.constant(
+                        i32, design.MAX_INPUT_GROUPS
+                    )
+                for group_index in range_(sum_groups):
+                    group = inputs_cons.acquire(1)
+                    prenorm_sum(
+                        group,
+                        arith.muli(
+                            arith.index_cast(i32, group_index),
+                            group_rows_i32,
+                        ),
+                        rows_steps,
+                        prenorm_state,
+                    )
+                    inputs_cons.release(1)
+                prenorm_finish(
+                    prenorm_state,
+                    config_out[design.CFG_PRENORM_EPS],
+                    config_out[design.CFG_PRENORM_INV_K],
+                )
+
         def emit_loop():
             """Stream every weight block and input group through the tiles."""
             # The diagnostic split path stores tile checksums while streaming;
@@ -179,6 +226,15 @@ def build_workers(device, dynamic, production=False):
             block = weights_cons.acquire(1)
             block_begin(state)
             input_group = inputs_cons.acquire(1)
+            if production:
+                with if_(arith.cmpi(CmpIPredicate.ne, prenorm, zero_i32)):
+                    prenorm_scale(
+                        input_group,
+                        zero_i32,
+                        rows_steps,
+                        prenorm_weight,
+                        prenorm_state,
+                    )
             group0 = zero_i32
 
             # Carried state: the current weight block, the current input
@@ -211,6 +267,22 @@ def build_workers(device, dynamic, production=False):
                 with InsertionPoint(next_input.then_block):
                     inputs_cons.release(1)
                     new_input = inputs_cons.acquire(1)
+                    if production:
+                        with if_(
+                            arith.cmpi(
+                                CmpIPredicate.ne, prenorm, zero_i32
+                            )
+                        ):
+                            prenorm_scale(
+                                new_input,
+                                arith.muli(
+                                    arith.addi(current_group, one_i32),
+                                    group_rows_i32,
+                                ),
+                                rows_steps,
+                                prenorm_weight,
+                                prenorm_state,
+                            )
                     scf_yield(
                         [new_input, arith.addi(current_group, one_i32)]
                     )
@@ -360,10 +432,12 @@ def build_workers(device, dynamic, production=False):
                     inputs_cons.release(1)
 
         if production:
+            emit_prenorm_sum()
             emit_loop()
         else:
             emit_diagnostic_paths()
         emit_padding()
+
 
     worker_kernels = npu.worker_kernel_list(device.kernels, production)
     return [
@@ -377,6 +451,8 @@ def build_workers(device, dynamic, production=False):
                 device.buffers.carry[npu._compute_index(g, c)],
                 device.buffers.state[npu._compute_index(g, c)],
                 device.buffers.accum[npu._compute_index(g, c)],
+                device.buffers.prenorm[npu._compute_index(g, c)],
+                device.buffers.prenorm_weight[npu._compute_index(g, c)],
                 *worker_kernels,
             ],
             tile=device.compute_tiles[g][c],

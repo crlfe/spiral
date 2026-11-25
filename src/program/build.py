@@ -124,6 +124,10 @@ def _emit_design_meta():
         "kCfgSoftCapHiLo": design.CFG_SOFT_CAP_HI_LO,
         "kCfgSoftInvHiLo": design.CFG_SOFT_INV_HI_LO,
         "kCfgEpilogue": design.CFG_EPILOGUE,
+        "kCfgPrenorm": design.CFG_PRENORM,
+        "kCfgPrenormEps": design.CFG_PRENORM_EPS,
+        "kCfgPrenormInvK": design.CFG_PRENORM_INV_K,
+        "kPrenormWeightOffset": design.PRENORM_WEIGHT_OFFSET_BYTES,
         "kConfigLen": design.CONFIG_LEN,
         "kFormatQ4_0": design.FORMAT_Q4_0,
         "kFormatQ6K": design.FORMAT_Q6_K,
@@ -136,6 +140,7 @@ def _emit_design_meta():
         "kModeTileCheck": design.MODE_TILE_CHECK,
         "kModeLast": design.MODE_LAST,
         "kProduction": 1 if PRODUCTION else 0,
+        "kPrenormAvailable": 1 if PRODUCTION else 0,
     }
     size_values = {
         "kL1StreamBytes": design.L1_STREAM_BYTES,
@@ -236,6 +241,41 @@ def _emit_golden():
     )
 
 
+def _patch_txn_header(path):
+    txn_src = path.read_text()
+    patched, count = re.subn(
+        r"return\s+std::nullopt\s*;",
+        'throw std::runtime_error(std::string("Overflow at ") + __FILE__ + '
+        '":" + std::to_string(__LINE__));',
+        txn_src,
+    )
+    if count:
+        path.write_text("#include <stdexcept>\n" + patched)
+
+
+def _lower_body(mlir, lowered_name, header_name):
+    """Compile one host sequence body from an already-built design MLIR."""
+    compile_mlir_module(mlir, work_dir=WORK_DIR, device=NPU2())
+    _tool(
+        str(AIE_BIN / "aie-opt"),
+        "--aie-substitute-shim-dma-allocations",
+        "--aie-assign-runtime-sequence-bd-ids",
+        "--aie-dma-tasks-to-npu",
+        "--aie-dma-to-npu",
+        "-o",
+        lowered_name,
+        "input_with_addresses.mlir",
+    )
+    _tool(
+        str(AIE_BIN / "aie-translate"),
+        "--aie-npu-to-cpp",
+        "-o",
+        header_name,
+        lowered_name,
+    )
+    _patch_txn_header(WORK_DIR / header_name)
+
+
 def main():
     global WORK_DIR, PRODUCTION
     PRODUCTION = "--production" in sys.argv[1:]
@@ -253,40 +293,23 @@ def main():
         if PRODUCTION
         else run.dynamic_program
     )
+    builder_prenorm = (
+        run.production_prenorm_dynamic_program
+        if PRODUCTION
+        else run.prenorm_dynamic_program
+    )
     mlir = builder.as_mlir()
     compile_external_kernels(
         ExternalFunction._instances, WORK_DIR, "aie2p"
     )
-    compile_mlir_module(mlir, work_dir=WORK_DIR, device=NPU2())
+    _lower_body(mlir, "lowered.mlir", "generate_txn.h")
 
-    _tool(
-        str(AIE_BIN / "aie-opt"),
-        "--aie-substitute-shim-dma-allocations",
-        "--aie-assign-runtime-sequence-bd-ids",
-        "--aie-dma-tasks-to-npu",
-        "--aie-dma-to-npu",
-        "-o",
-        "lowered.mlir",
-        "input_with_addresses.mlir",
-    )
-    _tool(
-        str(AIE_BIN / "aie-translate"),
-        "--aie-npu-to-cpp",
-        "-o",
-        "generate_txn.h",
-        "lowered.mlir",
-    )
-
-    txn_path = WORK_DIR / "generate_txn.h"
-    txn_src = txn_path.read_text()
-    patched, count = re.subn(
-        r"return\s+std::nullopt\s*;",
-        'throw std::runtime_error(std::string("Overflow at ") + __FILE__ + '
-        '":" + std::to_string(__LINE__));',
-        txn_src,
-    )
-    if count:
-        txn_path.write_text("#include <stdexcept>\n" + patched)
+    # Second static host body: same device design, extra dummy prelude fills.
+    # The xclbin below is built from the normal body; the prenorm body only
+    # changes the host transaction stream and config flag.
+    mlir_prenorm = builder_prenorm.as_mlir()
+    _lower_body(mlir_prenorm, "lowered_prenorm.mlir",
+                "generate_txn_prenorm.h")
 
     if PRODUCTION:
         # Reuse the diagnostic build's golden data when available; production

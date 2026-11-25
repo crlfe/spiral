@@ -30,6 +30,11 @@ PROBE_SOURCE = KERNEL_DIR / "program_probe.aie.cc"
 RAW_CHECK_SOURCE = KERNEL_DIR / "program_raw_check.aie.cc"
 Q4_0_BLOCK_SOURCE = KERNEL_DIR / "program_q4_block.aie.cc"
 Q6_K_BLOCK_SOURCE = KERNEL_DIR / "program_q6_block.aie.cc"
+PRENORM_SUM_SOURCE = KERNEL_DIR / "program_prenorm_sum.aie.cc"
+PRENORM_FINISH_SOURCE = KERNEL_DIR / "program_prenorm_finish.aie.cc"
+PRENORM_SCALE_SOURCE = KERNEL_DIR / "program_prenorm_scale.aie.cc"
+PRENORM_LOAD_SOURCE = KERNEL_DIR / "program_prenorm_load.aie.cc"
+PRENORM_IMPL_HEADER = KERNEL_DIR / "program_prenorm_impl.h"
 # Shared block body and helpers; included by every `program_*_block` source.
 BLOCK_IMPL_HEADER = KERNEL_DIR / "program_block_impl.h"
 STATE_HEADER = KERNEL_DIR / "program_state.h"
@@ -59,6 +64,13 @@ KERNEL_SOURCE_FILES = [
     BLOCK_SOURCE,
     Q4_0_BLOCK_SOURCE,
     Q6_K_BLOCK_SOURCE,
+    PRENORM_SUM_SOURCE,
+    PRENORM_FINISH_SOURCE,
+    PRENORM_SCALE_SOURCE,
+    PRENORM_LOAD_SOURCE,
+    PRENORM_IMPL_HEADER,
+    QUANTS_ROOT / "funcs/rmsnorm/rmsnorm.aie.h",
+    QUANTS_ROOT / "funcs/rmsnorm/layout.h",
     BLOCK_IMPL_HEADER,
     STATE_HEADER,
     *Q4_0_HEADERS,
@@ -91,6 +103,10 @@ class Kernels(NamedTuple):
     block_begin: object
     q4_block: object
     q6_block: object
+    prenorm_sum: object
+    prenorm_finish: object
+    prenorm_scale: object
+    prenorm_load: object = None
     assemble: object = None
     probe: object = None
     raw_check: object = None
@@ -103,6 +119,8 @@ class ComputeBuffers(NamedTuple):
     state: list
     config: list
     accum: list
+    prenorm: list
+    prenorm_weight: list
 
 
 class Device(NamedTuple):
@@ -220,6 +238,81 @@ def _make_kernels(production=False):
         source_file=str(Q4_0_BLOCK_SOURCE),
         inline=False,
     )
+    # The real prelude is production-only: the diagnostic build's probe
+    # kernels already fill the tile program memory.
+    if production:
+        prenorm_sum = ExternalFunction(
+            "program_prenorm_sum",
+            arg_types=[
+                design.l1_input_group_type,
+                np.int32,
+                np.int32,
+                design.l1_prenorm_state_type,
+            ],
+            include_dirs=[str(QUANTS_ROOT), str(KERNEL_DIR)],
+            compile_flags=[
+                f"-DPROGRAM_PRENORM_WEIGHT_OFFSET_BYTES="
+                f"{design.PRENORM_WEIGHT_OFFSET_BYTES}",
+                "-Os",
+            ],
+            source_file=str(PRENORM_SUM_SOURCE),
+            inline=False,
+        )
+        prenorm_finish = ExternalFunction(
+            "program_prenorm_finish",
+            arg_types=[
+                design.l1_prenorm_state_type,
+                np.int32,
+                np.int32,
+            ],
+            include_dirs=[str(QUANTS_ROOT), str(KERNEL_DIR)],
+            compile_flags=[
+                f"-DPROGRAM_PRENORM_WEIGHT_OFFSET_BYTES="
+                f"{design.PRENORM_WEIGHT_OFFSET_BYTES}",
+                "-Oz",
+            ],
+            source_file=str(PRENORM_FINISH_SOURCE),
+            inline=False,
+        )
+        prenorm_load = ExternalFunction(
+            "program_prenorm_load",
+            arg_types=[
+                design.l1_input_group_type,
+                design.l1_prenorm_weight_type,
+                np.int32,
+            ],
+            include_dirs=[str(QUANTS_ROOT), str(KERNEL_DIR)],
+            compile_flags=[
+                f"-DPROGRAM_PRENORM_WEIGHT_OFFSET_BYTES="
+                f"{design.PRENORM_WEIGHT_OFFSET_BYTES}",
+                "-Oz",
+            ],
+            source_file=str(PRENORM_LOAD_SOURCE),
+            inline=False,
+        )
+        prenorm_scale = ExternalFunction(
+            "program_prenorm_scale",
+            arg_types=[
+                design.l1_input_group_type,
+                np.int32,
+                np.int32,
+                design.l1_prenorm_weight_type,
+                design.l1_prenorm_state_type,
+            ],
+            include_dirs=[str(QUANTS_ROOT), str(KERNEL_DIR)],
+            compile_flags=[
+                f"-DPROGRAM_PRENORM_WEIGHT_OFFSET_BYTES="
+                f"{design.PRENORM_WEIGHT_OFFSET_BYTES}",
+                "-Os",
+            ],
+            source_file=str(PRENORM_SCALE_SOURCE),
+            inline=False,
+        )
+    else:
+        # Placeholders keep the worker argument list stable; the body
+        # never calls them in the diagnostic build.
+        prenorm_sum = prenorm_finish = prenorm_scale = zero
+        prenorm_load = zero
     if not production:
         probe = ExternalFunction(
             "program_probe",
@@ -257,6 +350,10 @@ def _make_kernels(production=False):
         block_begin=block_begin,
         q4_block=q4_0_block,
         q6_block=q6_k_block,
+        prenorm_sum=prenorm_sum,
+        prenorm_finish=prenorm_finish,
+        prenorm_scale=prenorm_scale,
+        prenorm_load=prenorm_load,
         assemble=assemble,
         probe=probe,
         raw_check=raw_check,
@@ -271,6 +368,7 @@ def _make_fifos(mem_tiles):
     inputs_l1 = inputs_l2.cons().forward(
         tile=mem_tiles[0],
         obj_type=design.l1_input_group_type,
+        depth=1,
         name="inputs_l1",
     )
 
@@ -352,6 +450,8 @@ def _make_compute_buffers():
         state=alloc(design.l1_state_type, "state"),
         config=alloc(design.l1_config_out_type, "config"),
         accum=alloc(design.l1_accum_type, "accum"),
+        prenorm=alloc(design.l1_prenorm_state_type, "prenorm"),
+        prenorm_weight=alloc(design.l1_prenorm_weight_type, "prenorm_weight"),
     )
 
 
@@ -364,6 +464,10 @@ def worker_kernel_list(kernels, production):
         kernels.block_begin,
         kernels.q4_block,
         kernels.q6_block,
+        kernels.prenorm_sum,
+        kernels.prenorm_finish,
+        kernels.prenorm_scale,
+        kernels.prenorm_load,
     ]
     if production:
         return common

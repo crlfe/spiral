@@ -235,6 +235,14 @@ float bf16_bits_to_float(uint16_t bits) {
   return value;
 }
 
+uint16_t float_to_bf16_bits(float value) {
+  uint32_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  const uint32_t lsb = (bits >> 16) & 1u;
+  bits += 0x7fffu + lsb;
+  return static_cast<uint16_t>(bits >> 16);
+}
+
 // The device API is bf16; widen only for the f32 golden comparison so the
 // timed unpack path is the real chaining path.
 bool check_outputs(const std::string& name, const Golden& golden,
@@ -271,6 +279,128 @@ bool run_golden(spiral::Program& program, const std::string& name) {
               golden.inputs.data(), outputs.data(), golden.weights_cols, 0);
 
   return check_outputs(name, golden, outputs);
+}
+
+bool run_prenorm_spike(spiral::Program& program, const std::string& name) {
+  Golden golden = load_golden(name);
+  const int32_t k = golden.weights_rows;
+  const int32_t cols = golden.weights_cols;
+  const int32_t vecs = design::kInputsVecs;
+  std::vector<uint16_t> outputs(static_cast<size_t>(vecs) * cols, 0);
+  std::vector<uint16_t> ref_inputs(static_cast<size_t>(vecs) * k, 0);
+  std::vector<uint16_t> ref_outputs(static_cast<size_t>(vecs) * cols, 0);
+  std::vector<float> weight(static_cast<size_t>(k), 1.0f);
+  constexpr float kEps = 1e-6f;
+  for (int32_t i = 0; i < k; ++i) {
+    weight[static_cast<size_t>(i)] =
+        1.0f + 0.05f * std::sin(0.01f * static_cast<float>(i));
+  }
+
+  // Host reference: normalize the bf16 activation in f32, apply the norm
+  // weight, and round once to bf16.  Mirror the device's hi/lo split of
+  // r * weight and its single rounding of x*hi + x*lo so the only remaining
+  // difference is the device's own r.
+  for (int32_t v = 0; v < vecs; ++v) {
+    double sum = 0.0;
+    for (int32_t i = 0; i < k; ++i) {
+      const double x = bf16_bits_to_float(
+          golden.inputs[static_cast<size_t>(v) * k + i]);
+      sum += x * x;
+    }
+    const float r = static_cast<float>(
+        1.0 / std::sqrt(sum / static_cast<double>(k) + kEps));
+    const float r_hi_f = bf16_bits_to_float(float_to_bf16_bits(r));
+    const float r_lo_f = bf16_bits_to_float(
+        float_to_bf16_bits(r - r_hi_f));
+    for (int32_t i = 0; i < k; ++i) {
+      const float x = bf16_bits_to_float(
+          golden.inputs[static_cast<size_t>(v) * k + i]);
+      const float w = weight[static_cast<size_t>(i)];
+      const float w_hi = bf16_bits_to_float(float_to_bf16_bits(w));
+      const float w_lo = bf16_bits_to_float(
+          float_to_bf16_bits(w - w_hi));
+      // Device order: rh*wh, + rh*wl, + rl*wh.
+      float s = r_hi_f * w_hi;
+      s = s + r_hi_f * w_lo;
+      s = s + r_lo_f * w_hi;
+      const uint16_t hi = float_to_bf16_bits(s);
+      const float hi_f = bf16_bits_to_float(hi);
+      const uint16_t lo = float_to_bf16_bits(s - hi_f);
+      ref_inputs[static_cast<size_t>(v) * k + i] = float_to_bf16_bits(
+          x * hi_f + x * bf16_bits_to_float(lo));
+    }
+  }
+
+  spiral::MatmulShape normal_shape;
+  normal_shape.format = golden.format;
+  normal_shape.weights_rows = golden.weights_rows;
+  normal_shape.weights_cols = golden.weights_cols;
+  set_epilogue(normal_shape, golden.soft_cap);
+  normal_shape.inputs_vecs = design::kInputsVecs;
+  auto normal = program.prepare(normal_shape, golden.raw.data(),
+                                golden.raw_stride, 0);
+
+  spiral::MatmulShape prenorm_shape = normal_shape;
+  prenorm_shape.prenorm = true;
+  prenorm_shape.prenorm_spec.weight = weight.data();
+  prenorm_shape.prenorm_spec.k = k;
+  prenorm_shape.prenorm_spec.eps = kEps;
+  // Derive the prelude variant from the normal handle: shares the packed
+  // weight BO instead of repacking it.
+  auto prenorm = program.prepare_prenorm(normal, prenorm_shape.prenorm_spec);
+
+  bool ok = true;
+  program.run(normal_shape, normal, golden.inputs.data(), outputs.data(),
+              cols, 0);
+  ok = check_outputs(name, golden, outputs) && ok;
+
+  program.run(normal_shape, normal, ref_inputs.data(), ref_outputs.data(),
+              cols, 0);
+  program.run(prenorm_shape, prenorm, golden.inputs.data(), outputs.data(),
+              cols, 0);
+
+  double worst = 0.0;
+  double max_error = 0.0;
+  for (int32_t n = 0; n < cols; ++n) {
+    double scale = 0.0;
+    for (int32_t v = 0; v < vecs; ++v) {
+      scale = std::max<double>(
+          scale, std::fabs(bf16_bits_to_float(
+                     ref_outputs[static_cast<size_t>(v) * cols + n])));
+    }
+    const double tol = std::max(1e-3, 6e-3 * scale);
+    for (int32_t v = 0; v < vecs; ++v) {
+      const size_t index = static_cast<size_t>(v) * cols + n;
+      const double got = bf16_bits_to_float(outputs[index]);
+      const double want = bf16_bits_to_float(ref_outputs[index]);
+      max_error = std::max(max_error, std::fabs(got - want));
+      worst = std::max(worst, std::fabs(got - want) / tol);
+    }
+  }
+  std::printf(
+      "%s prenorm real: max error %.6f, worst %.3f of tolerance\n",
+      name.c_str(), max_error, worst);
+  ok = worst <= 1.0 && ok;
+
+  // Interleave the two bodies so clock ramp and ordering cancel.
+  constexpr int32_t kRuns = 20;
+  double normal_us = 0.0;
+  double prenorm_us = 0.0;
+  for (int32_t i = 0; i < kRuns + 1; ++i) {
+    spiral::RunTimings normal_timing;
+    program.run(normal_shape, normal, golden.inputs.data(), outputs.data(),
+                cols, 0, &normal_timing);
+    spiral::RunTimings prenorm_timing;
+    program.run(prenorm_shape, prenorm, golden.inputs.data(), outputs.data(),
+                cols, 0, &prenorm_timing);
+    if (i > 0) {
+      normal_us += normal_timing.total_us;
+      prenorm_us += prenorm_timing.total_us;
+    }
+  }
+  std::printf("%s prenorm spike: normal %.1f us, prenorm %.1f us\n",
+              name.c_str(), normal_us / kRuns, prenorm_us / kRuns);
+  return ok;
 }
 
 bool run_head(spiral::Program& program, const std::string& name) {
@@ -751,6 +881,12 @@ bool run_manifest(spiral::Program& program) {
 int main(int argc, char** argv) {
   try {
     spiral::Program program;
+    if (argc > 1 && std::string(argv[1]) == "--prenorm-spike") {
+      bool ok = true;
+      ok = run_prenorm_spike(program, "q4_0_1536x512") && ok;
+      ok = run_prenorm_spike(program, "q4_0_1536x2048") && ok;
+      return ok ? 0 : 1;
+    }
     if (argc > 1 && std::string(argv[1]) == "--head-timing") {
       std::printf("%-22s %7s %7s %7s %7s %7s %7s %7s\n", "case", "prepare",
                   "upload", "txn", "input", "kernel", "unpack", "total");

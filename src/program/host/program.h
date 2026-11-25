@@ -6,6 +6,15 @@
 
 namespace spiral {
 
+// Optional RMS norm prelude for a matmul: the device normalizes the activation
+// with this f32 weight before the mmul.  The kernel stores the weight as bf16
+// hi/lo in the config object.  `k` must equal the matmul's weights_rows.
+struct PrenormSpec {
+  const float* weight = nullptr;
+  int32_t k = 0;
+  float eps = 1e-6f;
+};
+
 // One matmul call.  Dimensions use the model vocabulary, not M/N/K.
 struct MatmulShape {
   int32_t format = 2;        // ggml_type; 2 = Q4_0, 14 = Q6_K
@@ -24,6 +33,10 @@ struct MatmulShape {
   //                    two-segment prepare with equal widths, stores the gate
   //                    half at output offset 0
   int32_t epilogue = 0;
+  // Select the prelude-carrying host transaction body.  The device sums and
+  // scales the input before the mmul; the config carries the norm weight.
+  bool prenorm = false;
+  PrenormSpec prenorm_spec;
 };
 
 enum : int32_t {
@@ -145,6 +158,13 @@ class Program {
   PreparedWeights prepare(const MatmulShape& shape,
                           const WeightSegment* segments,
                           int32_t segment_count);
+
+  // Derive the prelude-carrying variant of an already prepared handle.  The
+  // weight stream is immutable and shared with `base`; only the host TXN and
+  // the config-carried norm weight differ, so this does not repack or
+  // allocate another BO.
+  PreparedWeights prepare_prenorm(const PreparedWeights& base,
+                                  const PrenormSpec& spec);
 
   // Run one matmul with already prepared weights.
   //

@@ -6,6 +6,7 @@ of the worker program.  `run.py` selects one of the builders and hands it to
 """
 
 import sys
+from functools import partial
 from pathlib import Path
 
 from aie import iron
@@ -79,7 +80,8 @@ def _drain_outputs(outputs_conses, outputs_buf, group):
 
 
 def _sequence_static(weights_buf, inputs_buf, config_buf, outputs_buf,
-                     weights_prods, inputs_prod, outputs_conses):
+                     weights_prods, inputs_prod, outputs_conses,
+                     prenorm=False):
     """Fixed-max host path used by the Python test runner."""
     group_stride_words = design.MAX_WEIGHT_BLOCKS * _L2_WORDS
     outer, inner = _factor_bd(design.MAX_WEIGHT_BLOCKS)
@@ -101,6 +103,19 @@ def _sequence_static(weights_buf, inputs_buf, config_buf, outputs_buf,
         group=tg,
         wait=False,
     )
+    if prenorm:
+        # Sum-pass set first; the main loop consumes the second set.
+        inputs_prod.fill(
+            inputs_buf,
+            tap=TensorAccessPattern(
+                (design.MAX_INPUT_WORDS,),
+                0,
+                [outer_in, inner_in, 1, _INPUT_WORDS],
+                [inner_in * _INPUT_WORDS, _INPUT_WORDS, 0, 1],
+            ),
+            group=tg,
+            wait=False,
+        )
 
     for g in range(design.GROUPS):
         weights_prods[g].fill(
@@ -122,7 +137,8 @@ def _sequence_static(weights_buf, inputs_buf, config_buf, outputs_buf,
 def _sequence_dynamic(weights_buf, inputs_buf, config_buf, outputs_buf,
                       weights_prods, inputs_prod, outputs_conses,
                       input0, input1, input2, input3,
-                      weight0, weight1, group_stride_words):
+                      weight0, weight1, group_stride_words,
+                      prenorm=False):
     """Runtime-sized host path used by the C++ production caller."""
     i32 = IntegerType.get_signless(32)
     i64 = IntegerType.get_signless(64)
@@ -138,20 +154,26 @@ def _sequence_dynamic(weights_buf, inputs_buf, config_buf, outputs_buf,
     _fill_config(inputs_prod, config_buf, config_tg)
     config_tg.finish()
 
-    offset = arith.constant(i32, 0)
-    for part in (input0, input1, input2, input3):
-        inputs_prod.fill(
-            inputs_buf,
-            tap=TensorAccessPattern(
-                (design.MAX_INPUT_WORDS,),
-                offset,
-                [as_i64(part), 1, 1, _INPUT_WORDS],
-                [_INPUT_WORDS, 0, 0, 1],
-            ),
-            group=tg,
-            wait=False,
-        )
-        offset = arith.addi(offset, arith.muli(part, input_step))
+    def fill_inputs():
+        offset = arith.constant(i32, 0)
+        for part in (input0, input1, input2, input3):
+            inputs_prod.fill(
+                inputs_buf,
+                tap=TensorAccessPattern(
+                    (design.MAX_INPUT_WORDS,),
+                    offset,
+                    [as_i64(part), 1, 1, _INPUT_WORDS],
+                    [_INPUT_WORDS, 0, 0, 1],
+                ),
+                group=tg,
+                wait=False,
+            )
+            offset = arith.addi(offset, arith.muli(part, input_step))
+
+    if prenorm:
+        # Sum-pass set first; the main loop consumes the second set.
+        fill_inputs()
+    fill_inputs()
 
     for g in range(design.GROUPS):
         offset = arith.muli(arith.constant(i32, g), group_stride_words)
@@ -173,6 +195,7 @@ def _sequence_dynamic(weights_buf, inputs_buf, config_buf, outputs_buf,
     tg.finish()
 
 
-def build(runtime_sized):
+def build(runtime_sized, prenorm=False):
     """Return the host sequence used by the C++ caller or Python runner."""
-    return _sequence_dynamic if runtime_sized else _sequence_static
+    fn = _sequence_dynamic if runtime_sized else _sequence_static
+    return partial(fn, prenorm=True) if prenorm else fn

@@ -64,6 +64,7 @@ It is not a scaffold to extend; the real kernels live here.
 | L2 stream block | 32 KiB |
 | carry buffer | 4 KiB (largest tile is Q6_K at 3392 bytes) |
 | weight FIFO depth | 2 per channel |
+| input FIFO depth | 1 (the freed 8 KiB holds the norm weight) |
 | max weights_rows | 12288 (48 rows_steps) |
 | max weights_cols, Q4_0 single tensor | 12288 (24 bands) |
 | max weights_cols, Q6_K output head | 262144 (512 bands) |
@@ -106,8 +107,11 @@ The config object is the first input-FIFO object, filled by its own shim fill
 from a dedicated config BO so the input BO contains only input groups. Both
 fills drive the same producer channel, so the config fill finishes before the
 input fill is issued. The object is 8 KiB because the FIFO has a fixed object
-type; only the first 64 bytes are used. It is copied into a per-compute buffer
-and decoded by the worker.
+type. The first 64 bytes are the header, copied into a per-compute buffer and
+decoded by the worker. A prenorm call also carries the full-K norm weight as
+interleaved hi/lo bf16 at byte 64; the worker copies it to a stable L1 buffer
+and releases the config object before the input stream starts. The config
+object is a stream slot the input DMA reuses, so the weight cannot stay in it.
 
 | word | value |
 | --: | :-- |
@@ -122,6 +126,9 @@ and decoded by the worker.
 | 8 | softcap hi/lo: two bf16 bits (`cap_hi | cap_lo << 16`); 0 disables |
 | 9 | softcap reciprocal hi/lo: two bf16 bits (`inv_hi | inv_lo << 16`) |
 | 10 | tile epilogue kind: 0 = none, 1 = softcap (words 8-9), 2 = GEGLU pair |
+| 11 | `prenorm`: nonzero selects the RMS-norm prelude for this call |
+| 12 | `prenorm` eps, f32 bits |
+| 13 | `prenorm` 1/K, f32 bits |
 
 `weights_blocks` covers the whole continuous stream:
 `ceil(total_tiles * tile_bytes / 8192)`. Padding exists only for the final
