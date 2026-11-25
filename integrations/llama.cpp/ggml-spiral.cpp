@@ -15,6 +15,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #if defined(__linux__)
@@ -131,6 +132,15 @@ struct ggml_backend_spiral_buffer {
                               uint8_t value, size_t offset, size_t size);
     static void clear(ggml_backend_buffer_t buffer, uint8_t value);
     bool ensure_prepared();
+
+    // Forced RMS-norm prelude variants.  The matmul weight stream is shared;
+    // only the config-carried norm weight differs, so these are prepared once
+    // per norm tensor and cached by pointer and eps.
+    std::vector<spiral::PreparedWeights> prenorm_prepared;
+    const void * prenorm_weight = nullptr;
+    float prenorm_eps = 0.0f;
+    uint64_t prenorm_epoch = 0;
+    bool ensure_prenorm_prepared(const void * weight, float eps);
 };
 
 // Prepared handles for several weight tensors concatenated along columns.
@@ -145,6 +155,10 @@ struct spiral_weight_chain {
     int32_t padded_cols = 0;
     std::vector<spiral::PreparedWeights> prepared;
     std::vector<spiral::MatmulShape> shapes;
+    // Shared-BO prelude variant; only the TXN and config gain differ.
+    std::vector<spiral::PreparedWeights> prenorm_prepared;
+    const void * prenorm_weight = nullptr;
+    float prenorm_eps = 0.0f;
 };
 
 // gate+up (GEGLU) -> down in one TXN.  The PreparedChain references the
@@ -157,6 +171,11 @@ struct spiral_ffn_chain {
     uint64_t up_epoch = 0;
     uint64_t down_epoch = 0;
     spiral::PreparedChain chain;
+    // gate+up+down with the prelude on op0's shared gate+up input.
+    spiral::PreparedChain prenorm_chain;
+    const void * prenorm_weight = nullptr;
+    float prenorm_eps = 0.0f;
+    bool has_prenorm = false;
 };
 
 struct ggml_backend_spiral {
@@ -180,6 +199,8 @@ struct ggml_backend_spiral {
     uint64_t stats_softcap_fused = 0;
     uint64_t stats_geglu_fused = 0;
     uint64_t stats_ffn_chains = 0;
+    uint64_t stats_prenorm_fused = 0;
+    uint64_t stats_prenorm_chains = 0;
     uint64_t stats_row_chunks = 0;
     uint64_t stats_col_chunks = 0;
     double stats_wall_us = 0.0;
@@ -451,6 +472,39 @@ bool ggml_backend_spiral_buffer::ensure_prepared() {
     return true;
 }
 
+bool ggml_backend_spiral_buffer::ensure_prenorm_prepared(const void * weight,
+                                                         float eps) {
+    if (!prenorm_prepared.empty() && prenorm_epoch == epoch &&
+        prenorm_weight == weight && prenorm_eps == eps) {
+        return true;
+    }
+    if (weight == nullptr || !ensure_prepared() || prepared.empty()) {
+        return false;
+    }
+    const double prepare_start = spiral_now_us();
+    prenorm_prepared.clear();
+    try {
+        for (const auto & base : prepared) {
+            spiral::PrenormSpec spec;
+            spec.weight = static_cast<const float *>(weight);
+            spec.k = weights_rows;
+            spec.eps = eps;
+            prenorm_prepared.push_back(
+                buft->dev->program->prepare_prenorm(base, spec));
+        }
+    } catch (const std::exception & error) {
+        GGML_LOG_ERROR("spiral: prenorm preparation failed: %s\n",
+                       error.what());
+        prenorm_prepared.clear();
+        return false;
+    }
+    prenorm_weight = weight;
+    prenorm_eps = eps;
+    prenorm_epoch = epoch;
+    buft->dev->prepare_us += spiral_now_us() - prepare_start;
+    return true;
+}
+
 void ggml_backend_spiral_buffer::get_tensor(ggml_backend_buffer_t buffer,
                                             const ggml_tensor * tensor, void * data,
                                             size_t offset, size_t size) {
@@ -682,9 +736,16 @@ ggml_backend_spiral_device & spiral_device(ggml_backend_reg_t reg) {
     return device;
 }
 
+struct spiral_prenorm_run {
+    const ggml_tensor * input = nullptr;
+    const ggml_tensor * weight = nullptr;
+    float eps = 0.0f;
+};
+
 bool spiral_run_mul_mat(ggml_backend_spiral * backend, ggml_tensor * node,
                         ggml_tensor * out = nullptr,
-                        float soft_cap = 0.0f) {
+                        float soft_cap = 0.0f,
+                        const spiral_prenorm_run * prenorm = nullptr) {
     const auto * src0 = node->src[0];
     const auto * src1 = node->src[1];
     if (src0 == nullptr || src1 == nullptr || src0->buffer == nullptr ||
@@ -701,21 +762,41 @@ bool spiral_run_mul_mat(ggml_backend_spiral * backend, ggml_tensor * node,
         GGML_LOG_ERROR("spiral: MUL_MAT %s has no prepared weights\n", node->name);
         return false;
     }
+    const ggml_tensor * input = prenorm != nullptr ? prenorm->input : src1;
+    if (input == nullptr) {
+        GGML_LOG_ERROR("spiral: MUL_MAT %s has no input\n", node->name);
+        return false;
+    }
+    if (prenorm != nullptr) {
+        if (prenorm->weight == nullptr ||
+            !weight_buffer->ensure_prenorm_prepared(prenorm->weight->data,
+                                                    prenorm->eps)) {
+            GGML_LOG_ERROR("spiral: MUL_MAT %s prenorm preparation failed\n",
+                           node->name);
+            return false;
+        }
+    }
+    if (prenorm != nullptr && backend->profile_nodes) {
+        GGML_LOG_INFO("spiral prenorm node %s\n", node->name);
+    }
+    const auto & prepared_chunks =
+        prenorm != nullptr ? weight_buffer->prenorm_prepared
+                           : weight_buffer->prepared;
 
     const int32_t weights_rows = weight_buffer->shapes[0].weights_rows;
     const int32_t weights_cols = weight_buffer->weights_cols;
-    const int64_t rows = src1->ne[1] * src1->ne[2] * src1->ne[3];
+    const int64_t rows = input->ne[1] * input->ne[2] * input->ne[3];
     if (rows <= 0) {
         // A graph with no output rows (for example a warm-up batch that
         // requests no logits) still visits the matmul nodes.  There is nothing
         // to compute; do not treat it as a shape error.
         return true;
     }
-    if (src1->ne[0] != weights_rows ||
-        node->ne[0] != weights_cols || node->ne[1] != src1->ne[1] ||
-        node->ne[2] != src1->ne[2] || node->ne[3] != src1->ne[3]) {
+    if (input->ne[0] != weights_rows ||
+        node->ne[0] != weights_cols || node->ne[1] != input->ne[1] ||
+        node->ne[2] != input->ne[2] || node->ne[3] != input->ne[3]) {
         GGML_LOG_ERROR("spiral: MUL_MAT %s shape mismatch K=%lld N=%lld rows=%lld node=[%lld,%lld,%lld,%lld]\n",
-                       node->name, (long long) src1->ne[0], (long long) weights_cols,
+                       node->name, (long long) input->ne[0], (long long) weights_cols,
                        (long long) rows, (long long) node->ne[0], (long long) node->ne[1],
                        (long long) node->ne[2], (long long) node->ne[3]);
         return false;
@@ -748,7 +829,7 @@ bool spiral_run_mul_mat(ggml_backend_spiral * backend, ggml_tensor * node,
     double node_gather_us = 0.0;
     int node_col_chunks = 0;
 
-    const auto * x = static_cast<const float *>(src1->data);
+    const auto * x = static_cast<const float *>(input->data);
     auto * y = static_cast<float *>(out->data);
 
     struct PendingCall {
@@ -814,10 +895,13 @@ bool spiral_run_mul_mat(ggml_backend_spiral * backend, ggml_tensor * node,
         node_pack_us += spiral_now_us() - pack_start;
 
         int32_t col_start = 0;
-        for (size_t chunk = 0; chunk < weight_buffer->prepared.size(); ++chunk) {
+        for (size_t chunk = 0; chunk < prepared_chunks.size(); ++chunk) {
             const auto & shape = weight_buffer->shapes[chunk];
             const int32_t chunk_cols = shape.weights_cols;
             spiral::MatmulShape run_shape = shape;
+            if (prenorm != nullptr) {
+                run_shape.prenorm = true;
+            }
             if (soft_cap != 0.0f) {
                 run_shape.soft_cap = soft_cap;
                 run_shape.epilogue = spiral::kEpilogueSoftcap;
@@ -831,7 +915,7 @@ bool spiral_run_mul_mat(ggml_backend_spiral * backend, ggml_tensor * node,
             call.chunk_cols = chunk_cols;
             call.col_start = col_start;
             call.ticket = backend->dev->program->submit(
-                run_shape, weight_buffer->prepared[chunk],
+                run_shape, prepared_chunks[chunk],
                 backend->input_staging.data(),
                 backend->output_staging.data(), chunk_cols, 0);
             pending.push_back(call);
@@ -942,7 +1026,37 @@ int32_t spiral_chain_length(const ggml_backend_spiral_device * dev,
 
 spiral_weight_chain * spiral_prepare_chain(
     ggml_backend_spiral * backend,
-    ggml_backend_spiral_buffer * const * buffers, int32_t count) {
+    ggml_backend_spiral_buffer * const * buffers, int32_t count,
+    const spiral_prenorm_run * prenorm = nullptr) {
+    auto build_variant = [&](spiral_weight_chain & chain) -> bool {
+        if (prenorm == nullptr || prenorm->weight == nullptr) {
+            return true;
+        }
+        if (!chain.prenorm_prepared.empty() &&
+            chain.prenorm_weight == prenorm->weight->data &&
+            chain.prenorm_eps == prenorm->eps) {
+            return true;
+        }
+        chain.prenorm_prepared.clear();
+        chain.prenorm_weight = nullptr;
+        try {
+            spiral::PrenormSpec spec;
+            spec.weight = static_cast<const float *>(prenorm->weight->data);
+            spec.k = chain.buffers[0]->weights_rows;
+            spec.eps = prenorm->eps;
+            chain.prenorm_prepared.push_back(
+                backend->dev->program->prepare_prenorm(chain.prepared[0],
+                                                       spec));
+        } catch (const std::exception & error) {
+            GGML_LOG_ERROR("spiral: chain prenorm preparation failed: %s\n",
+                           error.what());
+            chain.prenorm_prepared.clear();
+            return false;
+        }
+        chain.prenorm_weight = prenorm->weight->data;
+        chain.prenorm_eps = prenorm->eps;
+        return true;
+    };
     for (auto & chain : backend->weight_chains) {
         if (static_cast<int32_t>(chain.buffers.size()) != count) {
             continue;
@@ -956,7 +1070,7 @@ spiral_weight_chain * spiral_prepare_chain(
             }
         }
         if (match) {
-            return &chain;
+            return build_variant(chain) ? &chain : nullptr;
         }
     }
 
@@ -1004,23 +1118,31 @@ spiral_weight_chain * spiral_prepare_chain(
                        error.what());
         return nullptr;
     }
+    if (!build_variant(chain)) {
+        return nullptr;
+    }
     backend->dev->prepare_us += spiral_now_us() - prepare_start;
     backend->weight_chains.push_back(std::move(chain));
     return &backend->weight_chains.back();
 }
 
 bool spiral_run_chain(ggml_backend_spiral * backend, ggml_tensor ** nodes,
-                      int32_t count, spiral_weight_chain & chain) {
+                      int32_t count, spiral_weight_chain & chain,
+                      const spiral_prenorm_run * prenorm = nullptr) {
     if (static_cast<int32_t>(chain.buffers.size()) != count ||
         chain.prepared.size() != 1 || chain.shapes.size() != 1) {
         return false;
     }
     const auto * src1 = nodes[0]->src[1];
-    if (src1 == nullptr) {
+    const auto * input = prenorm != nullptr ? prenorm->input : src1;
+    if (src1 == nullptr || input == nullptr) {
+        return false;
+    }
+    if (prenorm != nullptr && chain.prenorm_prepared.size() != 1) {
         return false;
     }
     const int32_t weights_rows = chain.buffers[0]->weights_rows;
-    if (src1->ne[0] != weights_rows) {
+    if (input->ne[0] != weights_rows) {
         return false;
     }
     int32_t offset = 0;
@@ -1028,9 +1150,9 @@ bool spiral_run_chain(ggml_backend_spiral * backend, ggml_tensor ** nodes,
         const auto * buffer = chain.buffers[i];
         if (!spiral_same_input(src1, nodes[i]->src[1]) ||
             nodes[i]->ne[0] != buffer->weights_cols ||
-            nodes[i]->ne[1] != src1->ne[1] ||
-            nodes[i]->ne[2] != src1->ne[2] ||
-            nodes[i]->ne[3] != src1->ne[3]) {
+            nodes[i]->ne[1] != input->ne[1] ||
+            nodes[i]->ne[2] != input->ne[2] ||
+            nodes[i]->ne[3] != input->ne[3]) {
             return false;
         }
         offset += buffer->padded_cols;
@@ -1039,7 +1161,7 @@ bool spiral_run_chain(ggml_backend_spiral * backend, ggml_tensor ** nodes,
         return false;
     }
 
-    const int64_t rows = src1->ne[1] * src1->ne[2] * src1->ne[3];
+    const int64_t rows = input->ne[1] * input->ne[2] * input->ne[3];
     if (rows <= 0) {
         return true;  // zero-row graph; nothing to compute
     }
@@ -1055,7 +1177,7 @@ bool spiral_run_chain(ggml_backend_spiral * backend, ggml_tensor ** nodes,
     double node_gather_us = 0.0;
     int node_col_chunks = 0;
 
-    const auto * x = static_cast<const float *>(src1->data);
+    const auto * x = static_cast<const float *>(input->data);
     struct PendingCall {
         spiral::RunTicket ticket;
         int64_t first = 0;
@@ -1117,9 +1239,15 @@ bool spiral_run_chain(ggml_backend_spiral * backend, ggml_tensor ** nodes,
         PendingCall call;
         call.first = first;
         call.chunk_rows = chunk_rows;
+        spiral::MatmulShape run_shape = chain.shapes[0];
+        if (prenorm != nullptr) {
+            run_shape.prenorm = true;
+        }
         call.ticket = backend->dev->program->submit(
-            chain.shapes[0], chain.prepared[0], backend->input_staging.data(),
-            backend->output_staging.data(), chain.padded_cols, 0);
+            run_shape,
+            prenorm != nullptr ? chain.prenorm_prepared[0] : chain.prepared[0],
+            backend->input_staging.data(), backend->output_staging.data(),
+            chain.padded_cols, 0);
         pending.push_back(call);
         ++node_col_chunks;
     }
@@ -1162,20 +1290,25 @@ bool spiral_run_chain(ggml_backend_spiral * backend, ggml_tensor ** nodes,
 // starts.
 bool spiral_run_geglu_pair(ggml_backend_spiral * backend, ggml_tensor * gate,
                            ggml_tensor * up, ggml_tensor * glu,
-                           spiral_weight_chain & chain) {
+                           spiral_weight_chain & chain,
+                           const spiral_prenorm_run * prenorm = nullptr) {
     if (chain.buffers.size() != 2 || chain.prepared.size() != 1 ||
         chain.shapes.size() != 1) {
         return false;
     }
+    if (prenorm != nullptr && chain.prenorm_prepared.size() != 1) {
+        return false;
+    }
     const auto * src1 = gate->src[1];
-    if (src1 == nullptr || up->src[1] != src1) {
+    const auto * input = prenorm != nullptr ? prenorm->input : src1;
+    if (src1 == nullptr || input == nullptr || up->src[1] != src1) {
         return false;
     }
     const int32_t weights_rows = chain.buffers[0]->weights_rows;
     const int32_t gate_padded = chain.buffers[0]->padded_cols;
     const int32_t up_padded = chain.buffers[1]->padded_cols;
     const int32_t gate_cols = gate->ne[0];
-    if (src1->ne[0] != weights_rows || gate_padded != up_padded ||
+    if (input->ne[0] != weights_rows || gate_padded != up_padded ||
         chain.padded_cols != gate_padded + up_padded ||
         gate->ne[0] != up->ne[0] || glu->ne[0] != gate_cols ||
         glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu)) {
@@ -1187,7 +1320,7 @@ bool spiral_run_geglu_pair(ggml_backend_spiral * backend, ggml_tensor * gate,
         }
     }
 
-    const int64_t rows = src1->ne[1] * src1->ne[2] * src1->ne[3];
+    const int64_t rows = input->ne[1] * input->ne[2] * input->ne[3];
     if (rows <= 0) {
         return true;  // zero-row graph; nothing to compute
     }
@@ -1206,19 +1339,23 @@ bool spiral_run_geglu_pair(ggml_backend_spiral * backend, ggml_tensor * gate,
     spiral::MatmulShape run_shape = chain.shapes[0];
     run_shape.epilogue = spiral::kEpilogueGeglu;
     run_shape.soft_cap = 0.0f;
+    run_shape.prenorm = prenorm != nullptr;
+    const auto & chain_prepared =
+        prenorm != nullptr ? chain.prenorm_prepared[0] : chain.prepared[0];
 
     // Diagnostic: run the same gate+up pair without the epilogue and compare
     // the device GEGLU against a host GELU of that result.
     static const bool geglu_check =
         std::getenv("SPIRAL_GEGLU_CHECK") != nullptr;
     spiral::MatmulShape plain_shape = chain.shapes[0];
+    plain_shape.prenorm = prenorm != nullptr;
     std::vector<uint16_t> check_staging;
     if (geglu_check) {
         check_staging.resize(
             static_cast<size_t>(kSpiralInputsVecs) * chain.padded_cols);
     }
 
-    const auto * x = static_cast<const float *>(src1->data);
+    const auto * x = static_cast<const float *>(input->data);
     auto * y = static_cast<float *>(glu->data);
 
     auto gather = [&](int64_t first, int32_t chunk_rows) {
@@ -1287,9 +1424,8 @@ bool spiral_run_geglu_pair(ggml_backend_spiral * backend, ggml_tensor * gate,
 
         if (geglu_check) {
             backend->dev->program->run(
-                plain_shape, chain.prepared[0],
-                backend->input_staging.data(), check_staging.data(),
-                chain.padded_cols, 0);
+                plain_shape, chain_prepared, backend->input_staging.data(),
+                check_staging.data(), chain.padded_cols, 0);
         }
 
         // One row chunk at a time: the shared output staging and the
@@ -1297,7 +1433,7 @@ bool spiral_run_geglu_pair(ggml_backend_spiral * backend, ggml_tensor * gate,
         // has one chunk; prefill can pipeline once the staging is per-slot.
         spiral::RunTimings timings;
         backend->dev->program->run(
-            run_shape, chain.prepared[0], backend->input_staging.data(),
+            run_shape, chain_prepared, backend->input_staging.data(),
             backend->output_staging.data(), gate_padded, 0, &timings);
         node_npu_us += timings.txn_us + timings.input_us + timings.kernel_us +
                        timings.unpack_us;
@@ -1331,12 +1467,59 @@ bool spiral_run_geglu_pair(ggml_backend_spiral * backend, ggml_tensor * gate,
 
 spiral_ffn_chain * spiral_prepare_ffn_chain(
     ggml_backend_spiral * backend, ggml_backend_spiral_buffer * gate,
-    ggml_backend_spiral_buffer * up, ggml_backend_spiral_buffer * down) {
+    ggml_backend_spiral_buffer * up, ggml_backend_spiral_buffer * down,
+    const spiral_prenorm_run * prenorm = nullptr) {
+    auto build_prenorm = [&](spiral_ffn_chain & cached,
+                             spiral_weight_chain * gate_chain) -> bool {
+        if (prenorm == nullptr || prenorm->weight == nullptr) {
+            return true;
+        }
+        if (cached.has_prenorm &&
+            cached.prenorm_weight == prenorm->weight->data &&
+            cached.prenorm_eps == prenorm->eps) {
+            return true;
+        }
+        if (gate_chain == nullptr || gate_chain->prenorm_prepared.empty() ||
+            down->prepared.empty() || down->shapes.empty()) {
+            return false;
+        }
+        spiral::ChainOp ops[2];
+        ops[0].shape = gate_chain->shapes[0];
+        ops[0].shape.epilogue = spiral::kEpilogueGeglu;
+        ops[0].shape.soft_cap = 0.0f;
+        ops[0].shape.prenorm = true;
+        ops[0].weights = &gate_chain->prenorm_prepared[0];
+        ops[1].shape = down->shapes[0];
+        ops[1].shape.epilogue = spiral::kEpilogueNone;
+        ops[1].shape.soft_cap = 0.0f;
+        ops[1].weights = &down->prepared[0];
+        try {
+            cached.prenorm_chain = backend->dev->program->prepare_chain(ops, 2);
+        } catch (const std::exception & error) {
+            GGML_LOG_ERROR("spiral: FFN prenorm chain preparation failed: %s\n",
+                           error.what());
+            cached.has_prenorm = false;
+            return false;
+        }
+        cached.prenorm_weight = prenorm->weight->data;
+        cached.prenorm_eps = prenorm->eps;
+        cached.has_prenorm = true;
+        return true;
+    };
+
+    ggml_backend_spiral_buffer * pair[2] = {gate, up};
     for (auto & cached : backend->ffn_chains) {
         if (cached.gate == gate && cached.up == up && cached.down == down &&
             cached.gate_epoch == gate->epoch &&
             cached.up_epoch == up->epoch &&
             cached.down_epoch == down->epoch) {
+            if (prenorm != nullptr) {
+                spiral_weight_chain * gate_chain =
+                    spiral_prepare_chain(backend, pair, 2, prenorm);
+                if (!build_prenorm(cached, gate_chain)) {
+                    return nullptr;
+                }
+            }
             return &cached;
         }
     }
@@ -1344,9 +1527,8 @@ spiral_ffn_chain * spiral_prepare_ffn_chain(
         !down->ensure_prepared()) {
         return nullptr;
     }
-    ggml_backend_spiral_buffer * pair[2] = {gate, up};
     spiral_weight_chain * gate_chain =
-        spiral_prepare_chain(backend, pair, 2);
+        spiral_prepare_chain(backend, pair, 2, prenorm);
     if (gate_chain == nullptr || gate_chain->prepared.empty() ||
         gate_chain->shapes.empty() || down->prepared.empty() ||
         down->shapes.empty()) {
@@ -1378,6 +1560,9 @@ spiral_ffn_chain * spiral_prepare_ffn_chain(
                        error.what());
         return nullptr;
     }
+    if (!build_prenorm(cached, gate_chain)) {
+        return nullptr;
+    }
     backend->dev->prepare_us += spiral_now_us() - prepare_start;
     backend->ffn_chains.push_back(std::move(cached));
     return &backend->ffn_chains.back();
@@ -1385,14 +1570,19 @@ spiral_ffn_chain * spiral_prepare_ffn_chain(
 
 bool spiral_run_ffn_chain(ggml_backend_spiral * backend,
                           spiral_ffn_chain & chain, ggml_tensor * gate,
-                          ggml_tensor * down) {
+                          ggml_tensor * down,
+                          const spiral_prenorm_run * prenorm = nullptr) {
     const auto * src1 = gate->src[1];
-    if (src1 == nullptr) {
+    const auto * input = prenorm != nullptr ? prenorm->input : src1;
+    if (src1 == nullptr || input == nullptr) {
         return false;
     }
-    const int32_t weights_rows = src1->ne[0];
+    if (prenorm != nullptr && !chain.has_prenorm) {
+        return false;
+    }
+    const int32_t weights_rows = input->ne[0];
     const int32_t final_cols = down->ne[0];
-    const int64_t rows = src1->ne[1] * src1->ne[2] * src1->ne[3];
+    const int64_t rows = input->ne[1] * input->ne[2] * input->ne[3];
     if (rows <= 0) {
         return true;  // zero-row graph; nothing to compute
     }
@@ -1405,7 +1595,7 @@ bool spiral_run_ffn_chain(ggml_backend_spiral * backend,
     backend->output_staging.resize(
         static_cast<size_t>(kSpiralInputsVecs) * final_cols);
 
-    const auto * x = static_cast<const float *>(src1->data);
+    const auto * x = static_cast<const float *>(input->data);
     auto * y = static_cast<float *>(down->data);
     const double node_start = spiral_now_us();
     double node_npu_us = 0.0;
@@ -1430,8 +1620,9 @@ bool spiral_run_ffn_chain(ggml_backend_spiral * backend,
 
         spiral::RunTimings timings;
         backend->dev->program->run_chain(
-            chain.chain, backend->input_staging.data(),
-            backend->output_staging.data(), final_cols, 0, &timings);
+            prenorm != nullptr ? chain.prenorm_chain : chain.chain,
+            backend->input_staging.data(), backend->output_staging.data(),
+            final_cols, 0, &timings);
         node_npu_us += timings.txn_us + timings.input_us + timings.kernel_us +
                        timings.unpack_us;
         backend->stats_npu_txn_us += timings.txn_us;
@@ -1621,6 +1812,190 @@ bool spiral_geglu_pattern(const ggml_backend_spiral_device * dev,
     return true;
 }
 
+int32_t spiral_max_prenorm_k() {
+    return (design::kInputGroupElems * 2 - design::kPrenormWeightOffset) / 4;
+}
+
+// Match the forced prelude: `MUL_MAT` over `MUL(RMS_NORM(x), gain)` or bare
+// `RMS_NORM(x)`.  Only used with SPIRAL_PRENORM=1 for the end-to-end A/B.
+bool spiral_prenorm_source(const ggml_backend_spiral_device * dev,
+                           const ggml_tensor * mm,
+                           spiral_prenorm_run * run) {
+    if (mm == nullptr || mm->op != GGML_OP_MUL_MAT || dev == nullptr ||
+        run == nullptr) {
+        return false;
+    }
+    const ggml_tensor * src1 = mm->src[1];
+    if (src1 == nullptr) {
+        return false;
+    }
+    const ggml_tensor * norm = nullptr;
+    const ggml_tensor * gain = nullptr;
+    if (src1->op == GGML_OP_RMS_NORM) {
+        norm = src1;
+    } else if (src1->op == GGML_OP_MUL) {
+        norm = src1->src[0];
+        gain = src1->src[1];
+    }
+    if (norm == nullptr || norm->op != GGML_OP_RMS_NORM) {
+        return false;
+    }
+    if (gain != nullptr) {
+        if (gain->type != GGML_TYPE_F32 || !ggml_is_contiguous(gain) ||
+            gain->view_src != nullptr || gain->ne[1] != 1 ||
+            gain->ne[2] != 1 || gain->ne[3] != 1) {
+            return false;
+        }
+    }
+    const ggml_tensor * x = norm->src[0];
+    if (x == nullptr || x->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(x) || x->view_src != nullptr) {
+        return false;
+    }
+    if (norm->type != GGML_TYPE_F32 || !ggml_is_contiguous(norm) ||
+        src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1)) {
+        return false;
+    }
+    if (gain != nullptr && gain->ne[0] != x->ne[0]) {
+        return false;
+    }
+    if (x->ne[0] <= 0 || x->ne[0] % 256 != 0 ||
+        x->ne[0] > spiral_max_prenorm_k()) {
+        return false;
+    }
+    if (!spiral_supports_mul_mat(dev, mm) || mm->src[0]->ne[0] != x->ne[0]) {
+        return false;
+    }
+    // The prelude needs the gain; a bare norm would also need an all-ones
+    // config weight, which the experiment does not build yet.
+    if (gain == nullptr) {
+        return false;
+    }
+    run->input = x;
+    run->weight = gain;
+    run->eps = 0.0f;
+    std::memcpy(&run->eps, norm->op_params, sizeof(float));
+    return true;
+}
+
+// One pass over the graph builds the skip plan.  A norm/gain node is in the
+// plan only if every consumer is a prenorm matmul, so skipping it cannot strand
+// another node.
+void spiral_build_prenorm_plan(const ggml_backend_spiral_device * dev,
+                               const ggml_cgraph * cgraph,
+                               std::unordered_map<const ggml_tensor *, bool> & plan) {
+    plan.clear();
+    std::unordered_map<const ggml_tensor *, const ggml_tensor *> norm_gain;
+    std::unordered_map<const ggml_tensor *, int32_t> uses;
+    for (int32_t i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * t = cgraph->nodes[i];
+        if (t->op != GGML_OP_RMS_NORM && t->op != GGML_OP_MUL) {
+            continue;
+        }
+        bool ok = t->view_src == nullptr &&
+                  (t->flags & GGML_TENSOR_FLAG_OUTPUT) == 0;
+        if (t->op == GGML_OP_MUL &&
+            (t->src[0] == nullptr || t->src[0]->op != GGML_OP_RMS_NORM ||
+             t->src[1] == nullptr)) {
+            ok = false;
+        }
+        plan.emplace(t, ok);
+    }
+    for (int32_t j = 0; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        for (int32_t k = 0; k < GGML_MAX_SRC; ++k) {
+            const ggml_tensor * src = n->src[k];
+            if (src == nullptr) {
+                continue;
+            }
+            auto node = plan.find(src);
+            if (node == plan.end()) {
+                continue;
+            }
+            ++uses[src];
+            if (!node->second) {
+                continue;
+            }
+            if (src->op == GGML_OP_MUL) {
+                spiral_prenorm_run run;
+                node->second = n->op == GGML_OP_MUL_MAT &&
+                               n->src[1] == src &&
+                               spiral_prenorm_source(dev, n, &run);
+            } else if (n->op == GGML_OP_MUL && n->src[0] == src) {
+                if (norm_gain.count(src) != 0) {
+                    node->second = false;  // more than one gain consumer
+                } else {
+                    norm_gain.emplace(src, n);
+                }
+            } else {
+                spiral_prenorm_run run;
+                node->second = n->op == GGML_OP_MUL_MAT &&
+                               n->src[1] == src &&
+                               spiral_prenorm_source(dev, n, &run);
+            }
+        }
+    }
+    // One prelude per fused call.  A norm/gain with several matmul consumers
+    // is only worth taking when they form one wide chain; otherwise each
+    // consumer would repeat the sum and scale, which loses to the host norm.
+    for (auto & [t, ok] : plan) {
+        if (!ok) {
+            continue;
+        }
+        std::vector<int32_t> consumers;
+        for (int32_t j = 0; j < cgraph->n_nodes; ++j) {
+            const ggml_tensor * n = cgraph->nodes[j];
+            if (n->op != GGML_OP_MUL_MAT) {
+                continue;
+            }
+            for (int32_t k = 0; k < GGML_MAX_SRC; ++k) {
+                if (n->src[k] == t) {
+                    consumers.push_back(j);
+                    break;
+                }
+            }
+        }
+        if (consumers.empty()) {
+            continue;
+        }
+        if (consumers.size() == 1) {
+            const int32_t single_remaining = cgraph->n_nodes - consumers[0];
+            if (spiral_chain_length(
+                    dev, cgraph->nodes + consumers[0],
+                    std::min(single_remaining, kSpiralMaxChain)) < 2) {
+                ok = false;
+            }
+            continue;
+        }
+        bool contiguous = true;
+        for (size_t c = 1; c < consumers.size(); ++c) {
+            contiguous = contiguous && consumers[c] == consumers[0] + c;
+        }
+        const int32_t remaining = cgraph->n_nodes - consumers[0];
+        const int32_t length = spiral_chain_length(
+            dev, cgraph->nodes + consumers[0],
+            std::min(remaining, kSpiralMaxChain));
+        if (!contiguous ||
+            length < static_cast<int32_t>(consumers.size())) {
+            ok = false;
+        }
+    }
+    for (const auto & [norm, gain] : norm_gain) {
+        auto norm_node = plan.find(norm);
+        auto gain_node = plan.find(gain);
+        if (norm_node != plan.end()) {
+            norm_node->second =
+                norm_node->second && gain_node != plan.end() &&
+                gain_node->second;
+        }
+    }
+    for (auto & [t, ok] : plan) {
+        if (ok && uses[t] == 0) {
+            ok = false;
+        }
+    }
+}
+
 enum ggml_status spiral_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     auto * self = static_cast<ggml_backend_spiral *>(backend->context);
     const double graph_start = spiral_now_us();
@@ -1781,11 +2156,24 @@ enum ggml_status spiral_graph_compute(ggml_backend_t backend, ggml_cgraph * cgra
     ggml_tensor * geglu_up = nullptr;
     ggml_tensor * geglu_out = nullptr;
     spiral_weight_chain * geglu_chain = nullptr;
+    spiral_prenorm_run geglu_prenorm_run;
+    bool geglu_has_prenorm = false;
     ggml_tensor * ffn_gate = nullptr;
     ggml_tensor * ffn_up = nullptr;
     ggml_tensor * ffn_glu = nullptr;
     ggml_tensor * ffn_down = nullptr;
     spiral_ffn_chain * ffn_chain = nullptr;
+    spiral_prenorm_run ffn_prenorm_run;
+    bool ffn_has_prenorm = false;
+    // Dynamic per-graph switch: production builds select the prelude per
+    // pattern.  SPIRAL_NO_PRENORM=1 disables it.
+    static const bool prenorm_enabled =
+        design::kPrenormAvailable != 0 &&
+        std::getenv("SPIRAL_NO_PRENORM") == nullptr;
+    std::unordered_map<const ggml_tensor *, bool> prenorm_plan;
+    if (prenorm_enabled) {
+        spiral_build_prenorm_plan(self->dev, cgraph, prenorm_plan);
+    }
     static const bool geglu_fuse =
         std::getenv("SPIRAL_NO_GEGLU_FUSE") == nullptr;
     static const bool ffn_chain_enabled =
@@ -1847,7 +2235,9 @@ enum ggml_status spiral_graph_compute(ggml_backend_t backend, ggml_cgraph * cgra
                     ffn_down->name, node->name, ggml_op_name(node->op));
                 return GGML_STATUS_FAILED;
             }
-            if (!spiral_run_ffn_chain(self, *ffn_chain, ffn_gate, ffn_down)) {
+            if (!spiral_run_ffn_chain(
+                    self, *ffn_chain, ffn_gate, ffn_down,
+                    ffn_has_prenorm ? &ffn_prenorm_run : nullptr)) {
                 GGML_LOG_ERROR("spiral: FFN chain for %s failed\n",
                                ffn_down->name);
                 return GGML_STATUS_FAILED;
@@ -1857,6 +2247,7 @@ enum ggml_status spiral_graph_compute(ggml_backend_t backend, ggml_cgraph * cgra
             ffn_glu = nullptr;
             ffn_down = nullptr;
             ffn_chain = nullptr;
+            ffn_has_prenorm = false;
             ++i;
             continue;
         }
@@ -1868,8 +2259,9 @@ enum ggml_status spiral_graph_compute(ggml_backend_t backend, ggml_cgraph * cgra
                     geglu_out->name, node->name, ggml_op_name(node->op));
                 return GGML_STATUS_FAILED;
             }
-            if (!spiral_run_geglu_pair(self, geglu_gate, geglu_up, geglu_out,
-                                       *geglu_chain)) {
+            if (!spiral_run_geglu_pair(
+                    self, geglu_gate, geglu_up, geglu_out, *geglu_chain,
+                    geglu_has_prenorm ? &geglu_prenorm_run : nullptr)) {
                 GGML_LOG_ERROR("spiral: GEGLU pair for %s failed\n",
                                geglu_out->name);
                 return GGML_STATUS_FAILED;
@@ -1879,15 +2271,35 @@ enum ggml_status spiral_graph_compute(ggml_backend_t backend, ggml_cgraph * cgra
             geglu_up = nullptr;
             geglu_out = nullptr;
             geglu_chain = nullptr;
+            geglu_has_prenorm = false;
             ++i;
             continue;
         }
 
+        if (prenorm_enabled && !spiral_supports_mul_mat(self->dev, node)) {
+            auto plan = prenorm_plan.find(node);
+            if (plan != prenorm_plan.end() && plan->second) {
+                ++i;
+                continue;
+            }
+        }
+
         if (spiral_supports_mul_mat(self->dev, node)) {
+            spiral_prenorm_run prenorm_run;
+            bool has_prenorm = false;
+            if (prenorm_enabled) {
+                const ggml_tensor * key = node->src[1];
+                auto plan = key != nullptr ? prenorm_plan.find(key)
+                                           : prenorm_plan.end();
+                has_prenorm = plan != prenorm_plan.end() && plan->second &&
+                              spiral_prenorm_source(self->dev, node,
+                                                    &prenorm_run);
+            }
             static const bool softcap_fuse =
                 std::getenv("SPIRAL_NO_SOFTCAP_FUSE") == nullptr;
             float soft_cap = 0.0f;
-            if (softcap_fuse && spiral_softcap_pattern(cgraph, i, &soft_cap)) {
+            if (!has_prenorm && softcap_fuse &&
+                spiral_softcap_pattern(cgraph, i, &soft_cap)) {
                 if (!spiral_run_mul_mat(self, node, cgraph->nodes[i + 3],
                                         soft_cap)) {
                     return GGML_STATUS_FAILED;
@@ -1906,13 +2318,21 @@ enum ggml_status spiral_graph_compute(ggml_backend_t backend, ggml_cgraph * cgra
                         self->dev, cgraph->nodes[i + 3]);
                     if (b0 != nullptr && b1 != nullptr && bd != nullptr) {
                         spiral_ffn_chain * chain =
-                            spiral_prepare_ffn_chain(self, b0, b1, bd);
+                            spiral_prepare_ffn_chain(
+                                self, b0, b1, bd,
+                                has_prenorm ? &prenorm_run : nullptr);
                         if (chain != nullptr) {
                             ffn_gate = node;
                             ffn_up = cgraph->nodes[i + 1];
                             ffn_glu = glu;
                             ffn_down = cgraph->nodes[i + 3];
                             ffn_chain = chain;
+                            ffn_prenorm_run = prenorm_run;
+                            ffn_has_prenorm = has_prenorm;
+                            if (has_prenorm) {
+                                self->stats_prenorm_fused++;
+                                self->stats_prenorm_chains++;
+                            }
                             i += 3;
                             continue;
                         }
@@ -1928,13 +2348,21 @@ enum ggml_status spiral_graph_compute(ggml_backend_t backend, ggml_cgraph * cgra
                     ggml_backend_spiral_buffer * pair[2] = {b0, b1};
                     spiral_weight_chain * chain =
                         (b0 != nullptr && b1 != nullptr)
-                            ? spiral_prepare_chain(self, pair, 2)
+                            ? spiral_prepare_chain(
+                                  self, pair, 2,
+                                  has_prenorm ? &prenorm_run : nullptr)
                             : nullptr;
                     if (chain != nullptr) {
                         geglu_gate = node;
                         geglu_up = cgraph->nodes[i + 1];
                         geglu_out = glu;
                         geglu_chain = chain;
+                        geglu_prenorm_run = prenorm_run;
+                        geglu_has_prenorm = has_prenorm;
+                        if (has_prenorm) {
+                            self->stats_prenorm_fused++;
+                            self->stats_prenorm_chains++;
+                        }
                         i += 2;
                         continue;
                     }
@@ -1954,17 +2382,28 @@ enum ggml_status spiral_graph_compute(ggml_backend_t backend, ggml_cgraph * cgra
                 }
                 spiral_weight_chain * chain =
                     have_buffers
-                        ? spiral_prepare_chain(self, buffers, length)
+                        ? spiral_prepare_chain(
+                              self, buffers, length,
+                              has_prenorm ? &prenorm_run : nullptr)
                         : nullptr;
                 if (chain != nullptr &&
                     spiral_run_chain(self, cgraph->nodes + i, length,
-                                     *chain)) {
+                                     *chain,
+                                     has_prenorm ? &prenorm_run : nullptr)) {
+                    if (has_prenorm) {
+                        self->stats_prenorm_fused++;
+                        self->stats_prenorm_chains++;
+                    }
                     i += length;
                     continue;
                 }
             }
-            if (!spiral_run_mul_mat(self, node)) {
+            if (!spiral_run_mul_mat(self, node, nullptr, 0.0f,
+                                    has_prenorm ? &prenorm_run : nullptr)) {
                 return GGML_STATUS_FAILED;
+            }
+            if (has_prenorm) {
+                self->stats_prenorm_fused++;
             }
             look_ahead(i);
             ++i;
@@ -1974,6 +2413,12 @@ enum ggml_status spiral_graph_compute(ggml_backend_t backend, ggml_cgraph * cgra
         int j = i;
         while (j < cgraph->n_nodes &&
                !spiral_supports_mul_mat(self->dev, cgraph->nodes[j])) {
+            if (prenorm_enabled && j > i) {
+                auto plan = prenorm_plan.find(cgraph->nodes[j]);
+                if (plan != prenorm_plan.end() && plan->second) {
+                    break;
+                }
+            }
             if (!spiral_cpu_compatible(self->dev, cgraph->nodes[j])) {
                 GGML_LOG_ERROR("spiral: no CPU fallback for %s (%s)\n",
                                ggml_op_name(cgraph->nodes[j]->op),
@@ -2065,7 +2510,7 @@ void spiral_backend_free(ggml_backend_t backend) {
         GGML_LOG_INFO(
             "spiral profile: graphs=%llu wall=%.3f ms\n"
             "  cpu fallback: %.3f ms  nodes=%llu batches=%llu\n"
-            "  npu mulmat:   %.3f ms  calls=%llu chains=%llu fused_softcap=%llu fused_geglu=%llu ffn_chains=%llu row_chunks=%llu col_chunks=%llu max_slots=%d\n"
+            "  npu mulmat:   %.3f ms  calls=%llu chains=%llu fused_softcap=%llu fused_geglu=%llu ffn_chains=%llu prenorm=%llu prenorm_chains=%llu row_chunks=%llu col_chunks=%llu max_slots=%d\n"
             "  npu stages:   txn=%.3f input=%.3f kernel=%.3f unpack=%.3f ms\n"
             "  host:         pack=%.3f gather=%.3f ms\n"
             "  weight prep:  %.3f ms  tensors=%llu\n",
@@ -2080,6 +2525,8 @@ void spiral_backend_free(ggml_backend_t backend) {
             (unsigned long long) self->stats_softcap_fused,
             (unsigned long long) self->stats_geglu_fused,
             (unsigned long long) self->stats_ffn_chains,
+            (unsigned long long) self->stats_prenorm_fused,
+            (unsigned long long) self->stats_prenorm_chains,
             (unsigned long long) self->stats_row_chunks,
             (unsigned long long) self->stats_col_chunks,
             self->dev->program ? self->dev->program->max_outstanding() : 0,

@@ -54,7 +54,49 @@ steps in [`README.md`](README.md), numbers in
    - [ ] Decide whether to support more ggml ops on Spiral (RMS_NORM, GEGLU,
          ROPE) or rely on the scheduler. Device-side links belong to
          `src/program/TODO.md`; the backend only needs to stop splitting there.
-4. **CPU fallback.** Softcap and GEGLU are on the device now. The remaining
+   - [x] RMS-norm prelude matcher and dynamic switch (production only,
+         `SPIRAL_NO_PRENORM=1` is the A/B switch). It covers the FFN gate+up
+         chain. The attention norm stays on the host: Q/K/V are non-adjacent
+         (indices 9/14/19, RoPE and reshapes between them) and one path has a
+         ROPE consumer, so they cannot form one wide call. The graph view is not
+         the blocker: all consumers are visible, and a real split boundary
+         inserts a copy so the pattern stops matching safely.
+4. **RMS-norm prelude inside fused calls.** The FFN chain now carries the
+   prelude on op0: `prenorm=595`, `chains`/`ffn_chains` unchanged, CPU nodes
+   20536 -> 19346, greedy text identical. The device cost is ~3.5 us on the
+   synchronous chain, measured as +1.2% wall and no fan change in the soak.
+   The remaining gap is the attention norm.
+   - [x] `PreparedWeights::Impl::weights_bo` is a `std::shared_ptr<xrt::bo>`
+         and `Program::prepare_prenorm(base, spec)` derives the variant without
+         repacking or allocating. `--prenorm-spike` is bit-identical; the
+         standalone backend path uses it (no duplicate BO, no +0.8 s prep).
+   - [x] `prepare_chain` accepts the prelude on op0 (from a prenorm
+         `PreparedWeights`) and writes the gain into op0's config. The
+         concatenated TXN reuses the shared BO; no repack.
+   - [x] `spiral_weight_chain` caches the shared-BO variant and
+         `spiral_run_chain` stages the residual; the FFN gate+up pair uses it.
+         No standalone QKV chain exists on this graph.
+   - [x] `spiral_ffn_chain` caches the prenorm `PreparedChain` and
+         `spiral_run_ffn_chain` stages the residual. E2B: `prenorm=595`,
+         `chains`/`ffn_chains` unchanged at 595, CPU nodes 20536 -> 19346,
+         greedy text identical. Wall is +0.7 ms/token (+1.4%).
+   - [x] Plan grouping: a norm/gain feeding one contiguous wide chain is
+         eligible; the variant is built at the first fused call and every
+         fallback runner carries the same input.
+   - [x] Standalone matmuls stay on the host norm; the grouping only takes a
+         norm that one contiguous chain covers.
+   - [ ] Add a fused-prenorm case to `host/test.cc --prenorm-spike`: a
+         2-segment wide call and a 2-op chain, bit-exact against the
+         host-normalized reference.
+   - [x] 3000-token soak: prelude off 179.5 s / 17.29 t/s / Tctl 74.9 C /
+         fans 4834/4667; prelude on 181.5 s / 17.09 t/s / Tctl 74.0 C /
+         fans 4845/4667. So 1.2% slower, no fan change. Leave it on by
+         default on the assumption that covering the attention norm will bring
+         it to neutral or positive; `SPIRAL_NO_PRENORM=1` is the A/B switch.
+   - [ ] Attention norm: Q/K/V are non-adjacent and one path has a ROPE
+         consumer. Covering it needs a grouping across ROPE/reshape nodes or a
+         shared normalized activation, not a per-matmul prelude.
+5. **CPU fallback.** Softcap and GEGLU are on the device now. The remaining
    fallback is norms, RoPE, attention and small elementwise ops; do not
    optimize it before the chain/norm/attention links. The 4-slot E2B soak
    (54.4 t/s at 67.2 C, ~2.8k RPM; iGPU 87.9 t/s at 60.9 C and ~3.6k RPM)
@@ -76,7 +118,11 @@ steps in [`README.md`](README.md), numbers in
 ## Risks
 
 - **Weight BO residency:** one resident BO per prepared handle is in place;
-  combined chains duplicate their segment weights.
+  combined chains duplicate their segment weights. A prenorm variant of a
+  fused handle must share that BO, not repack it.
+- **Prenorm chain TXN:** `txn_concat` patches per-op offsets, so op0's prenorm
+  base TXN must be generated before concatenation and only op0 may carry the
+  extra input fill.
 - **Padding:** canonical padded N=256 copies must be byte-identical to the
   reference golden cases.
 - **Views/aliases:** weights must be dense and contiguous; view handling is
