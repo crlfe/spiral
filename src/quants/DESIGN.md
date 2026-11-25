@@ -226,6 +226,12 @@ Checked against the mlir-aie docs, the programming guide, the installed
   `N * type_bits >= 128` it is `v.extract<N>(index).grow_replicate<Elems>()`.
   Q8_0's `broadcast_vector<8, bfloat16, 64>` is already the `grow_replicate`
   path.
+- Repeating a 128-bit lane by a runtime or constant index is cheaper through
+  `broadcast_elem_128` (XDNA2): one `vextbcst.128` takes the lane as a register
+  operand, while `broadcast_vector` emits a `vshift` first. See
+  `common/lane_broadcast.aie.h` (`repeat_lane32`/`repeat_lane64`). Measured in
+  Q6_K's subgroup expansion; it regressed Q4_0, so the two formats use
+  different forms. Details in `docs/rejected.md`.
 - `vector::grow_replicate<ElemsOut>()` replicates the whole short vector. A
   64-lane bf16 value is two 512-bit registers, so each 8-lane expansion needs
   about four 128-bit copies per register (about 12 instructions), and four are
@@ -333,7 +339,8 @@ What helped: inlining unpack directly into the fused kernel instead of cursor
 objects; aligning tile payloads so `load_v` is valid; `aie::vector` pointers for
 input, output and payload tiles; sharing scale/dequant helpers with the
 standalone unpack test; exact bf16 scale terms in host repack when precision
-fits; `broadcast_vector` for 8-to-64 expansion.
+fits; `broadcast_vector` for 8-to-64 expansion on Q4_0 (Q6_K uses
+`repeat_lane64`).
 
 What did not help (see `docs/rejected.md`): partial unrolling without measuring
 the specific loop, `noinline` helpers, four columns, hoisting accumulators
@@ -372,9 +379,11 @@ before issuing mmuls.
 - The shared split computes `E << 7` once, builds `hi` with one `(E | top) << 5`
   plus the bias add, and folds the denormal `lo` exponent step into the same
   add. It is exact and the cheapest formulation measured.
-- Expand the eight scale lanes to 64 once per block, not per tile.
-  `broadcast_vector<8, bfloat16, 64>` is the chosen form; 32-lane and 8-lane
-  caches, and per-tile reload/split, were slower.
+- Expand the eight scale lanes to 64 once per block, not per tile. Q6_K uses
+  `repeat_lane64` (register-lane `vextbcst.128`) and gains on both Q6_K variants;
+  Q4_0 keeps `broadcast_vector<8, bfloat16, 64>` because the same change
+  regressed it. 32-lane and 8-lane caches, and per-tile reload/split, were
+  slower.
 - Q6_K hoists `d` to once per record; each chunk's 32 int8 scales are expanded
   to 32 lanes, multiplied by `d`, and split into hi/mid/lo once.
 - Rejected scale approaches are listed in `docs/rejected.md`.

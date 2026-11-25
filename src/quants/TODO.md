@@ -138,6 +138,17 @@ pass through the exact tolerances.
   explicit `upshift`.
 - Q4_0/Q8_0: compare `grow_replicate<64>()` against `broadcast_vector` for
   scale expansion (it lost for Q8_0; confirm for Q4_0).
+- Repeating one 128-bit lane: `broadcast_elem_128` (XDNA2) takes the lane as a
+  register operand, so one `vextbcst.128` does any lane, while
+  `broadcast_vector` emits a `vshift` first. `common/lane_broadcast.aie.h`
+  (`repeat_lane32`/`repeat_lane64`) wraps it with a portable fallback; a plain
+  `int` lane works, no template constant needed.
+  - Applied to `q6_scale::load_subgroup_scales64`: `q6_k_int8` 9101 -> 8440
+    cycles, `q6_k` 10180 -> 10115.
+  - Rejected for `q4_0::detail::expand_scale64` and its `q4_0_packed16`
+    twin: 7883 -> 7929 and 7397 -> 7573, so they keep `broadcast_vector`.
+    See `docs/rejected.md`.
+  - Also won in `src/funcs/rmsnorm` (scale 4016 -> 3920 cycles).
 - Q6_K/Q4_K/Q5_K: mask `uint8` payloads over `int4` vectors and reserve `int4`
   for the final `to_float`.
 - IQ formats: prototype the hardware LUT path before writing scalar gathers.

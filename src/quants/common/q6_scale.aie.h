@@ -4,6 +4,7 @@
 
 #include <aie_api/aie.hpp>
 
+#include "quants/common/lane_broadcast.aie.h"
 #include "quants/common/tile.h"
 
 // Shared exact scale path for the native and int8-expanded Q6_K variants.
@@ -66,12 +67,9 @@ static inline __attribute__((always_inline)) void load_subgroup_scales64(
     aie::vector<bfloat16, kMmulWeightsElems>& hi,
     aie::vector<bfloat16, kMmulWeightsElems>& mid,
     aie::vector<bfloat16, kMmulWeightsElems>& lo) {
-  hi = aie::broadcast_vector<kScaleCols, bfloat16, kMmulWeightsElems>(hi32,
-                                                                      subgroup);
-  mid = aie::broadcast_vector<kScaleCols, bfloat16, kMmulWeightsElems>(
-      mid32, subgroup);
-  lo = aie::broadcast_vector<kScaleCols, bfloat16, kMmulWeightsElems>(lo32,
-                                                                      subgroup);
+  hi = spiral::quants::repeat_lane64(hi32, subgroup);
+  mid = spiral::quants::repeat_lane64(mid32, subgroup);
+  lo = spiral::quants::repeat_lane64(lo32, subgroup);
 }
 
 // Apply the three exact bf16 scale terms to one 64-lane values vector.

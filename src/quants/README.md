@@ -18,7 +18,7 @@ unpack loops exist only for format conformance testing.
 <format>/repack.h       host-side canonical-to-tile conversion
 <format>/unpack.aie.h   device-side dequantization (test-only entry points)
 <format>/mmul.aie.h     device-side fused dequantization and mmul
-common/                 shared tile shape, scale, repack and mmul helpers
+common/                 shared tile shape, scale, repack, lane-broadcast and mmul helpers
 tests/                  host repack shims, NPU harnesses, NumPy references
 ```
 

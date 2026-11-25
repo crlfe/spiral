@@ -65,6 +65,13 @@ original change. Numbers, where they matter, are in
   wrong address; reserve aligned blocks.
 - **`grow_replicate` / `concat` ladders / `.rodata` constants** for Q8_0 scale
   expansion all grew `.text`; `broadcast_vector` is the chosen form.
+- **`broadcast_elem_128` register-lane `vextbcst.128` for Q4_0 scale
+  expansion.** It regressed `q4_0` (7883 -> 7929 cycles) and `q4_0_packed16`
+  (7397 -> 7573), so Q4_0 keeps `broadcast_vector`. The same edit does win for
+  Q6_K's subgroup expansion (`q6_k_int8` 9101 -> 8440, `q6_k` 10180 -> 10115)
+  because it drops the `vshift` that `broadcast_vector` emits before a non-zero
+  lane; Q6_K uses it. Not related to the Q8_0 case above: there the index is
+  zero, so there is no shift to remove.
 - **`MEMORY_STALL` trace event** never fires for any current probe; revisit
   only for an unexplained cycle gap that looks like bank contention.
 
