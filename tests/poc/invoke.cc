@@ -74,6 +74,7 @@ static void set_config(xrt::bo& config_bo,
   for (int32_t i = 0; i < kComputesPerGroup; i++) {
     buf[64 * i + 0] = input_steps;
     buf[64 * i + 1] = output_steps;
+    buf[64 * i + 2] = 0;  // optional runtime-if extra groups
   }
   config_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 }
